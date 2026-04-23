@@ -1,8 +1,10 @@
 # coding-agent-notifier
 
-Ping yourself on Slack (or Discord) when a coding agent — Claude Code, Codex — needs your attention, but only when you're actually away from the keyboard.
+Ping yourself on Slack or Discord when a coding agent — Claude Code, Codex — needs your attention, but only when you're actually away from the keyboard.
 
 Built for the workflow where you kick off an agent, switch to another task, and want to know *the moment* it asks for approval or finishes — without having to babysit the terminal.
+
+Duplicate-ping protection is built in: both agents fire two hooks for the same logical event (Claude Code: `PermissionRequest` + `Notification:permission_prompt`; Codex: `notify` + `Stop`), so the CLI collapses pairs within a 5-second window.
 
 ## What triggers a ping
 

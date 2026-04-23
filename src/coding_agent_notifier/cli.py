@@ -12,7 +12,8 @@ from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config
 from .event import Event
 from .gating import SystemState, should_send
 
-PERMISSION_DEDUP_TTL = 5.0
+DEDUP_TTL = 5.0
+DEDUPED_KINDS = frozenset({"permission", "turn_complete"})
 from .sinks.base import Sink, SinkError
 from .sinks.discord import DiscordSink
 from .sinks.slack import SlackSink
@@ -106,14 +107,16 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 
 def _is_duplicate(event: Event) -> bool:
-    # Claude Code fires both `PermissionRequest` and `Notification:permission_prompt`
-    # for the same approval gate. Collapse them within a short TTL so the user
-    # only gets one Slack ping per approval. We key on (agent, session) — not
-    # tool_name — because the Notification payload doesn't carry the tool.
-    if event.kind != "permission":
+    # Both agents can fire two hooks for the same logical event:
+    #   - Claude Code: `PermissionRequest` + `Notification:permission_prompt`
+    #   - Codex:       `notify` (agent-turn-complete) + the `Stop` hook
+    # Collapse pairs within a short TTL keyed on (agent, kind, session). We
+    # deliberately ignore tool_name — the Notification payload doesn't carry it
+    # so the keys would diverge otherwise.
+    if event.kind not in DEDUPED_KINDS:
         return False
     key = dedup.dedup_key(event.agent, event.kind, event.session_id, None)
-    return dedup.recently_seen(key, ttl=PERMISSION_DEDUP_TTL)
+    return dedup.recently_seen(key, ttl=DEDUP_TTL)
 
 
 def cmd_config(args: argparse.Namespace) -> int:

@@ -251,6 +251,85 @@ webhook_url = "https://hook.test/x"
     assert len(calls) == 1
 
 
+def test_hook_deduplicates_codex_turn_complete_twin_fire(monkeypatch, tmp_path: Path):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    calls = []
+
+    def fake_post(*a, **k):
+        calls.append(a)
+        return 200, "ok"
+
+    monkeypatch.setattr("coding_agent_notifier.sinks.slack.http_post_json", fake_post)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    # Codex fires `notify` and the `Stop` hook for the same turn
+    notify_payload = {
+        "type": "agent-turn-complete",
+        "turn-id": "sess-1",
+        "last-assistant-message": "done",
+        "cwd": "/tmp",
+    }
+    stop_payload = {
+        "hook_event_name": "Stop",
+        "cwd": "/tmp",
+        "session_id": "sess-1",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(notify_payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "codex"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(stop_payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "codex"])
+    assert len(calls) == 1
+
+
+def test_hook_does_not_dedup_idle_prompt(monkeypatch, tmp_path: Path):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    calls = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda *a, **k: (calls.append(a) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    payload = {
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "s1",
+        "message": "still here?",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 2
+
+
 def test_hook_force_bypasses_dedup(monkeypatch, tmp_path: Path):
     cfg = _write_config(
         tmp_path,
