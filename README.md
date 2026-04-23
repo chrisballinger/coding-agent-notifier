@@ -1,5 +1,7 @@
 # coding-agent-notifier
 
+[![CI](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml)
+
 Ping yourself on Slack or Discord when a coding agent — Claude Code, Codex — needs your attention, but only when you're actually away from the keyboard.
 
 Built for the workflow where you kick off an agent, switch to another task, and want to know *the moment* it asks for approval or finishes — without having to babysit the terminal.
