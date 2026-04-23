@@ -1,0 +1,5 @@
+{
+  "session_id": "abc123def456",
+  "cwd": "/Users/example/src/myproj",
+  "hook_event_name": "Stop"
+}

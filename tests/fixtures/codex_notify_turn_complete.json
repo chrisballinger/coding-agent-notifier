@@ -1,0 +1,6 @@
+{
+  "type": "agent-turn-complete",
+  "turn-id": "turn-9f",
+  "last-assistant-message": "I've finished the refactor and all tests pass.",
+  "cwd": "/Users/example/src/myproj"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "abc123def456",
+  "cwd": "/Users/example/src/myproj",
+  "hook_event_name": "PermissionRequest",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf node_modules",
+    "description": "Remove node_modules directory"
+  }
+}

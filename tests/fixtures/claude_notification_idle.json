@@ -1,0 +1,9 @@
+{
+  "session_id": "abc123def456",
+  "transcript_path": "/Users/example/.claude/projects/p/transcript.jsonl",
+  "cwd": "/Users/example/src/myproj",
+  "hook_event_name": "Notification",
+  "message": "Claude is waiting for your input",
+  "title": "Idle",
+  "notification_type": "idle_prompt"
+}

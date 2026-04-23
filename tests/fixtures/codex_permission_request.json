@@ -1,0 +1,9 @@
+{
+  "session_id": "codex-sess-12",
+  "cwd": "/Users/example/src/myproj",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "shell",
+  "tool_input": {
+    "command": "git push origin main"
+  }
+}
