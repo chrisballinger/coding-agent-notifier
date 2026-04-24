@@ -87,6 +87,15 @@ def build_slack_message(
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "normal",
 ) -> dict:
+    # In minimal mode we never touch `tool_input` or the tool summary, so skip
+    # the render call entirely — even an in-memory DANGEROUS_BASH_PATTERNS
+    # match is data we don't need to compute. The return value has a single
+    # header block, a generic fallback, no attachment color hint (avoids
+    # signaling danger, which itself could leak that a Bash command looked
+    # risky). Buttons are added separately by `build_approval_message`.
+    if verbosity == "minimal":
+        return _build_minimal_message(event)
+
     tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
     dangerous = tool.dangerous
 
@@ -136,8 +145,26 @@ def build_slack_message(
         "blocks": blocks,
     }
     return {
-        "text": _fallback_text(event, tool, dangerous),
+        "text": _fallback_text(event, tool, dangerous, verbosity=verbosity),
         "attachments": [attachment],
+    }
+
+
+def _build_minimal_message(event: Event) -> dict:
+    """Payload-free message for compliance-sensitive environments.
+
+    Contains ONLY `event.title` (e.g. "Claude Code needs approval"). No
+    tool name, no tool_input, no message body, no transcript snippet, no
+    cwd, no session id, no source app, no color bar. The user gets a
+    ping; the terminal is authoritative for what's actually pending.
+    """
+    title = event.title  # "Claude Code needs approval" etc — no cwd / tool / etc
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"{event.emoji} {title}", "emoji": True}},
+    ]
+    return {
+        "text": title,
+        "attachments": [{"blocks": blocks}],
     }
 
 
@@ -190,13 +217,18 @@ def _mrkdwn_polish(text: str) -> str:
 _IOS_PREVIEW_MAX = 140
 
 
-def _fallback_text(event: Event, tool: ToolRender, dangerous: bool) -> str:
+def _fallback_text(event: Event, tool: ToolRender, dangerous: bool, *,
+                   verbosity: Verbosity = "normal") -> str:
     """Compose the Slack `text` field — what iOS renders in the push preview.
 
     Slack mobile also displays this above the attachment in-app, so a full-body
     dump produces visible duplication. Keep it to a single line, capped at
-    140 chars; the rich content still lives in the attachment blocks.
+    140 chars; the rich content still lives in the attachment blocks. In
+    `minimal` verbosity the preview is just the event title — no command,
+    no code.
     """
+    if verbosity == "minimal":
+        return event.title
     bits = []
     if dangerous:
         bits.append("⚠️ DANGEROUS")
@@ -237,7 +269,17 @@ def build_approval_message(
     command); Deny is `danger` and needs no confirm (fail-safe direction).
     """
     body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
-    tool_label = event.tool_name or "tool"
+    # The confirm dialog is part of the Slack payload — in minimal mode it
+    # would itself leak tool_name / cwd. Strip it to a generic prompt so the
+    # buttons stay opaque to anyone reading the message.
+    if verbosity == "minimal":
+        confirm_text = "Approve pending tool call?"
+    else:
+        tool_label = event.tool_name or "tool"
+        confirm_text = (
+            f"Allow `{tool_label}` to run in "
+            f"`{event.cwd.name or str(event.cwd)}`?"
+        )
     actions_block = {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}",
@@ -250,10 +292,7 @@ def build_approval_message(
                 "value": approval_id,
                 "confirm": {
                     "title": {"type": "plain_text", "text": "Approve tool call?"},
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"Allow `{tool_label}` to run in `{event.cwd.name or str(event.cwd)}`?",
-                    },
+                    "text": {"type": "mrkdwn", "text": confirm_text},
                     "confirm": {"type": "plain_text", "text": "Approve"},
                     "deny": {"type": "plain_text", "text": "Cancel"},
                 },
@@ -342,11 +381,19 @@ def build_resolved_message(
         verb = "Timed out — denied"
         color = "#a0a0a0"
 
-    tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
     header = f"{icon} *{verb} by {actor_label}*"
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
+
+    if verbosity == "minimal":
+        # Outcome + actor only — no tool name, no context footer.
+        return {
+            "text": f"{verb} by {actor_label}",
+            "attachments": [{"color": color, "blocks": blocks}],
+        }
+
+    tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
     summary = tool.summary
     if verbosity == "terse" and event.tool_name and summary:
         summary = f"*{event.tool_name}:* {summary}"

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 import tomlkit
+
+from . import paths
 
 CLAUDE_HOOK_COMMAND = "agent-notify hook --source claude-code"
 CODEX_HOOK_COMMAND_PARTS = ["agent-notify", "hook", "--source", "codex"]
@@ -86,9 +89,21 @@ CODEX_HOOK_ENTRIES: dict[str, list[dict[str, Any]]] = {
 
 
 def _backup(path: Path) -> None:
+    """Copy `path` to a timestamped .bak- sibling with the same (or tighter)
+    permissions as the original. Preserves 0600 where applicable so a
+    backup of a secrets-bearing file doesn't leak to group/world."""
     if path.exists():
         ts = time.strftime("%Y%m%d-%H%M%S")
-        path.with_suffix(path.suffix + f".bak-{ts}").write_bytes(path.read_bytes())
+        backup = path.with_suffix(path.suffix + f".bak-{ts}")
+        content = path.read_bytes()
+        src_mode = path.stat().st_mode & 0o777
+        # Default to 0600 unless the original was already stricter.
+        mode = min(src_mode, 0o600) if src_mode else 0o600
+        fd = os.open(str(backup), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, content)
+        finally:
+            os.close(fd)
 
 
 def _has_our_hook(entries: list[dict[str, Any]]) -> bool:
@@ -122,7 +137,10 @@ def install_claude_code(settings_path: Path | None = None) -> list[str]:
         settings = json.loads(text)
     _backup(settings_path)
     new_settings, added = merge_claude_hooks(settings)
-    settings_path.write_text(json.dumps(new_settings, indent=2) + "\n")
+    # settings.json isn't secret, but it names the external command the agent
+    # runs on every hook — tighten to owner-only anyway to match the rest of
+    # our posture.
+    paths.write_secure(settings_path, json.dumps(new_settings, indent=2) + "\n")
     return added
 
 
@@ -169,7 +187,7 @@ def install_slack_bot(
     # install shouldn't require a prior `install claude-code`.
     settings, base_added = merge_claude_hooks(settings)
     settings, pre_added = merge_claude_pretooluse(settings)
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    paths.write_secure(settings_path, json.dumps(settings, indent=2) + "\n")
     claude_added = base_added + pre_added
 
     summary: dict[str, Any] = {
@@ -189,7 +207,10 @@ def install_slack_bot(
                 write = False
         if write:
             _backup(plist_path)
-            plist_path.write_text(desired)
+            # launchd reads the plist as the user; 0600 limits visibility to
+            # just the owner and contains blast radius if a future version
+            # accidentally sticks a token into EnvironmentVariables.
+            paths.write_secure(plist_path, desired)
         summary["plist_path"] = plist_path
         summary["plist_written"] = write
 
@@ -204,7 +225,7 @@ def _launchd_plist_contents(agent_notify_bin: str) -> str:
     ProcessType=Background because the daemon needs network + may spawn
     child processes for outgoing HTTPS.
     """
-    log_path = str(Path.home() / ".cache" / "coding-agent-notifier" / "daemon.log")
+    log_path = str(paths.daemon_log())
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -263,7 +284,13 @@ def install_codex(
         features["codex_hooks"] = True
         summary["config_updated"] = True
     _backup(config_path)
+    # Codex's config may contain other user state — preserve tomlkit's
+    # round-trip, but tighten permissions afterward.
     config_path.write_text(tomlkit.dumps(doc))
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
 
     # 2. hooks.json
     hooks_doc: dict[str, Any] = {}
@@ -277,5 +304,5 @@ def install_codex(
         existing.extend(new_entries)
         summary["hooks_added"].append(event)
     _backup(hooks_path)
-    hooks_path.write_text(json.dumps(hooks_doc, indent=2) + "\n")
+    paths.write_secure(hooks_path, json.dumps(hooks_doc, indent=2) + "\n")
     return summary

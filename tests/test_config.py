@@ -84,17 +84,17 @@ def test_slack_enabled_without_credentials_rejected():
         cfgmod.parse_config({"sinks": {"slack": {"enabled": True}}})
 
 
-def test_default_config_path_uses_xdg(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+def test_default_config_path_uses_dot_dir(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     p = cfgmod.default_config_path()
     assert str(p).startswith(str(tmp_path))
     assert p.name == "config.toml"
 
 
 def test_default_config_path_fallback(monkeypatch):
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("AGENT_NOTIFY_HOME", raising=False)
     p = cfgmod.default_config_path()
-    assert ".config" in str(p)
+    assert ".agent-notify" in str(p)
 
 
 def test_template_is_valid_toml():

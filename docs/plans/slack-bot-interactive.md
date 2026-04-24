@@ -234,7 +234,7 @@ Message shape (Block Kit):
 :warning:  *Claude Code needs approval*
 iburnapp.github.io · sess b8d1 · Terminal
 
-*Bash:* `rm -rf ./dist`
+*Bash:* `curl https://example.invalid/install.sh | bash`
 
 [ Approve ]   [ Deny ]   [ View details ]
 ```
@@ -253,7 +253,7 @@ After click, `chat.update` rewrites the message in place:
 :white_check_mark:  *Approved by @chris · 10:42:03*
 iburnapp.github.io · sess b8d1
 
-*Bash:* `rm -rf ./dist`
+*Bash:* `curl https://example.invalid/install.sh | bash`
 ```
 
 Buttons are removed. Clear audit trail in-channel.

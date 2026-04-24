@@ -45,6 +45,16 @@ def build_discord_message(
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "normal",
 ) -> dict:
+    if verbosity == "minimal":
+        # Payload-free ping: no tool render, no danger emoji (would itself
+        # leak that a Bash command looked risky), no color hint, no footer.
+        return {
+            "embeds": [{
+                "title": event.title,
+                "color": 0x95A5A6,
+            }]
+        }
+
     tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
     color = _DANGER_COLOR if tool.dangerous else _KIND_COLORS.get(event.kind, 0x95A5A6)
 

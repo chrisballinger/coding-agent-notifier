@@ -24,9 +24,8 @@ from .event import Event
 
 
 def default_pending_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base else Path.home() / ".cache"
-    return root / "coding-agent-notifier" / "pending"
+    from . import paths
+    return paths.pending_dir()
 
 
 def _path_for(agent: str, session_id: str | None, *, base_dir: Path | None = None) -> Path:
@@ -54,14 +53,13 @@ def _locked(lock_path: Path) -> Iterator[None]:
 
 def write(event: Event, *, base_dir: Path | None = None, clock: callable = time.time) -> Path:
     """Serialize `event` to a per-session pending file. Overwrites any prior entry."""
+    from . import paths
     key_path = _path_for(event.agent, event.session_id, base_dir=base_dir)
-    key_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.ensure_dir(key_path.parent)
     payload = _serialize(event, created_at=clock())
     lock_path = key_path.with_suffix(".lock")
     with _locked(lock_path):
-        tmp = key_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, key_path)
+        paths.write_secure(key_path, json.dumps(payload))
     return key_path
 
 

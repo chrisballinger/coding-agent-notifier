@@ -55,7 +55,18 @@ Both installers are idempotent and back up the target file before writing.
 
 ## Config
 
-`~/.config/coding-agent-notifier/config.toml` (or `$XDG_CONFIG_HOME/coding-agent-notifier/config.toml`):
+All state lives under a single dot directory — `~/.agent-notify/` by default, or wherever `AGENT_NOTIFY_HOME` points:
+
+```
+~/.agent-notify/              (0700)
+├── config.toml               (0600)   your config
+├── state/                    (0700)   dedup markers, queued events, pending approvals
+└── logs/                     (0700)   defer.log, daemon.log
+```
+
+If you previously used `agent-notify` with state under `~/.config/coding-agent-notifier/` and `~/.cache/coding-agent-notifier/`, the next run auto-migrates the files into the new tree and prints a one-line notice. The old directories are left in place so you can inspect before removing them yourself.
+
+`~/.agent-notify/config.toml`:
 
 ```toml
 idle_threshold_seconds = 60
@@ -75,7 +86,7 @@ enabled = true
 enabled = true
 
 [display]
-verbosity = "terse"             # terse | normal. terse drops the Project/Session/Tool/App grid in favor of a compact footer.
+verbosity = "terse"             # terse | normal | minimal. See "Security" below.
 coalesce_window_seconds = 2.5   # hold a `turn_complete` this long so a follow-up `idle_prompt` can cancel it; 0 disables.
 
 [summary]
@@ -143,6 +154,43 @@ cwd = "*"                                               # catch-all
 slack.webhook_url = "https://hooks.slack.com/services/personal/…"
 ```
 
+## Security
+
+`agent-notify` takes a defense-in-depth posture appropriate for a tool that sees approval prompts and, with the bot feature, relays them through third parties. Specifics:
+
+**Where things live, and who can read them.** Everything under `~/.agent-notify/` is owner-only: directories are `0700`, files are `0600`. Writes happen through an `os.open(…, 0o600)` + atomic-replace helper that ignores the process umask, so a badly-configured shell can't leak state to group/world. The install flow writes `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.codex/hooks.json`, and the launchd plist the same way. Timestamped `.bak-*` backups inherit the strict mode of the original file.
+
+**Config permission warning.** On load, if `config.toml` is group/world-readable AND contains any inline `webhook_url` / `bot_token` / `app_token` value (as opposed to an `_env` reference), `agent-notify` prints a loud stderr warning telling you to `chmod 600` it. It does *not* refuse to load — you may have reasons — but the warning is hard to miss.
+
+**Token storage, in order of preference.**
+
+1. Environment variable — config refers to it via `bot_token_env = "SLACK_BOT_TOKEN"`. Nothing secret on disk.
+2. Inline in `config.toml` — acceptable only if the file is `0600` and on an encrypted disk (e.g. macOS FileVault).
+3. We do *not* currently integrate with macOS Keychain — see "Out of scope" below.
+
+**What goes into logs.** `logs/defer.log` records metadata only — approval IDs, session IDs (short), tool names, decisions — and is created at `0600`. `tool_input` contents are never logged. If you see a stack trace in the log, it's from our own code; no token or command body is printed there either.
+
+**Verbosity and the payload that transits Slack / Discord.** The `display.verbosity` setting controls *how much* of each event actually leaves the machine:
+
+| Mode      | Event title | Tool name | `tool_input` (commands / code) | Transcript snippet | Project path / session ID |
+| --------- | :---------: | :-------: | :-----------------------------: | :----------------: | :-----------------------: |
+| `normal`  |      ✓      |     ✓     |                ✓                |          ✓         |             ✓             |
+| `terse`   |      ✓      |     ✓     |                ✓                |          ✓         |       ✓ (compact)         |
+| `minimal` |      ✓      |     —     |                —                |          —         |             —             |
+
+`minimal` mode exists for environments where the *content* of an agent's pending tool call — a command, a snippet of code, the name of a repo — cannot transit a third-party service. You still get a ping that tells you to glance at the terminal; the terminal is authoritative for what's waiting. Approve/deny buttons still work (they carry only an opaque UUID), and the Slack confirm dialog is stripped of tool-specific text.
+
+**Fail-closed approvals.** The blocking `PreToolUse` hook (when `sinks.slack.actionable_approvals = true`) defaults to `deny` on any error path: Slack post failure, timeout, daemon crash, token absent. Rationale: a notifier that silently *approves* on failure is much worse than one that silently denies — the worst case is a one-line "denied" message and you re-run in the terminal.
+
+**Safer example commands.** No destructive shell patterns (`rm -rf …`) appear in fixtures, examples, screenshots, or the `agent-notify test --dangerous` synthetic event — on the theory that a user who copies a command out of a notification into a terminal should not be harmed by it. Placeholder commands use `https://example.invalid/...` (a reserved TLD that never resolves) so `curl | bash`-style examples are cosmetically dangerous but cannot actually do anything.
+
+### Out of scope (today)
+
+- **macOS Keychain token storage.** Future pass — `security find-generic-password` or PyObjC. For now, env vars are the right answer.
+- **Encryption at rest.** Rely on macOS FileVault.
+- **Audit log of approve/deny decisions.** Separate feature — file if you want it.
+- **End-to-end encryption of push payloads.** See `docs/plans/ios-live-activities.md` for a native-iOS design that does E2EE; Slack itself is in-band encrypted but Slack-readable.
+
 ## Commands
 
 | Command                                | What it does                                                   |
@@ -150,7 +198,8 @@ slack.webhook_url = "https://hooks.slack.com/services/personal/…"
 | `agent-notify hook --source {claude-code,codex}` | Reads a hook payload on stdin; invoked by the agents. |
 | `agent-notify test [--force] [--kind ...]`       | Sends a synthetic event end-to-end.                   |
 | `agent-notify config init \| path`               | Write / locate the config file.                       |
-| `agent-notify install {claude-code,codex}`       | Install hooks into the target agent.                  |
+| `agent-notify install {claude-code,codex,slack-bot}` | Install hooks into the target agent (slack-bot also writes the launchd plist for the daemon). |
+| `agent-notify daemon`                                 | Run the Slack Socket Mode listener (required when `actionable_approvals` is on).              |
 | `agent-notify doctor`                            | Summarize config, system state, install state.        |
 
 ## Development

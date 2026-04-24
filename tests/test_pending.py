@@ -104,7 +104,7 @@ def test_corrupt_file_yields_none(tmp_path: Path):
     assert pending.claim("claude-code", "s1", base_dir=tmp_path) is None
 
 
-def test_default_pending_dir_honors_xdg(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_default_pending_dir_honors_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     d = pending.default_pending_dir()
     assert str(d).startswith(str(tmp_path))

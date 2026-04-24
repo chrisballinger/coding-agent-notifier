@@ -162,17 +162,17 @@ def test_gc_stale_empty_dir(tmp_path: Path):
     assert pa.gc_stale(base_dir=tmp_path / "nope") == 0
 
 
-def test_default_approvals_dir_uses_xdg(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_default_approvals_dir_uses_dot_dir(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     d = pa.default_approvals_dir()
     assert str(d).startswith(str(tmp_path))
-    assert "pending_approvals" in d.parts
+    assert "approvals" in d.parts
 
 
 def test_default_approvals_dir_fallback(monkeypatch):
-    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("AGENT_NOTIFY_HOME", raising=False)
     d = pa.default_approvals_dir()
-    assert ".cache" in d.parts
+    assert ".agent-notify" in d.parts
 
 
 def test_safe_filenames_sanitize_path_chars(tmp_path: Path):

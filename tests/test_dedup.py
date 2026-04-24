@@ -71,14 +71,14 @@ def test_tolerates_non_dict_state(tmp_path: Path):
     assert dedup.recently_seen("k", ttl=5, path=path, clock=_FakeClock()) is False
 
 
-def test_default_state_path_uses_xdg(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_default_state_path_uses_dot_dir(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     assert str(dedup.default_state_path()).startswith(str(tmp_path))
 
 
 def test_default_state_path_fallback(monkeypatch):
-    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
-    assert ".cache" in str(dedup.default_state_path())
+    monkeypatch.delenv("AGENT_NOTIFY_HOME", raising=False)
+    assert ".agent-notify" in str(dedup.default_state_path())
 
 
 def test_dedup_key_shape():

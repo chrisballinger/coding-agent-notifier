@@ -31,9 +31,8 @@ from typing import Callable, Iterator
 
 
 def default_approvals_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base else Path.home() / ".cache"
-    return root / "coding-agent-notifier" / "pending_approvals"
+    from . import paths
+    return paths.approvals_dir()
 
 
 def _record_path(approval_id: str, base_dir: Path | None) -> Path:
@@ -94,9 +93,8 @@ def create(
         "message_ts": None,
     }
     with _locked(_lock_path(approval_id, base_dir)):
-        tmp = record.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, record)
+        from . import paths as _paths
+        _paths.write_secure(record, json.dumps(payload))
         if not fifo.exists():
             os.mkfifo(fifo, 0o600)
     return record
@@ -117,9 +115,8 @@ def set_message_ref(
         data = json.loads(record.read_text())
         data["channel"] = channel
         data["message_ts"] = message_ts
-        tmp = record.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, record)
+        from . import paths as _paths
+        _paths.write_secure(record, json.dumps(data))
 
 
 def resolve(
@@ -145,9 +142,8 @@ def resolve(
         data["decision"] = decision
         data["actor"] = actor
         data["resolved_at"] = clock()
-        tmp = record.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, record)
+        from . import paths as _paths
+        _paths.write_secure(record, json.dumps(data))
     # Wake outside the lock: opening a FIFO for write blocks until a reader
     # is open, and the reader path below also tries to lock — keeping the
     # write-open inside `_locked` would deadlock.

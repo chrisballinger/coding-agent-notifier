@@ -75,7 +75,7 @@ def test_daemon_subcommand_calls_run_daemon(monkeypatch):
 
 
 def test_cmd_hook_routes_pretooluse_to_approval_flow(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     # Fake the heavy call — we just want to confirm the dispatch happens.
     called: dict = {}
 
@@ -108,7 +108,7 @@ def test_cmd_hook_pretooluse_ignored_for_codex(monkeypatch, tmp_path):
     """PreToolUse is a Claude Code concept — the codex source shouldn't
     accidentally trigger the approval flow if codex ever emits a payload
     with that hook name."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     sentinel = {"called": False}
 
     def fake_pretooluse(*a, **kw):

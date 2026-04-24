@@ -23,8 +23,8 @@ VALID_EVENT_KINDS: tuple[EventKind, ...] = (
     "elicitation",
 )
 
-Verbosity = Literal["terse", "normal"]
-VALID_VERBOSITIES: tuple[Verbosity, ...] = ("terse", "normal")
+Verbosity = Literal["terse", "normal", "minimal"]
+VALID_VERBOSITIES: tuple[Verbosity, ...] = ("terse", "normal", "minimal")
 
 
 class ConfigError(ValueError):
@@ -145,17 +145,60 @@ def _parse_string_tuple(value: Any, *, field: str) -> tuple[str, ...]:
 
 
 def default_config_path() -> Path:
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
-    return base / "coding-agent-notifier" / "config.toml"
+    from . import paths
+    return paths.config_file()
 
 
-def load_config(path: Path | None = None) -> Config:
+def load_config(path: Path | None = None, *, stderr=None) -> Config:
     path = path or default_config_path()
     if not path.exists():
         return Config()
-    raw = tomllib.loads(path.read_text())
+    raw_text = path.read_text()
+    _warn_on_loose_permissions(path, raw_text, stderr=stderr)
+    raw = tomllib.loads(raw_text)
     return parse_config(raw)
+
+
+def _warn_on_loose_permissions(path: Path, raw_text: str, *, stderr=None) -> None:
+    """Warn loudly if the config is group/world-readable AND carries inline
+    secrets. Doesn't parse TOML fully — a cheap substring scan is enough to
+    decide whether the warning is warranted (false positive is fine; we'd
+    rather over-warn than miss a real leak)."""
+    import sys as _sys
+    stderr = stderr if stderr is not None else _sys.stderr
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077 == 0:
+        return  # owner-only; nothing to warn about
+    secrets_present = any(
+        _looks_like_inline_secret(raw_text, key)
+        for key in ("webhook_url", "bot_token", "app_token")
+    )
+    if not secrets_present:
+        return
+    print(
+        f"agent-notify: {path} is mode {oct(mode)} — group/world can read "
+        f"it AND it contains inline secrets. Run `chmod 600 {path}` "
+        f"(or move secrets to env vars and reference them via "
+        f"`<key>_env = \"VAR_NAME\"`).",
+        file=stderr,
+    )
+
+
+def _looks_like_inline_secret(text: str, key: str) -> bool:
+    """True if `text` assigns `key = "..."` with a non-empty value.
+
+    Cheap — doesn't handle every TOML quirk. `_env`-suffix keys are
+    deliberately excluded (those reference env vars, not literal tokens).
+    """
+    import re as _re
+    pattern = _re.compile(
+        rf'^\s*{_re.escape(key)}\s*=\s*["\']([^"\']+)["\']',
+        _re.MULTILINE,
+    )
+    return bool(pattern.search(text))
 
 
 def parse_config(raw: dict[str, Any]) -> Config:
@@ -352,7 +395,14 @@ enabled = true
 enabled = true
 
 [display]
-verbosity = "terse"           # terse | normal. terse drops the 4-field block in favor of a compact footer.
+verbosity = "terse"           # terse | normal | minimal
+                               # - terse   : compact layout, 1-line iOS preview, full body
+                               # - normal  : explicit Project/Session/Tool/App fields
+                               # - minimal : ONLY "Agent needs attention" — no tool_name,
+                               #             tool_input, message body, transcript snippet,
+                               #             cwd, session id, or source app ever hits
+                               #             Slack/Discord. Use this in compliance-sensitive
+                               #             or shared-channel environments.
 coalesce_window_seconds = 2.5  # hold turn_complete this long so a follow-up idle_prompt can cancel it. 0 disables.
 
 [summary]

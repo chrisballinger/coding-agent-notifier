@@ -19,9 +19,8 @@ from typing import Callable, Iterator
 
 
 def default_state_path() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base else Path.home() / ".cache"
-    return root / "coding-agent-notifier" / "dedup.json"
+    from . import paths
+    return paths.dedup_file()
 
 
 @contextmanager
