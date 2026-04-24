@@ -60,6 +60,16 @@ def config_file() -> Path:
     return root() / "config.toml"
 
 
+def secrets_file() -> Path:
+    """Optional companion file for secrets (bot tokens, webhook URLs).
+
+    Lives next to `config.toml` in the same dot dir. Permissions are
+    ENFORCED — a world/group-readable secrets.toml refuses to load
+    rather than degrading to a warning like config.toml does.
+    """
+    return root() / "secrets.toml"
+
+
 def state_dir() -> Path:
     return root() / "state"
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from . import keychain
 from .event import EventKind
 
 GatingMode = Literal["idle_only", "background_only", "idle_or_background", "always"]
@@ -46,7 +47,15 @@ class SlackConfig:
     channel: str | None = None
     interactive: bool = False
     actionable_approvals: bool = False
+    # Who can click Approve/Deny. `approver_user_ids` is a literal list of
+    # Slack user IDs (U…); `approver_user_groups` is a list of Slack usergroup
+    # (subteam) IDs (S…). A click is allowed if the user matches either list.
+    # At least one list MUST be non-empty when actionable_approvals=true —
+    # an empty allowlist would let anyone in the channel rubber-stamp a tool
+    # call, which is a hard-fail of the security posture in a public or
+    # shared channel. For a private DM with the bot, set your own user ID.
     approver_user_ids: tuple[str, ...] = ()
+    approver_user_groups: tuple[str, ...] = ()
     approval_timeout_seconds: float = 600.0
 
 
@@ -71,7 +80,7 @@ class SummaryConfig:
     tail_chars: int = 250
 
 
-_VALID_SLACK_OVERRIDE_KEYS = frozenset({
+_SLACK_FIELD_KEYS = frozenset({
     "enabled",
     "webhook_url",
     "bot_token",
@@ -80,8 +89,14 @@ _VALID_SLACK_OVERRIDE_KEYS = frozenset({
     "interactive",
     "actionable_approvals",
     "approver_user_ids",
+    "approver_user_groups",
     "approval_timeout_seconds",
 })
+# Keys accepted in a [[routes]].slack block. `workspace` is extra: it names
+# which `[slack.workspaces.<name>]` to use as the base, and is NOT a
+# SlackConfig field — `_override_slack` consumes it before applying the
+# remaining field overrides.
+_VALID_SLACK_OVERRIDE_KEYS = _SLACK_FIELD_KEYS | {"workspace"}
 _VALID_DISCORD_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url"})
 
 
@@ -100,7 +115,11 @@ class Config:
     gating: GatingMode = "idle_or_background"
     tool_input_max_chars: int = 400
     events: dict[EventKind, EventConfig] = field(default_factory=dict)
+    # Back-compat handle for the "default" workspace (or an empty config if
+    # no default exists). All non-route code paths still read `config.slack`;
+    # code that needs multi-workspace awareness walks `config.slack_workspaces`.
     slack: SlackConfig = field(default_factory=SlackConfig)
+    slack_workspaces: dict[str, SlackConfig] = field(default_factory=dict)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     routes: tuple[Route, ...] = ()
     display: DisplayConfig = field(default_factory=DisplayConfig)
@@ -113,12 +132,19 @@ class Config:
         return self.event(kind).gating or self.gating
 
 
-def _resolve_env(raw: dict[str, Any], key: str) -> str | None:
-    """Resolve a secret from TOML.
+def _resolve_secret(raw: dict[str, Any], key: str, *, context: str) -> str | None:
+    """Resolve a secret from TOML via inline / env var / macOS Keychain.
 
-    Prefer an inline value at `key`; fall back to `os.environ[raw[f"{key}_env"]]`.
-    A missing env var returns None rather than raising — the `enabled`/feature
-    checks catch the real misconfiguration with a clearer message.
+    Precedence: inline `key` > `{key}_env` (env var lookup) > `{key}_keychain`
+    (Keychain account label). A missing env var returns None — the caller's
+    `enabled`/feature checks turn that into a clearer "feature X requires
+    <key>" error. A configured Keychain lookup that fails is a different
+    story: the user explicitly asked for a Keychain read, so both "account
+    not in Keychain" and real subprocess failures raise ConfigError rather
+    than silently returning None (see `keychain.py` docstring for why).
+
+    `context` is a path string like "sinks.slack" or "slack.workspaces.home"
+    that gets embedded in error messages to help the user locate the problem.
     """
     direct = raw.get(key)
     if isinstance(direct, str) and direct:
@@ -128,6 +154,21 @@ def _resolve_env(raw: dict[str, Any], key: str) -> str | None:
         val = os.environ.get(env_key)
         if val:
             return val
+    kc_account = raw.get(f"{key}_keychain")
+    if isinstance(kc_account, str) and kc_account:
+        try:
+            val = keychain.read(kc_account)
+        except keychain.KeychainError as e:
+            raise ConfigError(
+                f"{context}.{key}_keychain = {kc_account!r}: Keychain read failed: {e}"
+            ) from e
+        if val is None:
+            raise ConfigError(
+                f"{context}.{key}_keychain = {kc_account!r}: no entry in macOS Keychain. "
+                f"Store one with `agent-notify slack add`, or fall back to "
+                f"{key}_env / inline {key}."
+            )
+        return val
     return None
 
 
@@ -152,11 +193,61 @@ def default_config_path() -> Path:
 def load_config(path: Path | None = None, *, stderr=None) -> Config:
     path = path or default_config_path()
     if not path.exists():
+        # Even without a config.toml, a user might have secrets.toml sitting
+        # alongside — but there's nothing for those secrets to fill in, so
+        # treat it as an empty config rather than reading the secrets file.
         return Config()
     raw_text = path.read_text()
     _warn_on_loose_permissions(path, raw_text, stderr=stderr)
     raw = tomllib.loads(raw_text)
+    secrets_path = path.with_name("secrets.toml")
+    secrets_raw = _load_secrets_file(secrets_path)
+    if secrets_raw:
+        raw = _merge_secrets(raw, secrets_raw)
     return parse_config(raw)
+
+
+def _load_secrets_file(path: Path) -> dict[str, Any]:
+    """Read `secrets.toml` if present. Refuses to load on loose permissions.
+
+    Unlike `config.toml` (which warns), `secrets.toml` exists solely to hold
+    credentials — any group/world readability is treated as a real bug and
+    hard-fails with a message pointing at `chmod 600`. Missing file is fine
+    (returns {}).
+    """
+    if not path.exists():
+        return {}
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as e:
+        raise ConfigError(f"could not stat {path}: {e}") from e
+    if mode & 0o077:
+        raise ConfigError(
+            f"{path} is mode {oct(mode)} — secrets.toml must be owner-only "
+            f"(0600 or stricter). Run `chmod 600 {path}` and try again."
+        )
+    try:
+        return tomllib.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"could not parse {path}: {e}") from e
+
+
+def _merge_secrets(base: dict[str, Any], secrets: dict[str, Any]) -> dict[str, Any]:
+    """Fill-in-missing deep merge of `secrets` into `base`.
+
+    `base` (config.toml) wins at every leaf — secrets.toml is a fallback
+    that supplies values config.toml left unset. Tables recurse; scalars in
+    base are preserved. This rule prevents a loose secrets.toml from
+    silently overriding intentional config.toml values.
+    """
+    merged = dict(base)
+    for key, secret_val in secrets.items():
+        if key not in merged:
+            merged[key] = secret_val
+        elif isinstance(merged[key], dict) and isinstance(secret_val, dict):
+            merged[key] = _merge_secrets(merged[key], secret_val)
+        # else: base has a non-dict value — keep it, ignore the secret
+    return merged
 
 
 def _warn_on_loose_permissions(path: Path, raw_text: str, *, stderr=None) -> None:
@@ -201,6 +292,116 @@ def _looks_like_inline_secret(text: str, key: str) -> bool:
     return bool(pattern.search(text))
 
 
+def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> SlackConfig:
+    """Parse a single Slack workspace block (either legacy `[sinks.slack]` or
+    a `[slack.workspaces.<name>]` entry). Validates feature prerequisites so
+    an enabled-but-unconfigured workspace fails at parse time, not at first
+    dispatch."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{context} must be a table")
+    cfg = SlackConfig(
+        enabled=bool(raw.get("enabled", False)),
+        webhook_url=_resolve_secret(raw, "webhook_url", context=context),
+        bot_token=_resolve_secret(raw, "bot_token", context=context),
+        app_token=_resolve_secret(raw, "app_token", context=context),
+        channel=raw.get("channel"),
+        interactive=bool(raw.get("interactive", False)),
+        actionable_approvals=bool(raw.get("actionable_approvals", False)),
+        approver_user_ids=_parse_string_tuple(
+            raw.get("approver_user_ids", []),
+            field=f"{context}.approver_user_ids",
+        ),
+        approver_user_groups=_parse_string_tuple(
+            raw.get("approver_user_groups", []),
+            field=f"{context}.approver_user_groups",
+        ),
+        approval_timeout_seconds=float(raw.get("approval_timeout_seconds", 600.0)),
+    )
+    if cfg.enabled and not (cfg.webhook_url or cfg.bot_token):
+        raise ConfigError(f"{context} is enabled but has no webhook_url or bot_token")
+    if cfg.interactive and not cfg.bot_token:
+        raise ConfigError(f"{context}.interactive=true requires bot_token")
+    if cfg.actionable_approvals:
+        if not cfg.bot_token:
+            raise ConfigError(f"{context}.actionable_approvals=true requires bot_token")
+        if not cfg.app_token:
+            raise ConfigError(
+                f"{context}.actionable_approvals=true requires app_token "
+                "(xapp-* for Socket Mode — get one from api.slack.com under Basic Information)"
+            )
+        # Secure-by-default approver gating. Two acceptable shapes:
+        #
+        #   1. An explicit allowlist (approver_user_ids or approver_user_groups).
+        #      Required for any non-DM channel — anything shared must be gated.
+        #
+        #   2. Empty allowlist + `channel = "@me"` (DM with the bot). Only the
+        #      installing user can see a DM with the bot, so the click origin
+        #      is implicit. The daemon double-checks this at click time by
+        #      asserting the incoming channel_id starts with `D` (Slack's DM
+        #      prefix); if someone somehow routes the message into a non-DM,
+        #      the runtime check fails closed rather than trusting the config.
+        #
+        # Anything else is a footgun and fails at parse time.
+        channel = cfg.channel or "@me"
+        if not cfg.approver_user_ids and not cfg.approver_user_groups:
+            if channel != "@me":
+                raise ConfigError(
+                    f"{context}.actionable_approvals=true with channel="
+                    f"{channel!r} requires a non-empty approver_user_ids or "
+                    "approver_user_groups — otherwise anyone in the channel "
+                    "can click Approve. An empty allowlist is only allowed "
+                    "when channel is '@me' (DM with the bot)."
+                )
+    if cfg.approval_timeout_seconds <= 0:
+        raise ConfigError(f"{context}.approval_timeout_seconds must be > 0")
+    return cfg
+
+
+def _parse_slack_workspaces(raw: dict[str, Any]) -> dict[str, SlackConfig]:
+    """Parse Slack workspaces from both legacy `[sinks.slack]` (→ "default")
+    AND new `[slack.workspaces.<name>]` blocks.
+
+    Defining BOTH `[sinks.slack]` and `[slack.workspaces.default]` is an
+    error — the legacy block implicitly names the default, so having both
+    is ambiguous. Pick one.
+    """
+    sinks = raw.get("sinks", {}) or {}
+    if not isinstance(sinks, dict):
+        raise ConfigError("sinks must be a table")
+    legacy_raw = sinks.get("slack", {}) or {}
+    if not isinstance(legacy_raw, dict):
+        raise ConfigError("sinks.slack must be a table")
+
+    slack_top = raw.get("slack", {}) or {}
+    if not isinstance(slack_top, dict):
+        raise ConfigError("slack must be a table")
+    workspaces_raw = slack_top.get("workspaces", {}) or {}
+    if not isinstance(workspaces_raw, dict):
+        raise ConfigError("slack.workspaces must be a table")
+
+    has_legacy = bool(legacy_raw)
+    has_new_default = "default" in workspaces_raw
+    if has_legacy and has_new_default:
+        raise ConfigError(
+            "both [sinks.slack] and [slack.workspaces.default] are defined. "
+            "Pick one — [sinks.slack] is implicitly the default workspace, so "
+            "defining both is ambiguous. Drop [sinks.slack] or rename one."
+        )
+
+    workspaces: dict[str, SlackConfig] = {}
+    if has_legacy:
+        workspaces["default"] = _parse_slack_workspace(
+            "default", legacy_raw, context="sinks.slack"
+        )
+    for name, ws_raw in workspaces_raw.items():
+        if not isinstance(name, str) or not name:
+            raise ConfigError("slack.workspaces keys must be non-empty strings")
+        workspaces[name] = _parse_slack_workspace(
+            name, ws_raw, context=f"slack.workspaces.{name}"
+        )
+    return workspaces
+
+
 def parse_config(raw: dict[str, Any]) -> Config:
     idle = float(raw.get("idle_threshold_seconds", 60))
     gating = raw.get("gating", "idle_or_background")
@@ -225,39 +426,18 @@ def parse_config(raw: dict[str, Any]) -> Config:
             gating=mode,
         )
 
-    sinks = raw.get("sinks", {}) or {}
-    slack_raw = sinks.get("slack", {}) or {}
-    slack = SlackConfig(
-        enabled=bool(slack_raw.get("enabled", False)),
-        webhook_url=_resolve_env(slack_raw, "webhook_url"),
-        bot_token=_resolve_env(slack_raw, "bot_token"),
-        app_token=_resolve_env(slack_raw, "app_token"),
-        channel=slack_raw.get("channel"),
-        interactive=bool(slack_raw.get("interactive", False)),
-        actionable_approvals=bool(slack_raw.get("actionable_approvals", False)),
-        approver_user_ids=_parse_string_tuple(slack_raw.get("approver_user_ids", []),
-                                              field="sinks.slack.approver_user_ids"),
-        approval_timeout_seconds=float(slack_raw.get("approval_timeout_seconds", 600.0)),
-    )
-    if slack.enabled and not (slack.webhook_url or slack.bot_token):
-        raise ConfigError("sinks.slack is enabled but has no webhook_url or bot_token")
-    if slack.interactive and not slack.bot_token:
-        raise ConfigError("sinks.slack.interactive=true requires bot_token")
-    if slack.actionable_approvals:
-        if not slack.bot_token:
-            raise ConfigError("sinks.slack.actionable_approvals=true requires bot_token")
-        if not slack.app_token:
-            raise ConfigError(
-                "sinks.slack.actionable_approvals=true requires app_token "
-                "(xapp-* for Socket Mode — get one from api.slack.com under Basic Information)"
-            )
-    if slack.approval_timeout_seconds <= 0:
-        raise ConfigError("sinks.slack.approval_timeout_seconds must be > 0")
+    slack_workspaces = _parse_slack_workspaces(raw)
+    # Back-compat handle: `config.slack` == the "default" workspace, or empty
+    # if none was defined. Old single-workspace code paths keep working.
+    slack = slack_workspaces.get("default", SlackConfig())
 
-    discord_raw = sinks.get("discord", {}) or {}
+    discord_sinks = raw.get("sinks", {}) or {}
+    discord_raw = discord_sinks.get("discord", {}) or {}
+    if not isinstance(discord_raw, dict):
+        raise ConfigError("sinks.discord must be a table")
     discord = DiscordConfig(
         enabled=bool(discord_raw.get("enabled", False)),
-        webhook_url=discord_raw.get("webhook_url"),
+        webhook_url=_resolve_secret(discord_raw, "webhook_url", context="sinks.discord"),
     )
 
     routes_raw = raw.get("routes", []) or []
@@ -282,7 +462,30 @@ def parse_config(raw: dict[str, Any]) -> Config:
         unknown = set(discord_override) - _VALID_DISCORD_OVERRIDE_KEYS
         if unknown:
             raise ConfigError(f"routes[{i}].discord has unknown keys: {sorted(unknown)}")
-        routes.append(Route(cwd=cwd, slack=dict(slack_override), discord=dict(discord_override)))
+        ws_ref = slack_override.get("workspace")
+        if ws_ref is not None:
+            if not isinstance(ws_ref, str) or not ws_ref:
+                raise ConfigError(
+                    f"routes[{i}].slack.workspace must be a non-empty string"
+                )
+            if ws_ref not in slack_workspaces:
+                known = sorted(slack_workspaces) or ["(none defined)"]
+                raise ConfigError(
+                    f"routes[{i}].slack.workspace = {ws_ref!r} refs an undefined "
+                    f"workspace. Known workspaces: {known}"
+                )
+        # Coerce tuple-typed overrides so `replace()` downstream preserves
+        # the dataclass's declared types. Without this, a route that sets
+        # `approver_user_ids = [...]` leaves a list where SlackConfig expects
+        # a tuple, which breaks both comparisons and hashability.
+        slack_override_clean = dict(slack_override)
+        for tuple_field in ("approver_user_ids", "approver_user_groups"):
+            if tuple_field in slack_override_clean:
+                slack_override_clean[tuple_field] = _parse_string_tuple(
+                    slack_override_clean[tuple_field],
+                    field=f"routes[{i}].slack.{tuple_field}",
+                )
+        routes.append(Route(cwd=cwd, slack=slack_override_clean, discord=dict(discord_override)))
 
     display_raw = raw.get("display", {}) or {}
     if not isinstance(display_raw, dict):
@@ -317,6 +520,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         tool_input_max_chars=tool_input_max_chars,
         events=events,
         slack=slack,
+        slack_workspaces=slack_workspaces,
         discord=discord,
         routes=tuple(routes),
         display=display,
@@ -347,7 +551,8 @@ def sinks_for(cwd: Path, config: Config) -> tuple[SlackConfig, DiscordConfig] | 
 
     - No routes configured → fall back to the global `[sinks.*]` blocks.
     - Routes configured and one matches → return the base sinks merged with
-      that route's overrides.
+      that route's overrides. `route.slack.workspace = "name"` swaps in that
+      named workspace as the slack base before applying per-route fields.
     - Routes configured and none match → return None. The caller treats this
       as "skip this dispatch" so an unrouted repo never accidentally pings a
       channel belonging to a different project. Users who want a default can
@@ -358,15 +563,46 @@ def sinks_for(cwd: Path, config: Config) -> tuple[SlackConfig, DiscordConfig] | 
     route = match_route(cwd, config)
     if route is None:
         return None
-    slack = _override_slack(config.slack, route.slack)
+    slack = _override_slack(config.slack, route.slack, workspaces=config.slack_workspaces)
     discord = _override_discord(config.discord, route.discord)
     return slack, discord
 
 
-def _override_slack(base: SlackConfig, override: dict[str, Any]) -> SlackConfig:
+def workspace_for(cwd: Path, config: Config) -> str:
+    """Return the workspace name selected for this cwd.
+
+    Matches `sinks_for`'s resolution: if routing selects a named workspace,
+    that name; otherwise "default". Callers use this to stamp the approval
+    record so the hook's timeout-cleanup path can pick the right bot_token.
+    """
+    if not config.routes:
+        return "default"
+    route = match_route(cwd, config)
+    if route is None:
+        return "default"
+    ws_ref = route.slack.get("workspace")
+    if isinstance(ws_ref, str) and ws_ref:
+        return ws_ref
+    return "default"
+
+
+def _override_slack(
+    base: SlackConfig,
+    override: dict[str, Any],
+    *,
+    workspaces: dict[str, SlackConfig],
+) -> SlackConfig:
     if not override:
         return base
-    return replace(base, **{k: override[k] for k in override if k in _VALID_SLACK_OVERRIDE_KEYS})
+    # `workspace` selects the base workspace; the remaining keys patch its fields.
+    # Validated at parse time, so an unknown name here is a programmer error.
+    ws_ref = override.get("workspace")
+    if isinstance(ws_ref, str) and ws_ref in workspaces:
+        base = workspaces[ws_ref]
+    field_overrides = {k: override[k] for k in override if k in _SLACK_FIELD_KEYS}
+    if not field_overrides:
+        return base
+    return replace(base, **field_overrides)
 
 
 def _override_discord(base: DiscordConfig, override: dict[str, Any]) -> DiscordConfig:
@@ -410,46 +646,83 @@ enabled = true                 # include a head/tail snippet of the agent's last
 head_chars = 250
 tail_chars = 250
 
-[sinks.slack]
-# Set enabled = true after filling in a webhook_url or bot_token below.
-enabled = false
-# Pick ONE of:
+# --- Slack workspaces ----------------------------------------------------
+#
+# Define one or more Slack workspaces under [slack.workspaces.<name>]. The
+# wizard (`agent-notify slack add`) writes these for you and stores bot /
+# app tokens in macOS Keychain.
+#
+# Secret resolution for each token tries, in order:
+#   1. Inline value                             (bot_token = "xoxb-…")
+#   2. Environment variable                     (bot_token_env = "VAR_NAME")
+#   3. macOS Keychain                           (bot_token_keychain = "<workspace>:bot_token")
+#   4. secrets.toml (sibling file)              — see §Secrets file below
+#
+# [slack.workspaces.default]
+# enabled = true
+# bot_token_keychain = "default:bot_token"      # xoxb-*
+# app_token_keychain = "default:app_token"      # xapp-* — only for actionable_approvals
+# channel = "@me"                               # DM with the bot (secure default)
+# interactive = true                            # approve/deny buttons on pings
+# actionable_approvals = true                   # block PreToolUse, inject decision
+# approver_user_ids = ["U0YOURID"]              # wizard fills this in automatically
+# approver_user_groups = ["S01OPSTEAM"]         # optional: allow a Slack usergroup
+# approval_timeout_seconds = 600                # hook fails closed (deny) after timeout
+#
+# Empty allowlist (no approver_user_ids, no approver_user_groups) is only
+# accepted when `channel = "@me"` — the daemon double-checks at click time
+# that the Slack channel ID starts with `D` (DM prefix), so stray posts to
+# shared channels can never rubber-stamp tool calls. Any shared/public
+# channel requires an explicit allowlist.
+#
+# For webhook-only pings (no buttons, no approvals), the simpler shape still
+# works:
+# [sinks.slack]                                  # == [slack.workspaces.default]
+# enabled = true
 # webhook_url = "https://hooks.slack.com/services/…"
-# bot_token = "xoxb-…"                # or bot_token_env = "SLACK_BOT_TOKEN"
-# channel = "@me"                     # resolved via auth.test when @me
-
-# Interactive + actionable approvals (requires bot_token and Slack App with Socket Mode).
-# See docs/plans/slack-bot-interactive.md for the full setup flow.
-# interactive = true                  # approve/deny buttons on permission messages
-# actionable_approvals = true         # wire the blocking PreToolUse hook — approvals
-                                       # actually resolve the pending tool call, not
-                                       # just notify
-# app_token_env = "SLACK_APP_TOKEN"    # xapp-* app-level token (Socket Mode)
-# approver_user_ids = ["U0123ABC"]    # Slack user IDs allowed to click buttons
-# approval_timeout_seconds = 600      # hook blocks this long before failing closed (deny)
 
 [sinks.discord]
 enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
 
 # Per-repo routing. First matching route wins. Paths expand `~` and support
-# `fnmatch` wildcards (`*`, `?`, `[abc]`). Override just the fields you want
-# to change; everything else inherits from the sink blocks above.
+# `fnmatch` wildcards (`*`, `?`, `[abc]`). Each route can:
+#   - select a different workspace via `slack.workspace = "work"`
+#   - override any individual field (channel, approver_user_ids, …)
 #
 # *** STRICT MODE ***
 # As soon as any [[routes]] entry exists, unmatched cwds send NOTHING — we
-# never fall back to [sinks.slack] for safety. Add a catch-all route (cwd =
-# "*") at the end if you want a default ping destination.
+# never fall back to the default workspace. Add a catch-all (cwd = "*") at
+# the end if you want a fallback destination.
 #
 # [[routes]]
 # cwd = "~/work/acme-*"
-# slack.webhook_url = "https://hooks.slack.com/services/acme-work/…"
+# slack.workspace = "work"         # references [slack.workspaces.work]
+# slack.channel = "#agents-acme"
 #
 # [[routes]]
 # cwd = "~/personal/*"
-# slack.channel = "#me-only"       # overrides channel when using a bot_token
+# slack.workspace = "default"
+# slack.channel = "@me"
 #
 # [[routes]]
 # cwd = "*"                        # explicit catch-all (opt-in to fallback)
-# slack.webhook_url = "https://hooks.slack.com/services/default/…"
+# slack.workspace = "default"
+
+# --- Secrets file (optional) ---------------------------------------------
+#
+# If you want to keep bot tokens out of this file (e.g. to commit config.toml
+# to a dotfiles repo), drop them into a sibling `secrets.toml` with the same
+# shape. Values there fill in missing keys here; if a key is set in BOTH
+# files, config.toml wins. secrets.toml permissions are ENFORCED at 0600 —
+# loose perms abort the load rather than warn.
+#
+#   ~/.agent-notify/config.toml   (0600)   — structure, routing, non-secrets
+#   ~/.agent-notify/secrets.toml  (0600)   — just the token values
+#
+# Example ~/.agent-notify/secrets.toml:
+#
+#   [slack.workspaces.default]
+#   bot_token = "xoxb-…"
+#   app_token = "xapp-…"
 """
