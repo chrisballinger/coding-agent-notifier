@@ -7,6 +7,7 @@ dangerous operations so the sink can visually escalate them.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass
@@ -46,6 +47,9 @@ class ToolRender:
     # monospace code fence. Only a handful of renderers (AskUserQuestion) need
     # this; Bash/Edit/etc. keep the default so commands stay monospaced.
     code_block: bool = True
+    # Language hint for the code fence (e.g. "diff"). Discord honors this for
+    # syntax highlighting; Slack ignores but the hint is harmless.
+    code_block_lang: str = ""
 
 
 Renderer = Callable[[dict[str, Any], int], ToolRender]
@@ -94,14 +98,18 @@ def _render_file_edit(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
     path = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
     if not path:
         return ToolRender()
-    # For Edit, try to hint at the change. For Write, skip the detail — file
-    # content can be huge.
+    old_str = tool_input.get("old_string")
     new_str = tool_input.get("new_string")
     summary = f"`{path}`"
-    detail = None
+    # Prefer a unified diff when both sides are present — a wall of `new_string`
+    # is unreadable on phone for multi-line edits.
+    if isinstance(old_str, str) and isinstance(new_str, str):
+        diff = _unified_diff(old_str, new_str, max_chars)
+        if diff:
+            return ToolRender(summary=summary, detail=diff, code_block_lang="diff")
     if isinstance(new_str, str) and new_str.strip():
-        detail = truncate(new_str.strip(), max_chars)
-    return ToolRender(summary=summary, detail=detail)
+        return ToolRender(summary=summary, detail=truncate(new_str.strip(), max_chars))
+    return ToolRender(summary=summary)
 
 
 def _render_write(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
@@ -119,7 +127,22 @@ def _render_multi_edit(tool_input: dict[str, Any], max_chars: int) -> ToolRender
     n = len(edits) if isinstance(edits, list) else 0
     if not path and n == 0:
         return ToolRender()
-    return ToolRender(summary=f"`{path}` — {n} edit{'s' if n != 1 else ''}")
+    summary = f"`{path}` — {n} edit{'s' if n != 1 else ''}"
+    if isinstance(edits, list) and edits:
+        chunks: list[str] = []
+        for i, e in enumerate(edits, 1):
+            if not isinstance(e, dict):
+                continue
+            old = e.get("old_string")
+            new = e.get("new_string")
+            if isinstance(old, str) and isinstance(new, str):
+                d = _unified_diff(old, new, max_chars)
+                if d:
+                    chunks.append(f"# edit {i}\n{d}" if n > 1 else d)
+        if chunks:
+            detail = truncate("\n".join(chunks), max_chars)
+            return ToolRender(summary=summary, detail=detail, code_block_lang="diff")
+    return ToolRender(summary=summary)
 
 
 def _render_read(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
@@ -224,3 +247,22 @@ _H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 def _first_heading(markdown: str) -> str | None:
     m = _H1_RE.search(markdown)
     return m.group(1).strip() if m else None
+
+
+def _unified_diff(old: str, new: str, max_chars: int) -> str:
+    """Produce a header-less unified diff with small context window.
+
+    Drop the `--- old` / `+++ new` header lines — the sink already surfaces
+    the filename. Small context (n=2) keeps phone-sized diffs readable.
+    """
+    if old == new:
+        return ""
+    lines = list(difflib.unified_diff(
+        old.splitlines(),
+        new.splitlines(),
+        lineterm="",
+        n=2,
+    ))
+    # Strip the `---`/`+++` header lines (always the first two in a diff).
+    stripped = [ln for ln in lines if not ln.startswith("--- ") and not ln.startswith("+++ ")]
+    return truncate("\n".join(stripped), max_chars)

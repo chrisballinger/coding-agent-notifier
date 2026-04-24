@@ -97,6 +97,39 @@ def test_slack_message_linkifies_urls():
     assert "<https://docs.example.com/x|docs.example.com>" in found
 
 
+# --- Slack diff fence ---
+
+
+def test_slack_edit_renders_diff_fence():
+    body = build_slack_message(_event(
+        tool_name="Edit",
+        tool_input={
+            "file_path": "/p/foo.py",
+            "old_string": "a = 1",
+            "new_string": "a = 2",
+        },
+    ))
+    joined = json.dumps(body)
+    assert "```diff" in joined
+    assert "-a = 1" in joined
+    assert "+a = 2" in joined
+
+
+def test_discord_edit_renders_diff_fence():
+    body = build_discord_message(_event(
+        tool_name="Edit",
+        tool_input={
+            "file_path": "/p/foo.py",
+            "old_string": "a = 1",
+            "new_string": "a = 2",
+        },
+    ))
+    desc = body["embeds"][0]["description"]
+    assert "```diff" in desc
+    assert "-a = 1" in desc
+    assert "+a = 2" in desc
+
+
 # --- Slack iOS fallback text ---
 
 

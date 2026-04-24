@@ -78,13 +78,43 @@ def test_exit_plan_mode_missing_field():
     assert render("ExitPlanMode", {"other": "x"}) == ToolRender()
 
 
-def test_edit_with_new_string():
+def test_edit_with_new_string_only():
     r = render("Edit", {"file_path": "/p/foo.py", "new_string": "changed"})
     assert r.summary == "`/p/foo.py`"
     assert r.detail == "changed"
+    assert r.code_block_lang == ""
 
 
-def test_edit_without_new_string():
+def test_edit_produces_unified_diff_when_both_sides_present():
+    r = render("Edit", {
+        "file_path": "/p/foo.py",
+        "old_string": "a = 1\nb = 2\nc = 3",
+        "new_string": "a = 1\nb = 20\nc = 3",
+    })
+    assert r.summary == "`/p/foo.py`"
+    assert r.code_block_lang == "diff"
+    # Header lines stripped
+    assert "--- " not in r.detail
+    assert "+++ " not in r.detail
+    # Contains the actual +/- change
+    assert "-b = 2" in r.detail
+    assert "+b = 20" in r.detail
+
+
+def test_edit_diff_empty_when_unchanged():
+    # No actual change — fall through to new_string-only rendering (since that's
+    # still truthy and non-empty).
+    r = render("Edit", {
+        "file_path": "/p/foo.py",
+        "old_string": "same",
+        "new_string": "same",
+    })
+    # When old == new, we skip the diff and fall through to new_string display
+    assert r.code_block_lang == ""
+    assert r.detail == "same"
+
+
+def test_edit_without_old_or_new_string():
     r = render("Edit", {"file_path": "/p/foo.py"})
     assert r.summary == "`/p/foo.py`"
     assert r.detail is None
@@ -108,6 +138,23 @@ def test_multi_edit_counts():
     r = render("MultiEdit", {"file_path": "/p/a.py", "edits": [{}, {}, {}]})
     assert "/p/a.py" in r.summary
     assert "3 edits" in r.summary
+
+
+def test_multi_edit_produces_diff_per_hunk():
+    r = render("MultiEdit", {
+        "file_path": "/p/a.py",
+        "edits": [
+            {"old_string": "x = 1", "new_string": "x = 2"},
+            {"old_string": "y = 3", "new_string": "y = 4"},
+        ],
+    })
+    assert r.code_block_lang == "diff"
+    assert "-x = 1" in r.detail
+    assert "+x = 2" in r.detail
+    assert "-y = 3" in r.detail
+    assert "+y = 4" in r.detail
+    assert "# edit 1" in r.detail
+    assert "# edit 2" in r.detail
 
 
 def test_multi_edit_singular():

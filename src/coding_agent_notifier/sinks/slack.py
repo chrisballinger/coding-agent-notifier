@@ -107,7 +107,12 @@ def build_slack_message(
     if body:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
     if tool.detail:
-        detail_text = f"```\n{tool.detail}\n```" if tool.code_block else tool.detail
+        if tool.code_block:
+            lang = tool.code_block_lang
+            fence = f"```{lang}\n" if lang else "```\n"
+            detail_text = f"{fence}{tool.detail}\n```"
+        else:
+            detail_text = tool.detail
         blocks.append(
             {"type": "section",
              "text": {"type": "mrkdwn", "text": detail_text}}

@@ -63,7 +63,9 @@ def build_discord_message(
         description_parts.append(summary)
     if tool.detail:
         if tool.code_block:
-            description_parts.append(f"```\n{tool.detail}\n```")
+            lang = tool.code_block_lang
+            fence = f"```{lang}\n" if lang else "```\n"
+            description_parts.append(f"{fence}{tool.detail}\n```")
         else:
             description_parts.append(tool.detail)
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 import traceback
@@ -138,6 +137,10 @@ def cmd_hook(args: argparse.Namespace) -> int:
         if not should_send(event, config, _snapshot_state()):
             return 0
         pending.write(event)
+        _log_event(
+            f"hook queued turn_complete agent={event.agent} "
+            f"sess={event.session_id} spawning={sys.executable}"
+        )
         _spawn_defer_child(args.config, event.agent, event.session_id)
         return 0
 
@@ -149,16 +152,9 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 
 def cmd_defer_dispatch(args: argparse.Namespace) -> int:
-    agent = args.agent
-    session_id = args.session_id or None
-    config = load_config(args.config)
-    if config.display.coalesce_window_seconds > 0:
-        _sleep(config.display.coalesce_window_seconds)
-    event = pending.claim(agent, session_id)
-    if event is None:
-        return 0  # superseded by a follow-up idle_prompt, or expired
-    event = _maybe_apply_snippet(event, config)
-    _dispatch(event, config)
+    # Retained for backward compatibility / manual invocation; the production
+    # path uses double-fork `_run_defer_inline` and never re-execs through argv.
+    _run_defer_inline(args.config, args.agent, args.session_id or None)
     return 0
 
 
@@ -193,27 +189,110 @@ def _maybe_apply_snippet(event: Event, config: Config) -> Event:
 def _spawn_defer_child(
     config_path: Path | None, agent: str, session_id: str | None
 ) -> None:
-    """Fork-and-forget a detached child that runs `_defer-dispatch` later.
+    """POSIX double-fork a daemon grandchild that runs the defer dispatch.
 
-    Using `start_new_session=True` with stdin/stdout/stderr redirected to
-    /dev/null so Claude Code's hook returns instantly without waiting on the
-    child. Exceptions during spawn are swallowed — a coalesce miss is far less
-    bad than blocking the agent.
+    We tried `subprocess.Popen(start_new_session=True, stderr=<log>)` first and
+    found the child was dying before it could write a single log line —
+    despite stderr pointing at defer.log. Some combination of Claude Code's
+    hook process lifecycle and subprocess re-exec was killing it.
+
+    Double-fork sidesteps all of that: the grandchild inherits the parent's
+    interpreter (no re-import, no `sys.executable` dependency), detaches from
+    the session via `setsid`, and is reparented to init when the middle
+    process exits — so Claude Code can't reap it. The parent reaps the middle
+    process immediately so it doesn't become a zombie.
     """
     try:
-        argv: list[str] = [sys.executable, "-m", "coding_agent_notifier.cli"]
-        if config_path is not None:
-            argv += ["--config", str(config_path)]
-        argv += ["_defer-dispatch", agent, session_id or ""]
-        subprocess.Popen(
-            argv,
-            start_new_session=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        first = os.fork()
     except OSError as e:
-        print(f"agent-notify: failed to spawn defer child: {e}", file=sys.stderr)
+        print(f"agent-notify: failed to fork defer child: {e}", file=sys.stderr)
+        return
+    if first != 0:
+        # Parent: reap the middle child (which exits instantly) and return.
+        try:
+            os.waitpid(first, 0)
+        except OSError:
+            pass
+        return
+    # Middle process: detach from session, fork again, exit so the
+    # grandchild is reparented to init (PID 1).
+    try:
+        os.setsid()
+        second = os.fork()
+        if second != 0:
+            os._exit(0)
+    except OSError:
+        os._exit(0)
+    # Grandchild: this is the daemon. Redirect stdio to /dev/null and stderr
+    # to defer.log, then run the dispatch inline.
+    try:
+        _daemonize_fds()
+        _run_defer_inline(config_path, agent, session_id)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        os._exit(0)
+
+
+def _daemonize_fds() -> None:
+    """Redirect stdin/stdout/stderr for the daemon grandchild.
+
+    stdin/stdout → /dev/null; stderr → defer.log (append). The redirection
+    happens before any real work so a crash during load_config / import
+    surfaces in the log rather than being swallowed."""
+    log_path = _defer_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    err_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(err_fd, 2)
+    if devnull > 2:
+        os.close(devnull)
+    if err_fd > 2:
+        os.close(err_fd)
+
+
+def _run_defer_inline(
+    config_path: Path | None, agent: str, session_id: str | None
+) -> None:
+    """Run the defer dispatch without re-parsing argv. Mirrors cmd_defer_dispatch.
+
+    Kept separate so the double-fork grandchild doesn't pay import / argparse
+    cost and so tests can exercise the same code path without actually forking.
+    """
+    _log_event(f"defer grandchild started agent={agent} sess={session_id}")
+    config = load_config(config_path)
+    if config.display.coalesce_window_seconds > 0:
+        _sleep(config.display.coalesce_window_seconds)
+    event = pending.claim(agent, session_id)
+    if event is None:
+        _log_event(f"defer grandchild exit: no pending sess={session_id}")
+        return
+    event = _maybe_apply_snippet(event, config)
+    _log_event(f"defer grandchild dispatching sess={session_id} msg_len={len(event.message)}")
+    _dispatch(event, config)
+    _log_event(f"defer grandchild done sess={session_id}")
+
+
+def _defer_log_path() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "coding-agent-notifier" / "defer.log"
+
+
+def _log_event(msg: str) -> None:
+    """Append a timestamped line to defer.log. Swallows all errors — a hook
+    logging failure must never block the agent. Used to audit the defer
+    pipeline (pending write, subprocess spawn, claim, dispatch)."""
+    try:
+        path = _defer_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] pid={os.getpid()} {msg}\n")
+    except OSError:
+        pass
 
 
 def _is_duplicate(event: Event) -> bool:
