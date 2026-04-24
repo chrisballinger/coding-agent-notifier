@@ -186,11 +186,22 @@ def match_route(cwd: Path, config: Config) -> Route | None:
     return None
 
 
-def sinks_for(cwd: Path, config: Config) -> tuple[SlackConfig, DiscordConfig]:
-    """Apply any matching route's sink overrides on top of the base configs."""
+def sinks_for(cwd: Path, config: Config) -> tuple[SlackConfig, DiscordConfig] | None:
+    """Resolve sink configs for this repo path, honoring strict routing.
+
+    - No routes configured → fall back to the global `[sinks.*]` blocks.
+    - Routes configured and one matches → return the base sinks merged with
+      that route's overrides.
+    - Routes configured and none match → return None. The caller treats this
+      as "skip this dispatch" so an unrouted repo never accidentally pings a
+      channel belonging to a different project. Users who want a default can
+      add an explicit catch-all route (`cwd = "*"`).
+    """
+    if not config.routes:
+        return config.slack, config.discord
     route = match_route(cwd, config)
     if route is None:
-        return config.slack, config.discord
+        return None
     slack = _override_slack(config.slack, route.slack)
     discord = _override_discord(config.discord, route.discord)
     return slack, discord
@@ -243,6 +254,11 @@ enabled = false
 # `fnmatch` wildcards (`*`, `?`, `[abc]`). Override just the fields you want
 # to change; everything else inherits from the sink blocks above.
 #
+# *** STRICT MODE ***
+# As soon as any [[routes]] entry exists, unmatched cwds send NOTHING — we
+# never fall back to [sinks.slack] for safety. Add a catch-all route (cwd =
+# "*") at the end if you want a default ping destination.
+#
 # [[routes]]
 # cwd = "~/work/acme-*"
 # slack.webhook_url = "https://hooks.slack.com/services/acme-work/…"
@@ -250,4 +266,8 @@ enabled = false
 # [[routes]]
 # cwd = "~/personal/*"
 # slack.channel = "#me-only"       # overrides channel when using a bot_token
+#
+# [[routes]]
+# cwd = "*"                        # explicit catch-all (opt-in to fallback)
+# slack.webhook_url = "https://hooks.slack.com/services/default/…"
 """

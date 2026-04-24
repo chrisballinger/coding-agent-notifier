@@ -109,6 +109,22 @@ slack.enabled = false
 
 Patterns use `fnmatch`-style globs (`*`, `?`, `[abc]`) with `~` expansion. Use `agent-notify doctor` from inside a repo to confirm which route (if any) matches your current `cwd`.
 
+### Strict routing — no cross-project leakage
+
+**As soon as any `[[routes]]` entry exists, routing becomes strict**: if the hook's `cwd` doesn't match *any* route, the notification is silently skipped (with a one-line stderr note) instead of falling back to `[sinks.slack]`. This prevents the hazard where you clone a new repo you forgot to route, and its events accidentally ping the channel of a different project.
+
+If you *want* a catch-all, add one explicitly at the end — it's just a route:
+
+```toml
+[[routes]]
+cwd = "~/work/acme-*"
+slack.webhook_url = "https://hooks.slack.com/services/work/…"
+
+[[routes]]
+cwd = "*"                                               # catch-all
+slack.webhook_url = "https://hooks.slack.com/services/personal/…"
+```
+
 ## Commands
 
 | Command                                | What it does                                                   |

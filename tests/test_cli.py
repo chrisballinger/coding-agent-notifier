@@ -183,6 +183,40 @@ webhook_url = "https://hook.test/x"
     assert "Gating suppressed" in capsys.readouterr().err
 
 
+def test_hook_skips_dispatch_when_no_route_matches(monkeypatch, tmp_path: Path, capsys):
+    """Strict routing: if routes exist and none match, we skip the ping
+    (avoiding cross-project leakage) and log to stderr."""
+    repo = tmp_path / "stranger" / "repo"
+    repo.mkdir(parents=True)
+    cfg = _write_config(
+        tmp_path,
+        f"""
+gating = "always"
+[sinks.slack]
+enabled = true
+webhook_url = "https://default.test/hook"
+
+[[routes]]
+cwd = "{tmp_path / 'work' / '*'}"
+slack.webhook_url = "https://work.test/acme"
+""".strip(),
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    payload = {"hook_event_name": "Stop", "cwd": str(repo), "session_id": "sess-x"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert calls == [], "must not fall back to global sink when routes exist"
+    err = capsys.readouterr().err
+    assert "no [[routes]] entry matches" in err
+
+
 def test_hook_routes_to_per_repo_webhook(monkeypatch, tmp_path: Path):
     repo = tmp_path / "work" / "acme"
     repo.mkdir(parents=True)
@@ -262,7 +296,8 @@ slack.channel = "#never"
     monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
     cli.main(["--config", str(cfg), "doctor"])
     out = capsys.readouterr().out
-    assert "no route matches" in out
+    assert "NO ROUTE MATCHES" in out
+    assert "strict" in out
 
 
 def test_doctor_reports_config_error(monkeypatch, tmp_path: Path, capsys):

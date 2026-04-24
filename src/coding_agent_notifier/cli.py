@@ -201,12 +201,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  slack:   enabled={config.slack.enabled} webhook={bool(config.slack.webhook_url)} bot={bool(config.slack.bot_token)}")
     print(f"  discord: enabled={config.discord.enabled} webhook={bool(config.discord.webhook_url)}")
     if config.routes:
-        print(f"  routes:  {len(config.routes)} configured")
+        print(f"  routes:  {len(config.routes)} configured (strict: unmatched paths skipped)")
         matched = match_route(Path.cwd(), config)
         if matched is not None:
             print(f"    cwd={Path.cwd()} → matches {matched.cwd!r}")
         else:
-            print(f"    cwd={Path.cwd()} → no route matches (falls back to global sinks)")
+            print(
+                f"    cwd={Path.cwd()} → NO ROUTE MATCHES — notifications for this "
+                f"path will be skipped. Add a `[[routes]]` entry or a `cwd = \"*\"` "
+                f"catch-all if you want coverage here."
+            )
 
     state = _snapshot_state()
     print(f"System: idle={state.idle_seconds}s frontmost={state.frontmost_app!r}")
@@ -229,7 +233,16 @@ def _snapshot_state() -> SystemState:
 
 
 def _dispatch(event: Event, config: Config) -> None:
-    slack_cfg, discord_cfg = sinks_for(event.cwd, config)
+    resolved = sinks_for(event.cwd, config)
+    if resolved is None:
+        print(
+            f"agent-notify: no [[routes]] entry matches {event.cwd} — skipping "
+            f"to avoid cross-project leakage. Add a route (or `cwd = \"*\"` "
+            f"catch-all) to re-enable notifications for this path.",
+            file=sys.stderr,
+        )
+        return
+    slack_cfg, discord_cfg = resolved
     sinks: list[Sink] = []
     if slack_cfg.enabled:
         sinks.append(SlackSink(slack_cfg, tool_input_max_chars=config.tool_input_max_chars))
