@@ -162,6 +162,43 @@ def test_head_tail_only_head_appends_ellipsis():
     assert snippet == "x" * 50 + "…"
 
 
+def test_head_tail_snaps_head_to_word_boundary():
+    # Sentence designed so char 250 lands in the middle of "sa_within".
+    prefix = "A" * 240 + " the sawithin"  # char 250 lands in "sawithin"
+    suffix = " B" * 300
+    text = prefix + suffix
+    snippet = head_tail_snippet(text, head=250, tail=100)
+    # Must not end with a truncated word like "sa"
+    head = snippet.split("\n…\n")[0]
+    assert not head.endswith("sa"), f"head ended mid-word: {head!r}"
+    # Must end at the last whitespace boundary within the window
+    assert head.endswith("the")
+
+
+def test_head_tail_snaps_tail_to_word_boundary():
+    prefix = "A " * 300
+    # Deliberately arrange so text[-250:] begins mid-word ("ithin").
+    suffix_tail = "within the tail " + "B" * 240
+    text = prefix + suffix_tail
+    snippet = head_tail_snippet(text, head=100, tail=250)
+    tail = snippet.split("\n…\n")[1]
+    # Tail must start at a word boundary — not mid-word like "ithin".
+    assert not tail.startswith("ithin")
+    # First "word" in tail should appear intact in the original text
+    first_word = tail.split(" ", 1)[0].split("\n", 1)[0]
+    assert f" {first_word}" in text or text.startswith(first_word)
+
+
+def test_head_tail_no_whitespace_preserves_content():
+    """A giant URL or base64 with no spaces shouldn't collapse to empty after snapping."""
+    text = "x" * 800
+    snippet = head_tail_snippet(text, head=100, tail=100)
+    # Should still have substantive content on both sides of the ellipsis
+    head, _, tail = snippet.partition("\n…\n")
+    assert len(head) > 50
+    assert len(tail) > 50
+
+
 def test_head_tail_only_tail_prepends_ellipsis():
     text = "y" * 1000
     snippet = head_tail_snippet(text, head=0, tail=50)

@@ -43,6 +43,7 @@ def read_last_assistant_text(path: Path) -> str | None:
 def head_tail_snippet(text: str, *, head: int = 250, tail: int = 250) -> str:
     """Return `text` unchanged if short; else head+ellipsis+tail preview.
 
+    Snaps each cut to the nearest whitespace so words don't break mid-letter.
     With head=0 only the tail is kept and `…` is prefixed; with tail=0 only the
     head is kept and `…` is appended. With both 0 the result is empty.
     """
@@ -51,13 +52,40 @@ def head_tail_snippet(text: str, *, head: int = 250, tail: int = 250) -> str:
         return ""
     if len(text) <= head + tail + 5:
         return text
-    head_part = text[:head].rstrip() if head > 0 else ""
-    tail_part = text[-tail:].lstrip() if tail > 0 else ""
+    head_part = _snap_head(text[:head]) if head > 0 else ""
+    tail_part = _snap_tail(text[-tail:]) if tail > 0 else ""
     if head_part and tail_part:
         return f"{head_part}\n…\n{tail_part}"
     if head_part:
         return f"{head_part}…"
     return f"…{tail_part}"
+
+
+def _snap_head(chunk: str) -> str:
+    """Trim `chunk` back to the last whitespace so we never end mid-word.
+
+    Only snaps when at least half the budget is preserved — otherwise a word
+    with no internal whitespace (e.g. a URL) would collapse to an empty string.
+    """
+    stripped = chunk.rstrip()
+    idx = max(stripped.rfind(" "), stripped.rfind("\n"))
+    if idx > len(stripped) // 2:
+        stripped = stripped[:idx].rstrip()
+    return stripped
+
+
+def _snap_tail(chunk: str) -> str:
+    """Trim `chunk` forward from the first whitespace so we never start mid-word."""
+    stripped = chunk.lstrip()
+    idx_space = stripped.find(" ")
+    idx_nl = stripped.find("\n")
+    cuts = [i for i in (idx_space, idx_nl) if i >= 0]
+    if not cuts:
+        return stripped
+    idx = min(cuts)
+    if 0 < idx < len(stripped) // 2:
+        stripped = stripped[idx + 1:].lstrip()
+    return stripped
 
 
 def _extract_assistant_text(obj: Any) -> str:

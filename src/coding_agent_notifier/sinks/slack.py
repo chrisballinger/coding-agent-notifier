@@ -177,15 +177,31 @@ def _mrkdwn_polish(text: str) -> str:
     return text
 
 
+_IOS_PREVIEW_MAX = 140
+
+
 def _fallback_text(event: Event, tool: ToolRender, dangerous: bool) -> str:
+    """Compose the Slack `text` field — what iOS renders in the push preview.
+
+    Slack mobile also displays this above the attachment in-app, so a full-body
+    dump produces visible duplication. Keep it to a single line, capped at
+    140 chars; the rich content still lives in the attachment blocks.
+    """
     bits = []
     if dangerous:
         bits.append("⚠️ DANGEROUS")
     bits.append(event.title)
     summary = tool.summary or event.message
     if summary:
-        bits.append(summary)
+        bits.append(_single_line(summary, _IOS_PREVIEW_MAX))
     return " — ".join(b for b in bits if b)
+
+
+def _single_line(text: str, limit: int) -> str:
+    flat = " ".join(text.split())  # collapse whitespace + newlines
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
 
 
 def _safe_json(text: str) -> dict:

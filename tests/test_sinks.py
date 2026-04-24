@@ -97,6 +97,33 @@ def test_slack_message_linkifies_urls():
     assert "<https://docs.example.com/x|docs.example.com>" in found
 
 
+# --- Slack iOS fallback text ---
+
+
+def test_slack_fallback_text_is_single_line_and_capped():
+    """The `text` field is what iOS renders in the push preview. Avoid
+    duplication / wall of text by collapsing newlines and capping length."""
+    long_body = "word " * 200  # 1000+ chars across many spaces
+    body = build_slack_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=long_body)
+    )
+    text = body["text"]
+    assert "\n" not in text
+    # Allow a little over 140 for the "Claude Code ... — " prefix
+    assert len(text) <= 200
+    assert "…" in text  # truncation marker
+
+
+def test_slack_fallback_collapses_multiline_body():
+    body = build_slack_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None,
+               message="line one\n…\nline two")
+    )
+    text = body["text"]
+    assert "\n" not in text
+    assert "line one" in text
+
+
 # --- Slack terse mode ---
 
 
