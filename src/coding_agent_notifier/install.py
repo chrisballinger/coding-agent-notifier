@@ -10,6 +10,27 @@ import tomlkit
 CLAUDE_HOOK_COMMAND = "agent-notify hook --source claude-code"
 CODEX_HOOK_COMMAND_PARTS = ["agent-notify", "hook", "--source", "codex"]
 
+# PreToolUse is a blocking decision hook — its timeout must be long enough to
+# survive a lock-screen approval round-trip. 10min matches Claude Code's
+# documented default; we make it explicit so a user with a shorter global
+# default doesn't fail-close prematurely.
+PRETOOLUSE_TIMEOUT_SECONDS = 600
+
+CLAUDE_PRETOOLUSE_ENTRIES: dict[str, list[dict[str, Any]]] = {
+    "PreToolUse": [
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": CLAUDE_HOOK_COMMAND,
+                    "timeout": PRETOOLUSE_TIMEOUT_SECONDS,
+                }
+            ],
+        }
+    ],
+}
+
 CLAUDE_HOOK_ENTRIES: dict[str, list[dict[str, Any]]] = {
     "Notification": [
         {
@@ -103,6 +124,114 @@ def install_claude_code(settings_path: Path | None = None) -> list[str]:
     new_settings, added = merge_claude_hooks(settings)
     settings_path.write_text(json.dumps(new_settings, indent=2) + "\n")
     return added
+
+
+def merge_claude_pretooluse(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Add the PreToolUse blocking hook. Idempotent."""
+    hooks = settings.setdefault("hooks", {})
+    added: list[str] = []
+    for event, new_entries in CLAUDE_PRETOOLUSE_ENTRIES.items():
+        existing = hooks.setdefault(event, [])
+        if _has_our_hook(existing):
+            continue
+        existing.extend(new_entries)
+        added.append(event)
+    return settings, added
+
+
+LAUNCHD_LABEL = "com.chrisballinger.agent-notify-daemon"
+
+
+def install_slack_bot(
+    settings_path: Path | None = None,
+    *,
+    launch_agents_dir: Path | None = None,
+    agent_notify_bin: str = "agent-notify",
+    install_plist: bool = True,
+) -> dict[str, Any]:
+    """Install the PreToolUse hook into Claude Code settings and (optionally)
+    a launchd plist that supervises `agent-notify daemon`.
+
+    Returns a summary dict with keys:
+      - `claude_hooks_added`: list of Claude hook event names added.
+      - `plist_path`: path of the launchd plist (whether newly written or
+        pre-existing), or None if `install_plist=False`.
+      - `plist_written`: bool, True if we actually wrote the plist (it was
+        missing or differed from the desired content).
+    """
+    settings_path = settings_path or (Path.home() / ".claude" / "settings.json")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings: dict[str, Any] = {}
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text() or "{}")
+    _backup(settings_path)
+    # Include the base hooks too — running install-slack-bot on a fresh
+    # install shouldn't require a prior `install claude-code`.
+    settings, base_added = merge_claude_hooks(settings)
+    settings, pre_added = merge_claude_pretooluse(settings)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    claude_added = base_added + pre_added
+
+    summary: dict[str, Any] = {
+        "claude_hooks_added": claude_added,
+        "plist_path": None,
+        "plist_written": False,
+    }
+
+    if install_plist:
+        la_dir = launch_agents_dir or (Path.home() / "Library" / "LaunchAgents")
+        la_dir.mkdir(parents=True, exist_ok=True)
+        plist_path = la_dir / f"{LAUNCHD_LABEL}.plist"
+        desired = _launchd_plist_contents(agent_notify_bin)
+        write = True
+        if plist_path.exists():
+            if plist_path.read_text() == desired:
+                write = False
+        if write:
+            _backup(plist_path)
+            plist_path.write_text(desired)
+        summary["plist_path"] = plist_path
+        summary["plist_written"] = write
+
+    return summary
+
+
+def _launchd_plist_contents(agent_notify_bin: str) -> str:
+    """Minimal launchd plist that keeps `agent-notify daemon` alive.
+
+    RunAtLoad + KeepAlive restarts on crash; we log stderr to defer.log's
+    sibling so the user has a single place to check. Not using
+    ProcessType=Background because the daemon needs network + may spawn
+    child processes for outgoing HTTPS.
+    """
+    log_path = str(Path.home() / ".cache" / "coding-agent-notifier" / "daemon.log")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{agent_notify_bin}</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+"""
 
 
 def install_codex(

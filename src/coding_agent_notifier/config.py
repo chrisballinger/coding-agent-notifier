@@ -42,7 +42,12 @@ class SlackConfig:
     enabled: bool = False
     webhook_url: str | None = None
     bot_token: str | None = None
+    app_token: str | None = None
     channel: str | None = None
+    interactive: bool = False
+    actionable_approvals: bool = False
+    approver_user_ids: tuple[str, ...] = ()
+    approval_timeout_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -66,7 +71,17 @@ class SummaryConfig:
     tail_chars: int = 250
 
 
-_VALID_SLACK_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url", "bot_token", "channel"})
+_VALID_SLACK_OVERRIDE_KEYS = frozenset({
+    "enabled",
+    "webhook_url",
+    "bot_token",
+    "app_token",
+    "channel",
+    "interactive",
+    "actionable_approvals",
+    "approver_user_ids",
+    "approval_timeout_seconds",
+})
 _VALID_DISCORD_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url"})
 
 
@@ -96,6 +111,37 @@ class Config:
 
     def gating_for(self, kind: EventKind) -> GatingMode:
         return self.event(kind).gating or self.gating
+
+
+def _resolve_env(raw: dict[str, Any], key: str) -> str | None:
+    """Resolve a secret from TOML.
+
+    Prefer an inline value at `key`; fall back to `os.environ[raw[f"{key}_env"]]`.
+    A missing env var returns None rather than raising — the `enabled`/feature
+    checks catch the real misconfiguration with a clearer message.
+    """
+    direct = raw.get(key)
+    if isinstance(direct, str) and direct:
+        return direct
+    env_key = raw.get(f"{key}_env")
+    if isinstance(env_key, str) and env_key:
+        val = os.environ.get(env_key)
+        if val:
+            return val
+    return None
+
+
+def _parse_string_tuple(value: Any, *, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{field} must be an array of strings")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ConfigError(f"{field}[{i}] must be a string, got {type(item).__name__}")
+        out.append(item)
+    return tuple(out)
 
 
 def default_config_path() -> Path:
@@ -140,12 +186,30 @@ def parse_config(raw: dict[str, Any]) -> Config:
     slack_raw = sinks.get("slack", {}) or {}
     slack = SlackConfig(
         enabled=bool(slack_raw.get("enabled", False)),
-        webhook_url=slack_raw.get("webhook_url"),
-        bot_token=slack_raw.get("bot_token"),
+        webhook_url=_resolve_env(slack_raw, "webhook_url"),
+        bot_token=_resolve_env(slack_raw, "bot_token"),
+        app_token=_resolve_env(slack_raw, "app_token"),
         channel=slack_raw.get("channel"),
+        interactive=bool(slack_raw.get("interactive", False)),
+        actionable_approvals=bool(slack_raw.get("actionable_approvals", False)),
+        approver_user_ids=_parse_string_tuple(slack_raw.get("approver_user_ids", []),
+                                              field="sinks.slack.approver_user_ids"),
+        approval_timeout_seconds=float(slack_raw.get("approval_timeout_seconds", 600.0)),
     )
     if slack.enabled and not (slack.webhook_url or slack.bot_token):
         raise ConfigError("sinks.slack is enabled but has no webhook_url or bot_token")
+    if slack.interactive and not slack.bot_token:
+        raise ConfigError("sinks.slack.interactive=true requires bot_token")
+    if slack.actionable_approvals:
+        if not slack.bot_token:
+            raise ConfigError("sinks.slack.actionable_approvals=true requires bot_token")
+        if not slack.app_token:
+            raise ConfigError(
+                "sinks.slack.actionable_approvals=true requires app_token "
+                "(xapp-* for Socket Mode — get one from api.slack.com under Basic Information)"
+            )
+    if slack.approval_timeout_seconds <= 0:
+        raise ConfigError("sinks.slack.approval_timeout_seconds must be > 0")
 
     discord_raw = sinks.get("discord", {}) or {}
     discord = DiscordConfig(
@@ -301,8 +365,18 @@ tail_chars = 250
 enabled = false
 # Pick ONE of:
 # webhook_url = "https://hooks.slack.com/services/…"
-# bot_token = "xoxb-…"
-# channel = "@me"              # resolved via auth.test when @me
+# bot_token = "xoxb-…"                # or bot_token_env = "SLACK_BOT_TOKEN"
+# channel = "@me"                     # resolved via auth.test when @me
+
+# Interactive + actionable approvals (requires bot_token and Slack App with Socket Mode).
+# See docs/plans/slack-bot-interactive.md for the full setup flow.
+# interactive = true                  # approve/deny buttons on permission messages
+# actionable_approvals = true         # wire the blocking PreToolUse hook — approvals
+                                       # actually resolve the pending tool call, not
+                                       # just notify
+# app_token_env = "SLACK_APP_TOKEN"    # xapp-* app-level token (Socket Mode)
+# approver_user_ids = ["U0123ABC"]    # Slack user IDs allowed to click buttons
+# approval_timeout_seconds = 600      # hook blocks this long before failing closed (deny)
 
 [sinks.discord]
 enabled = false

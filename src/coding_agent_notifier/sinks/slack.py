@@ -11,6 +11,10 @@ from .base import SinkError, http_post_json
 
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
+SLACK_CHAT_UPDATE_URL = "https://slack.com/api/chat.update"
+
+APPROVE_ACTION_ID = "agent_notify_approve"
+DENY_ACTION_ID = "agent_notify_deny"
 
 # Slack attachment color bar per event kind (hex without #).
 _KIND_COLORS: dict[EventKind, str] = {
@@ -61,9 +65,10 @@ class SlackSink:
         raise SinkError("Slack sink has neither webhook_url nor bot_token configured")
 
 
-def resolve_self_channel(bot_token: str) -> str:
+def resolve_self_channel(bot_token: str, *, poster: "callable | None" = None) -> str:
     """Call auth.test to find the bot's own user id, so we can DM 'self'."""
-    status, text = http_post_json(
+    _post = poster or http_post_json
+    status, text = _post(
         SLACK_AUTH_TEST_URL,
         {},
         headers={"Authorization": f"Bearer {bot_token}"},
@@ -215,3 +220,165 @@ def _safe_json(text: str) -> dict:
     except (ValueError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def build_approval_message(
+    event: Event,
+    approval_id: str,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    verbosity: Verbosity = "terse",
+) -> dict:
+    """Like `build_slack_message` but with an approve/deny actions block.
+
+    Buttons carry `value = approval_id` so the Socket Mode handler can resolve
+    the right `PendingApproval` record on click. Approve has `primary` style +
+    a confirm dialog (an accidental tap on a lock screen shouldn't run a Bash
+    command); Deny is `danger` and needs no confirm (fail-safe direction).
+    """
+    body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
+    tool_label = event.tool_name or "tool"
+    actions_block = {
+        "type": "actions",
+        "block_id": f"agent_notify::{approval_id}",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve", "emoji": False},
+                "style": "primary",
+                "action_id": APPROVE_ACTION_ID,
+                "value": approval_id,
+                "confirm": {
+                    "title": {"type": "plain_text", "text": "Approve tool call?"},
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Allow `{tool_label}` to run in `{event.cwd.name or str(event.cwd)}`?",
+                    },
+                    "confirm": {"type": "plain_text", "text": "Approve"},
+                    "deny": {"type": "plain_text", "text": "Cancel"},
+                },
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Deny", "emoji": False},
+                "style": "danger",
+                "action_id": DENY_ACTION_ID,
+                "value": approval_id,
+            },
+        ],
+    }
+    # Append to the first attachment so the color bar / fallback text stay
+    # intact. Falls back to top-level blocks if the builder ever stops using
+    # attachments (defensive).
+    if body.get("attachments"):
+        body["attachments"][0].setdefault("blocks", []).append(actions_block)
+    else:
+        body.setdefault("blocks", []).append(actions_block)
+    return body
+
+
+def post_approval_message(
+    event: Event,
+    slack_config: SlackConfig,
+    approval_id: str,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    verbosity: Verbosity = "terse",
+    poster: "callable | None" = None,
+) -> tuple[str, str]:
+    """Post an approval message, return (channel_id, message_ts).
+
+    `poster` is injectable for tests (matches existing `_FakePoster` pattern in
+    test_sinks.py). Production passes the default `http_post_json`.
+    """
+    if not slack_config.bot_token:
+        raise SinkError("approval messages require bot_token (webhook cannot carry interactivity)")
+    body = build_approval_message(event, approval_id, max_chars=max_chars, verbosity=verbosity)
+    channel = slack_config.channel or "@me"
+    if channel == "@me":
+        channel = resolve_self_channel(slack_config.bot_token, poster=poster)
+    payload = {"channel": channel, **body}
+    _post = poster or http_post_json
+    status, text = _post(
+        SLACK_POST_MESSAGE_URL,
+        payload,
+        headers={"Authorization": f"Bearer {slack_config.bot_token}"},
+    )
+    if status >= 300:
+        raise SinkError(f"Slack chat.postMessage {status}: {text!r}")
+    parsed = _safe_json(text)
+    if not parsed.get("ok"):
+        raise SinkError(f"Slack API error: {parsed.get('error', text)!r}")
+    ts = parsed.get("ts")
+    posted_channel = parsed.get("channel") or channel
+    if not isinstance(ts, str) or not ts:
+        raise SinkError(f"Slack did not return a message ts: {text!r}")
+    return posted_channel, ts
+
+
+def build_resolved_message(
+    event: Event,
+    decision: str,
+    actor_label: str,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    verbosity: Verbosity = "terse",
+) -> dict:
+    """Block Kit replacement for `chat.update` after approve/deny or timeout.
+
+    Preserves the tool summary so scroll-back context isn't lost, but strips
+    the buttons and swaps the header to the outcome.
+    """
+    if decision == "allow":
+        icon = ":white_check_mark:"
+        verb = "Approved"
+        color = "#2eb67d"
+    elif decision == "deny":
+        icon = ":no_entry_sign:"
+        verb = "Denied"
+        color = "#e01e5a"
+    else:  # "timeout"
+        icon = ":hourglass:"
+        verb = "Timed out — denied"
+        color = "#a0a0a0"
+
+    tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
+    header = f"{icon} *{verb} by {actor_label}*"
+    blocks: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+    ]
+    summary = tool.summary
+    if verbosity == "terse" and event.tool_name and summary:
+        summary = f"*{event.tool_name}:* {summary}"
+    if summary:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
+    footer = _terse_footer(event) if verbosity == "terse" else None
+    if footer:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
+    return {
+        "text": f"{verb} by {actor_label} — {event.tool_name or 'tool'}",
+        "attachments": [{"color": color, "blocks": blocks}],
+    }
+
+
+def update_message(
+    bot_token: str,
+    channel: str,
+    ts: str,
+    body: dict,
+    *,
+    poster: "callable | None" = None,
+) -> None:
+    """Edit a previously-posted message in place via chat.update."""
+    _post = poster or http_post_json
+    payload = {"channel": channel, "ts": ts, **body}
+    status, text = _post(
+        SLACK_CHAT_UPDATE_URL,
+        payload,
+        headers={"Authorization": f"Bearer {bot_token}"},
+    )
+    if status >= 300:
+        raise SinkError(f"Slack chat.update {status}: {text!r}")
+    parsed = _safe_json(text)
+    if not parsed.get("ok"):
+        raise SinkError(f"Slack chat.update error: {parsed.get('error', text)!r}")

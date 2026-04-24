@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import traceback
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from . import __version__, dedup, install, macos, pending, transcript
+from . import __version__, dedup, install, macos, pending, pending_approvals, transcript
 from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config, match_route, sinks_for
 from .event import Event
 from .gating import SystemState, should_send
@@ -68,7 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_sub.add_parser("init", help="Write a commented config template.")
 
     inst = sub.add_parser("install", help="Install hooks into an agent's config.")
-    inst.add_argument("target", choices=["claude-code", "codex"])
+    inst.add_argument("target", choices=["claude-code", "codex", "slack-bot"])
+    inst.add_argument(
+        "--no-launchd",
+        action="store_true",
+        help="(slack-bot only) Skip writing the launchd plist that supervises `agent-notify daemon`.",
+    )
 
     test = sub.add_parser("test", help="Send a synthetic test event through sinks.")
     test.add_argument("--kind", default="permission",
@@ -78,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Use a dangerous command in the synthetic tool_input (for permission kind).")
 
     sub.add_parser("doctor", help="Check config, connectivity, and install state.")
+
+    sub.add_parser(
+        "daemon",
+        help="Run the Slack Socket Mode listener (required for actionable approvals).",
+    )
 
     # Hidden: internal deferred-dispatch subcommand invoked by a detached child
     # to coalesce a queued turn_complete after a short window.
@@ -103,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_test(args)
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "daemon":
+            return cmd_daemon(args)
         if args.cmd == "_defer-dispatch":
             return cmd_defer_dispatch(args)
     except Exception:  # noqa: BLE001 - never block the agent
@@ -137,6 +151,16 @@ def cmd_hook(args: argparse.Namespace) -> int:
                 f"UserPromptSubmit cleared {cleared} marker(s) sess={session_id}"
             )
         return 0
+
+    # PreToolUse is a blocking decision hook: we post a Slack message with
+    # approve/deny buttons and wait for the user to click. The daemon
+    # (`agent-notify daemon`) resolves the matching PendingApproval, which
+    # unblocks our FIFO wait, and we emit Claude Code's `permissionDecision`
+    # JSON. Fails closed (deny) on any error so a misconfigured bot never
+    # silently approves. Only wired if actionable approvals are enabled.
+    if args.source == "claude-code" and payload.get("hook_event_name") == "PreToolUse":
+        config = load_config(args.config)
+        return cmd_pretooluse(payload, config)
 
     source_app = macos.term_program_to_app(os.environ.get("TERM_PROGRAM"))
     parse = src_claude.parse if args.source == "claude-code" else src_codex.parse
@@ -188,6 +212,141 @@ def cmd_defer_dispatch(args: argparse.Namespace) -> int:
     # path uses double-fork `_run_defer_inline` and never re-execs through argv.
     _run_defer_inline(args.config, args.agent, args.session_id or None)
     return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Run the Slack Socket Mode listener forever (required for actionable approvals).
+
+    Logs to stderr — launchd plist / user-supervisor redirects that to a log
+    file. Fails loudly if Slack bot / app tokens aren't configured.
+    """
+    from . import slack_socket
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    config = load_config(args.config)
+    slack_socket.run_daemon(config)
+    return 0
+
+
+def cmd_pretooluse(
+    payload: dict,
+    config: Config,
+    *,
+    poster=None,
+    clock=time.monotonic,
+    stdout=None,
+) -> int:
+    """Block on a Slack approve/deny round-trip for a PreToolUse hook.
+
+    Emits Claude Code's expected stdout JSON with `permissionDecision`, and
+    fails closed (deny) on any error path so a misconfigured bot never
+    silently rubber-stamps a tool call. The blocking is just a FIFO read
+    with timeout — the work happens in the daemon process that resolves
+    the approval.
+    """
+    from .sinks import slack as slack_sink
+
+    out = stdout if stdout is not None else sys.stdout
+    if not (config.slack.enabled and config.slack.actionable_approvals):
+        # Feature off — return "ask" so Claude Code falls back to its normal
+        # in-terminal permission flow. Safer than defaulting to "allow" or
+        # "deny" (which would block every tool call).
+        _emit_decision(out, "ask")
+        return 0
+
+    approval_id = str(uuid.uuid4())
+    session_id = payload.get("session_id")
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else None
+    cwd = Path(payload.get("cwd") or ".")
+    transcript_raw = payload.get("transcript_path")
+    transcript_path = Path(transcript_raw) if isinstance(transcript_raw, str) and transcript_raw else None
+
+    event = Event(
+        agent="claude-code",
+        kind="permission",
+        message="",
+        cwd=cwd,
+        session_id=session_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        source_app=macos.term_program_to_app(os.environ.get("TERM_PROGRAM")),
+        transcript_path=transcript_path,
+    )
+
+    _log_event(
+        f"PreToolUse approval_id={approval_id} tool={tool_name} sess={session_id}"
+    )
+    pending_approvals.create(
+        approval_id,
+        agent="claude-code",
+        session_id=session_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+    )
+
+    try:
+        channel, message_ts = slack_sink.post_approval_message(
+            event,
+            config.slack,
+            approval_id,
+            max_chars=config.tool_input_max_chars,
+            verbosity=config.display.verbosity,
+            poster=poster,
+        )
+        pending_approvals.set_message_ref(approval_id, channel, message_ts)
+        _log_event(f"PreToolUse posted slack channel={channel} ts={message_ts}")
+    except Exception as e:  # noqa: BLE001
+        _log_event(f"PreToolUse slack post failed: {e}")
+        pending_approvals.cleanup(approval_id)
+        # Fail-closed: deny the tool call rather than leaving the agent hung.
+        _emit_decision(out, "deny", reason=f"agent-notify: Slack post failed: {e}")
+        return 0
+
+    decision = pending_approvals.wait(
+        approval_id,
+        timeout=config.slack.approval_timeout_seconds,
+    )
+    if decision is None:
+        _log_event(f"PreToolUse timed out approval_id={approval_id}")
+        # Try to mark the message as timed-out; best-effort.
+        try:
+            if config.slack.bot_token:
+                body = slack_sink.build_resolved_message(event, "timeout", "system")
+                slack_sink.update_message(
+                    config.slack.bot_token, channel, message_ts, body, poster=poster,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        pending_approvals.cleanup(approval_id)
+        _emit_decision(out, "deny", reason="agent-notify: approval timed out")
+        return 0
+
+    _log_event(f"PreToolUse resolved approval_id={approval_id} decision={decision}")
+    pending_approvals.cleanup(approval_id)
+    _emit_decision(out, decision)
+    return 0
+
+
+def _emit_decision(out, decision: str, *, reason: str | None = None) -> None:
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+        }
+    }
+    if reason:
+        payload["hookSpecificOutput"]["permissionDecisionReason"] = reason
+    out.write(json.dumps(payload))
+    out.write("\n")
+    try:
+        out.flush()
+    except Exception:
+        pass
 
 
 def _maybe_apply_snippet(event: Event, config: Config) -> Event:
@@ -387,6 +546,35 @@ def cmd_install(args: argparse.Namespace) -> int:
             print(f"Claude Code: added hooks for {', '.join(added)}")
         else:
             print("Claude Code: hooks already installed; nothing to do.")
+        return 0
+    if args.target == "slack-bot":
+        summary = install.install_slack_bot(install_plist=not args.no_launchd)
+        added = summary["claude_hooks_added"]
+        if added:
+            print(f"Claude Code: added hooks for {', '.join(added)}")
+        else:
+            print("Claude Code: hooks already installed; nothing to do.")
+        plist_path = summary["plist_path"]
+        if plist_path is not None:
+            if summary["plist_written"]:
+                print(f"launchd: wrote {plist_path}")
+                print(f"         to start now: launchctl load {plist_path}")
+            else:
+                print(f"launchd: {plist_path} already up to date.")
+        print(
+            "\nNext steps:\n"
+            "  1. Create a Slack App from docs/slack-app-manifest.yaml at\n"
+            "     https://api.slack.com/apps → Create New App → From a manifest.\n"
+            "  2. Install to workspace, then copy the bot token (xoxb-…). On\n"
+            "     the app's Basic Information page, generate an App-Level token\n"
+            "     with `connections:write` scope — that's your xapp-… token.\n"
+            "  3. export SLACK_BOT_TOKEN=xoxb-… SLACK_APP_TOKEN=xapp-…\n"
+            "  4. Edit ~/.config/coding-agent-notifier/config.toml to set\n"
+            "     interactive=true and actionable_approvals=true under\n"
+            "     [sinks.slack] (plus approver_user_ids = [\"U0YOURID\"]).\n"
+            "  5. launchctl load <plist>  (or run `agent-notify daemon` in a terminal).",
+            file=sys.stderr,
+        )
         return 0
     summary = install.install_codex()
     if summary["hooks_added"]:

@@ -13,6 +13,11 @@ dependencies = [
     "tomlkit>=0.12",
 ]
 
+[project.optional-dependencies]
+# Interactive Slack bot (chat.postMessage + Socket Mode). Only needed when
+# [sinks.slack] has interactive=true or actionable_approvals=true.
+slack-bot = ["slack-sdk>=3.27"]
+
 [project.scripts]
 agent-notify = "coding_agent_notifier.cli:main"
 

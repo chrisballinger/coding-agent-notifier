@@ -1,0 +1,67 @@
+# Slack App manifest for agent-notify.
+#
+# To install:
+#   1. Open https://api.slack.com/apps and click "Create New App" →
+#      "From a manifest".
+#   2. Pick the workspace you want the bot in.
+#   3. Paste this YAML as-is, review, and confirm.
+#   4. On the created app's page, visit "Install App" in the sidebar and
+#      install to workspace to get the `xoxb-…` Bot User OAuth Token.
+#   5. Visit "Basic Information" → scroll to "App-Level Tokens" →
+#      "Generate Token and Scopes". Add the `connections:write` scope and
+#      generate — you'll get an `xapp-…` token. This is the Socket Mode
+#      app-level token.
+#   6. Set both tokens as env vars on the Mac running `agent-notify`:
+#        export SLACK_BOT_TOKEN=xoxb-...
+#        export SLACK_APP_TOKEN=xapp-...
+#   7. Edit ~/.config/coding-agent-notifier/config.toml to enable the bot:
+#        [sinks.slack]
+#        enabled = true
+#        bot_token_env = "SLACK_BOT_TOKEN"
+#        app_token_env = "SLACK_APP_TOKEN"
+#        interactive = true
+#        actionable_approvals = true
+#        approver_user_ids = ["U0YOURID"]   # `/admin` → profile URL
+#        channel = "@me"                    # DM the bot by default
+#   8. Start the daemon (launchctl load <plist>, or `agent-notify daemon`).
+#
+# Security notes:
+#   - The bot has NO public request URL. All interactivity is delivered
+#     via Socket Mode's outbound WebSocket, so you don't need a public
+#     server or tunnel.
+#   - `approver_user_ids` in the config is the real authorization gate —
+#     the bot itself is installed workspace-wide, so anyone who can see
+#     the DM would otherwise be able to click Approve. Without the
+#     allowlist, only the installing user can reach the DM thread.
+#   - Rotate the bot token via Slack's "OAuth & Permissions" page if it
+#     ever leaks.
+display_information:
+  name: agent-notify
+  description: Actionable agent notifications for Claude Code / Codex. Approve or deny tool calls from your Slack DMs.
+  background_color: "#1a1a1a"
+  long_description: |
+    agent-notify forwards "agent needs attention" events from Claude Code and
+    Codex into Slack, and — when enabled — lets you approve or deny the
+    agent's pending tool call from the notification itself. The Mac running
+    agent-notify connects to Slack over Socket Mode (outbound WebSocket), so
+    there's no public server, port forward, or tunnel required.
+
+features:
+  bot_user:
+    display_name: agent-notify
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write         # post approval messages
+      - im:write           # DM the installing user
+      - chat:write.public  # post in channels the bot isn't explicitly invited to (opt-in)
+
+settings:
+  interactivity:
+    is_enabled: true
+    # No request_url: Socket Mode delivers interactivity over the WebSocket.
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
