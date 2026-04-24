@@ -136,6 +136,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
     if not args.force and not should_send(event, config, _snapshot_state()):
         return 0
+    event = _maybe_apply_snippet(event, config)
     _dispatch(event, config)
     return 0
 
@@ -149,18 +150,37 @@ def cmd_defer_dispatch(args: argparse.Namespace) -> int:
     event = pending.claim(agent, session_id)
     if event is None:
         return 0  # superseded by a follow-up idle_prompt, or expired
-    if config.summary.enabled and event.transcript_path is not None:
-        text = transcript.read_last_assistant_text(event.transcript_path)
-        if text:
-            snippet = transcript.head_tail_snippet(
-                text,
-                head=config.summary.head_chars,
-                tail=config.summary.tail_chars,
-            )
-            if snippet:
-                event = replace(event, message=snippet)
+    event = _maybe_apply_snippet(event, config)
     _dispatch(event, config)
     return 0
+
+
+def _maybe_apply_snippet(event: Event, config: Config) -> Event:
+    """Replace `event.message` with a head/tail slice of the last assistant turn.
+
+    Applies to turn_complete AND idle_prompt events: in the common coalesce
+    flow the turn_complete ping is cancelled by the follow-up idle_prompt, so
+    idle_prompt is where the snippet actually needs to appear. Permission and
+    elicitation already have meaningful bodies (tool_input / MCP message), so
+    they're left alone.
+    """
+    if not config.summary.enabled:
+        return event
+    if event.kind not in ("turn_complete", "idle_prompt"):
+        return event
+    if event.transcript_path is None:
+        return event
+    text = transcript.read_last_assistant_text(event.transcript_path)
+    if not text:
+        return event
+    snippet = transcript.head_tail_snippet(
+        text,
+        head=config.summary.head_chars,
+        tail=config.summary.tail_chars,
+    )
+    if not snippet:
+        return event
+    return replace(event, message=snippet)
 
 
 def _spawn_defer_child(

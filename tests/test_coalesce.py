@@ -192,6 +192,81 @@ webhook_url = "https://hook.test/x"
     assert "Here is what I did" in body
 
 
+def test_idle_prompt_picks_up_transcript_snippet(monkeypatch, tmp_path: Path):
+    """The main win: when turn_complete is coalesced away by a follow-up
+    idle_prompt, the snippet must attach to the idle_prompt instead — otherwise
+    the user loses the 'what did the agent just do' context entirely."""
+    transcript_file = tmp_path / "t.jsonl"
+    transcript_file.write_text(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "I changed foo.py and bar.py."}],
+        },
+    }))
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[display]
+coalesce_window_seconds = 2.5
+[summary]
+enabled = true
+head_chars = 250
+tail_chars = 250
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    payload = {
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "sess-idle",
+        "message": "Claude is waiting for your input",
+        "transcript_path": str(transcript_file),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+    body_json = json.dumps(calls[0][1])
+    assert "I changed foo.py and bar.py." in body_json
+    # Original message is replaced — no "waiting for your input" in body.
+    assert "waiting for your input" not in body_json
+
+
+def test_idle_prompt_without_transcript_keeps_original_message(monkeypatch, tmp_path: Path):
+    cfg = _basic_cfg(tmp_path)  # summary.enabled = false in _basic_cfg
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    payload = {
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "sess-1",
+        "message": "Claude is waiting for your input",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    body_json = json.dumps(calls[0][1])
+    assert "waiting for your input" in body_json
+
+
 def test_force_flag_bypasses_defer(monkeypatch, tmp_path: Path):
     """--force skips the defer path: the notification goes out immediately."""
     cfg = _basic_cfg(tmp_path)
