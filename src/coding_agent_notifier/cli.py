@@ -23,6 +23,18 @@ DEDUP_TTLS: dict[str, float] = {
     "permission": 60.0,
     "turn_complete": 5.0,
 }
+
+# Cross-kind coalescing: turn_complete and idle_prompt describe the same moment
+# ("agent is done, please engage") — only the first one per session-turn
+# should ping. The primary reset is `UserPromptSubmit` (user typed a reply →
+# we're in a new turn), which clears the marker immediately. The TTL is a
+# safety net: if that hook fails to fire (misconfigured, Claude Code bug,
+# different surface) the marker can't silence notifications indefinitely. 5
+# minutes is long enough that Claude Code's ~60s idle_prompt follow-up is
+# reliably suppressed, short enough that a broken UserPromptSubmit doesn't
+# kill pings for more than one cycle.
+_TURN_OR_IDLE_KINDS = frozenset({"turn_complete", "idle_prompt"})
+_TURN_OR_IDLE_TTL = 300.0
 from .sinks.base import Sink, SinkError
 from .sinks.discord import DiscordSink
 from .sinks.slack import SlackSink
@@ -112,6 +124,20 @@ def cmd_hook(args: argparse.Namespace) -> int:
         print(f"agent-notify: malformed hook JSON: {e}", file=sys.stderr)
         return 0
 
+    # UserPromptSubmit is a control signal, not a ping: the user just replied,
+    # which starts a new turn. Reset all dedup markers for this session —
+    # the cross-kind coalesce marker AND any within-kind twin-fire markers —
+    # so the next turn's events can ping cleanly without colliding with the
+    # previous turn's state.
+    if args.source == "claude-code" and payload.get("hook_event_name") == "UserPromptSubmit":
+        session_id = payload.get("session_id")
+        cleared = dedup.forget_session("claude-code", session_id)
+        if cleared:
+            _log_event(
+                f"UserPromptSubmit cleared {cleared} marker(s) sess={session_id}"
+            )
+        return 0
+
     source_app = macos.term_program_to_app(os.environ.get("TERM_PROGRAM"))
     parse = src_claude.parse if args.source == "claude-code" else src_codex.parse
     event = parse(payload, source_app=source_app)
@@ -145,6 +171,12 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
 
     if not args.force and not should_send(event, config, _snapshot_state()):
+        return 0
+    if not args.force and _turn_or_idle_recently_dispatched(event):
+        _log_event(
+            f"hook suppressed {event.kind} — already pinged turn/idle for "
+            f"sess={event.session_id} within {_TURN_OR_IDLE_TTL}s"
+        )
         return 0
     event = _maybe_apply_snippet(event, config)
     _dispatch(event, config)
@@ -269,6 +301,13 @@ def _run_defer_inline(
     if event is None:
         _log_event(f"defer grandchild exit: no pending sess={session_id}")
         return
+    # Cross-kind dedup — if the user's machine answered quickly and an
+    # idle_prompt already dispatched for this session, suppress ourselves.
+    if _turn_or_idle_recently_dispatched(event):
+        _log_event(
+            f"defer grandchild suppressed: idle_prompt already pinged sess={session_id}"
+        )
+        return
     event = _maybe_apply_snippet(event, config)
     _log_event(f"defer grandchild dispatching sess={session_id} msg_len={len(event.message)}")
     _dispatch(event, config)
@@ -293,6 +332,21 @@ def _log_event(msg: str) -> None:
             f.write(f"[{ts}] pid={os.getpid()} {msg}\n")
     except OSError:
         pass
+
+
+def _turn_or_idle_recently_dispatched(event: Event) -> bool:
+    """Check-and-mark whether we already pinged turn_complete/idle_prompt
+    for this session within the cross-kind coalesce window.
+
+    The mark is written on first call (so the second call returns True and
+    suppresses). Same semantics as `dedup.recently_seen`, just a different key
+    namespace so it doesn't collide with the within-kind dedup used for
+    twin-fires (PermissionRequest + Notification:permission_prompt).
+    """
+    if event.kind not in _TURN_OR_IDLE_KINDS:
+        return False
+    key = f"turn_or_idle:{event.agent}:{event.session_id or ''}"
+    return dedup.recently_seen(key, ttl=_TURN_OR_IDLE_TTL)
 
 
 def _is_duplicate(event: Event) -> bool:

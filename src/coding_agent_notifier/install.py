@@ -29,6 +29,15 @@ CLAUDE_HOOK_ENTRIES: dict[str, list[dict[str, Any]]] = {
             "hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}],
         }
     ],
+    # UserPromptSubmit is a control signal, not a ping source — we use it to
+    # reset the per-session cross-kind coalesce marker so the next turn's
+    # turn_complete / idle_prompt can ping cleanly.
+    "UserPromptSubmit": [
+        {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}],
+        }
+    ],
 }
 
 CODEX_HOOK_ENTRIES: dict[str, list[dict[str, Any]]] = {

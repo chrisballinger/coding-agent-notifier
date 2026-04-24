@@ -364,6 +364,206 @@ webhook_url = "https://hook.test/x"
     assert calls == []
 
 
+def test_idle_prompt_suppresses_after_turn_complete_dispatched(monkeypatch, tmp_path: Path):
+    """Real-world phone case: turn_complete dispatches, then idle_prompt
+    fires later when the user finally notices. Both pinging is the bug.
+    The cross-kind marker catches it."""
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[display]
+coalesce_window_seconds = 0
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "Stop", "cwd": "/tmp", "session_id": "sess-dup"}
+    )))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "sess-dup",
+        "message": "Claude is waiting for your input",
+    })))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1, "idle_prompt should have been suppressed"
+
+
+def test_idle_prompt_then_turn_complete_also_suppresses(monkeypatch, tmp_path: Path):
+    """Reverse direction: idle_prompt fires first. The grandchild that wakes
+    up and tries to dispatch turn_complete must see the idle_prompt marker
+    and skip."""
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[display]
+coalesce_window_seconds = 0.01
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        cli, "_spawn_defer_child",
+        lambda cfg_path, agent, sid: recorded.append((cfg_path, agent, sid)),
+    )
+    monkeypatch.setattr(cli, "_sleep", lambda _s: None)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "sess-rev",
+        "message": "Claude is waiting for your input",
+    })))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "Stop", "cwd": "/tmp", "session_id": "sess-rev"}
+    )))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(recorded) == 1
+
+    cli.main(["--config", str(cfg), "_defer-dispatch", "claude-code", "sess-rev"])
+    assert len(calls) == 1, "grandchild should have been suppressed by cross-kind marker"
+
+
+def test_user_prompt_submit_resets_marker(monkeypatch, tmp_path: Path):
+    """The primary reset path: user replies (fires UserPromptSubmit), marker
+    clears, the next turn's turn_complete / idle_prompt pings cleanly."""
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[display]
+coalesce_window_seconds = 0
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    # Turn 1: turn_complete dispatches
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "Stop", "cwd": "/tmp", "session_id": "sess-ups"}
+    )))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+
+    # User types a reply — UserPromptSubmit fires, clears the marker
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "sess-ups",
+        "cwd": "/tmp",
+    })))
+    rc = cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert rc == 0
+    # UserPromptSubmit itself never pings
+    assert len(calls) == 1
+
+    # Turn 2: a new turn_complete should ping legitimately
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "Stop", "cwd": "/tmp", "session_id": "sess-ups"}
+    )))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 2, "after UserPromptSubmit reset, turn 2 should ping"
+
+
+def test_ttl_safety_net_releases_stuck_marker(monkeypatch, tmp_path: Path):
+    """If UserPromptSubmit never fires (misconfigured hook, bug), the marker
+    must eventually expire so notifications aren't silenced forever. This is
+    the defense-in-depth the user asked for explicitly."""
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[display]
+coalesce_window_seconds = 0
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.time.monotonic", lambda: clock[0]
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "Stop", "cwd": "/tmp", "session_id": "sess-stale"}
+    )))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+
+    # Simulate UserPromptSubmit NEVER firing and 400s elapsing — past the 300s
+    # safety-net TTL.
+    clock[0] += 400.0
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "session_id": "sess-stale",
+        "message": "still waiting",
+    })))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 2, "marker must expire so broken UserPromptSubmit can't silence forever"
+
+
 def test_pending_write_uses_real_cache_dir(monkeypatch, tmp_path: Path):
     """Production spawn path writes to XDG_CACHE_HOME; conftest already
     isolates that so there's nothing for tests to do beyond sanity-checking."""

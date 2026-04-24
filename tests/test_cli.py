@@ -453,7 +453,10 @@ webhook_url = "https://hook.test/x"
     assert len(calls) == 1
 
 
-def test_hook_does_not_dedup_idle_prompt(monkeypatch, tmp_path: Path):
+def test_hook_coalesces_repeated_idle_prompts(monkeypatch, tmp_path: Path):
+    """Two idle_prompts for the same session within the cross-kind window
+    are collapsed into one ping. Claude Code can fire idle_prompt repeatedly
+    while the user stays idle; without coalescing that's a ping every minute."""
     cfg = _write_config(
         tmp_path,
         """
@@ -486,7 +489,7 @@ webhook_url = "https://hook.test/x"
     cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
-    assert len(calls) == 2
+    assert len(calls) == 1, "repeated idle_prompts should be coalesced"
 
 
 def test_hook_force_bypasses_dedup(monkeypatch, tmp_path: Path):

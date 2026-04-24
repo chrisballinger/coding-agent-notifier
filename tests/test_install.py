@@ -9,7 +9,7 @@ from coding_agent_notifier import install
 def test_claude_install_creates_settings(tmp_path: Path):
     settings = tmp_path / "settings.json"
     added = install.install_claude_code(settings)
-    assert set(added) == {"Notification", "PermissionRequest", "Stop"}
+    assert set(added) == {"Notification", "PermissionRequest", "Stop", "UserPromptSubmit"}
     data = json.loads(settings.read_text())
     assert "hooks" in data
     assert any(

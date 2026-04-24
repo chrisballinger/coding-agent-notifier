@@ -84,3 +84,52 @@ def test_default_state_path_fallback(monkeypatch):
 def test_dedup_key_shape():
     assert dedup.dedup_key("claude-code", "permission", "abc", "Bash") == "claude-code:permission:abc:Bash"
     assert dedup.dedup_key("codex", "permission", None, None) == "codex:permission::"
+
+
+def test_forget_removes_key(tmp_path: Path):
+    path = tmp_path / "d.json"
+    clock = _FakeClock()
+    dedup.recently_seen("k", ttl=60, path=path, clock=clock)
+    assert dedup.forget("k", path=path) is True
+    # After forgetting, the next check is a fresh "not seen"
+    assert dedup.recently_seen("k", ttl=60, path=path, clock=clock) is False
+
+
+def test_forget_missing_key_returns_false(tmp_path: Path):
+    path = tmp_path / "d.json"
+    assert dedup.forget("k", path=path) is False
+
+
+def test_forget_leaves_other_keys_intact(tmp_path: Path):
+    path = tmp_path / "d.json"
+    clock = _FakeClock()
+    dedup.recently_seen("a", ttl=60, path=path, clock=clock)
+    dedup.recently_seen("b", ttl=60, path=path, clock=clock)
+    dedup.forget("a", path=path)
+    assert dedup.recently_seen("b", ttl=60, path=path, clock=clock) is True
+    assert dedup.recently_seen("a", ttl=60, path=path, clock=clock) is False
+
+
+def test_forget_session_clears_all_matching(tmp_path: Path):
+    path = tmp_path / "d.json"
+    clock = _FakeClock()
+    dedup.recently_seen("claude-code:permission:sess-A:Bash", ttl=60, path=path, clock=clock)
+    dedup.recently_seen("claude-code:turn_complete:sess-A:", ttl=60, path=path, clock=clock)
+    dedup.recently_seen("turn_or_idle:claude-code:sess-A", ttl=60, path=path, clock=clock)
+    # Other session, other agent — should not be touched
+    dedup.recently_seen("claude-code:turn_complete:sess-B:", ttl=60, path=path, clock=clock)
+    dedup.recently_seen("codex:permission:sess-A:shell", ttl=60, path=path, clock=clock)
+
+    removed = dedup.forget_session("claude-code", "sess-A", path=path)
+    assert removed == 3
+
+    import json as _json
+    remaining = set(_json.loads(path.read_text()).keys())
+    assert "claude-code:turn_complete:sess-B:" in remaining
+    assert "codex:permission:sess-A:shell" in remaining
+    assert not any("sess-A" in k and "claude-code" in k.split(":") for k in remaining)
+
+
+def test_forget_session_no_matches_returns_zero(tmp_path: Path):
+    path = tmp_path / "d.json"
+    assert dedup.forget_session("claude-code", "nothing", path=path) == 0
