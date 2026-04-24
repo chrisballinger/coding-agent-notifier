@@ -11,19 +11,16 @@
 #      "Generate Token and Scopes". Add the `connections:write` scope and
 #      generate — you'll get an `xapp-…` token. This is the Socket Mode
 #      app-level token.
-#   6. Set both tokens as env vars on the Mac running `agent-notify`:
-#        export SLACK_BOT_TOKEN=xoxb-...
-#        export SLACK_APP_TOKEN=xapp-...
-#   7. Edit ~/.config/coding-agent-notifier/config.toml to enable the bot:
-#        [sinks.slack]
-#        enabled = true
-#        bot_token_env = "SLACK_BOT_TOKEN"
-#        app_token_env = "SLACK_APP_TOKEN"
-#        interactive = true
-#        actionable_approvals = true
-#        approver_user_ids = ["U0YOURID"]   # `/admin` → profile URL
-#        channel = "@me"                    # DM the bot by default
-#   8. Start the daemon (launchctl load <plist>, or `agent-notify daemon`).
+#   6. Run `agent-notify slack add` — the interactive wizard prompts for the
+#      tokens, stores them in macOS Keychain, and writes a
+#      [slack.workspaces.default] block into ~/.agent-notify/config.toml.
+#      For scripted installs:
+#        agent-notify slack add --bot-token - --app-token - --approvers U0YOURID \
+#          < secrets-file
+#      Prefer the wizard over manual edits — it verifies via Slack auth.test
+#      and fills in the approver_user_ids with your Slack user ID so the
+#      daemon doesn't reject your own button clicks.
+#   7. Start the daemon (launchctl load <plist>, or `agent-notify daemon`).
 #
 # Security notes:
 #   - The bot has NO public request URL. All interactivity is delivered

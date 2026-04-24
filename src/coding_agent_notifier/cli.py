@@ -12,7 +12,15 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, dedup, install, macos, paths, pending, pending_approvals, transcript
-from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config, match_route, sinks_for
+from .config import (
+    CONFIG_TEMPLATE,
+    Config,
+    default_config_path,
+    load_config,
+    match_route,
+    sinks_for,
+    workspace_for,
+)
 from .event import Event
 from .gating import SystemState, should_send
 
@@ -91,6 +99,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the Slack Socket Mode listener (required for actionable approvals).",
     )
 
+    slack = sub.add_parser(
+        "slack",
+        help="Manage Slack workspaces (tokens + config blocks).",
+    )
+    slack_sub = slack.add_subparsers(dest="slack_cmd", required=True)
+
+    slack_add = slack_sub.add_parser(
+        "add",
+        help="Add or update a Slack workspace (interactive unless flags supplied).",
+    )
+    slack_add.add_argument("--name", default=None,
+                           help="Workspace name (default: 'default').")
+    slack_add.add_argument("--bot-token", default=None,
+                           help="Bot token (xoxb-…). Pass '-' to read from stdin.")
+    slack_add.add_argument("--app-token", default=None,
+                           help="App-level token (xapp-…). Pass '-' to read from stdin.")
+    slack_add.add_argument("--channel", default=None,
+                           help="Default channel (e.g. '@me' for DM, '#chan' for channel).")
+    slack_add.add_argument("--approvers", default=None,
+                           help="Comma-separated Slack user IDs (U…). "
+                                "Required for non-DM channels.")
+    slack_add.add_argument("--no-verify", action="store_true",
+                           help="Skip the auth.test round-trip.")
+    slack_add.add_argument("--no-actionable", action="store_true",
+                           help="Don't set actionable_approvals=true in the block "
+                                "(webhook-style notifications only, no buttons).")
+
+    slack_sub.add_parser("list", help="List configured Slack workspaces.")
+
+    slack_remove = slack_sub.add_parser(
+        "remove",
+        help="Remove a Slack workspace (deletes config block + Keychain entries).",
+    )
+    slack_remove.add_argument("name")
+
+    slack_test = slack_sub.add_parser(
+        "test",
+        help="Post a synthetic smoke-test message to a workspace.",
+    )
+    slack_test.add_argument("name")
+
     # Hidden: internal deferred-dispatch subcommand invoked by a detached child
     # to coalesce a queued turn_complete after a short window.
     defer = sub.add_parser("_defer-dispatch", add_help=False)
@@ -125,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_doctor(args)
         if args.cmd == "daemon":
             return cmd_daemon(args)
+        if args.cmd == "slack":
+            return cmd_slack(args)
         if args.cmd == "_defer-dispatch":
             return cmd_defer_dispatch(args)
     except Exception:  # noqa: BLE001 - never block the agent
@@ -222,6 +273,64 @@ def cmd_defer_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_slack(args: argparse.Namespace) -> int:
+    """Dispatch `agent-notify slack {add,list,remove,test}`."""
+    from . import slack_admin
+
+    if args.slack_cmd == "add":
+        return slack_admin.run_add_wizard(
+            name=args.name,
+            bot_token=args.bot_token,
+            app_token=args.app_token,
+            channel=args.channel,
+            approvers=args.approvers,
+            no_verify=args.no_verify,
+            no_actionable=args.no_actionable,
+            config_path=args.config,
+        )
+    if args.slack_cmd == "list":
+        try:
+            workspaces = slack_admin.list_workspaces(args.config)
+        except Exception as e:  # noqa: BLE001
+            print(f"agent-notify: failed to load config: {e}", file=sys.stderr)
+            return 1
+        if not workspaces:
+            print("No Slack workspaces configured. Run `agent-notify slack add`.")
+            return 0
+        for ws in workspaces:
+            badges = []
+            badges.append("ENABLED" if ws.enabled else "disabled")
+            badges.append("bot" if ws.has_bot_token else "NO-BOT-TOKEN")
+            if ws.has_app_token:
+                badges.append("app")
+            if ws.actionable_approvals:
+                badges.append("interactive")
+            print(f"  {ws.name}: {', '.join(badges)}")
+            print(f"    channel: {ws.channel or '(unset)'}")
+            if ws.approver_user_ids:
+                print(f"    approvers: {', '.join(ws.approver_user_ids)}")
+            if ws.approver_user_groups:
+                print(f"    groups:    {', '.join(ws.approver_user_groups)}")
+        return 0
+    if args.slack_cmd == "remove":
+        summary = slack_admin.remove_workspace(args.name, config_path=args.config)
+        if summary["config_removed"]:
+            print(f"removed [slack.workspaces.{args.name}] from config.toml")
+        else:
+            print(f"no [slack.workspaces.{args.name}] block found in config.toml")
+        for acc in summary["keychain_removed"]:
+            print(f"removed keychain entry agent-notify:{acc}")
+        return 0
+    if args.slack_cmd == "test":
+        ok, msg = slack_admin.test_workspace(args.name, config_path=args.config)
+        if ok:
+            print(f"✓ {msg}")
+            return 0
+        print(f"✗ {msg}", file=sys.stderr)
+        return 1
+    return 1
+
+
 def cmd_daemon(args: argparse.Namespace) -> int:
     """Run the Slack Socket Mode listener forever (required for actionable approvals).
 
@@ -259,7 +368,19 @@ def cmd_pretooluse(
     from .sinks import slack as slack_sink
 
     out = stdout if stdout is not None else sys.stdout
-    if not (config.slack.enabled and config.slack.actionable_approvals):
+
+    cwd = Path(payload.get("cwd") or ".")
+    resolved = sinks_for(cwd, config)
+    if resolved is None:
+        # Strict routing: no route matches this cwd. Fall back to "ask" so
+        # Claude Code shows its own terminal prompt rather than denying or
+        # silently approving.
+        _emit_decision(out, "ask")
+        return 0
+    slack_cfg, _ = resolved
+    workspace_name = workspace_for(cwd, config)
+
+    if not (slack_cfg.enabled and slack_cfg.actionable_approvals):
         # Feature off — return "ask" so Claude Code falls back to its normal
         # in-terminal permission flow. Safer than defaulting to "allow" or
         # "deny" (which would block every tool call).
@@ -270,7 +391,6 @@ def cmd_pretooluse(
     session_id = payload.get("session_id")
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else None
-    cwd = Path(payload.get("cwd") or ".")
     transcript_raw = payload.get("transcript_path")
     transcript_path = Path(transcript_raw) if isinstance(transcript_raw, str) and transcript_raw else None
 
@@ -287,7 +407,8 @@ def cmd_pretooluse(
     )
 
     _log_event(
-        f"PreToolUse approval_id={approval_id} tool={tool_name} sess={session_id}"
+        f"PreToolUse approval_id={approval_id} tool={tool_name} sess={session_id} "
+        f"workspace={workspace_name}"
     )
     pending_approvals.create(
         approval_id,
@@ -295,12 +416,13 @@ def cmd_pretooluse(
         session_id=session_id,
         tool_name=tool_name,
         tool_input=tool_input,
+        workspace=workspace_name,
     )
 
     try:
         channel, message_ts = slack_sink.post_approval_message(
             event,
-            config.slack,
+            slack_cfg,
             approval_id,
             max_chars=config.tool_input_max_chars,
             verbosity=config.display.verbosity,
@@ -317,16 +439,16 @@ def cmd_pretooluse(
 
     decision = pending_approvals.wait(
         approval_id,
-        timeout=config.slack.approval_timeout_seconds,
+        timeout=slack_cfg.approval_timeout_seconds,
     )
     if decision is None:
         _log_event(f"PreToolUse timed out approval_id={approval_id}")
         # Try to mark the message as timed-out; best-effort.
         try:
-            if config.slack.bot_token:
+            if slack_cfg.bot_token:
                 body = slack_sink.build_resolved_message(event, "timeout", "system")
                 slack_sink.update_message(
-                    config.slack.bot_token, channel, message_ts, body, poster=poster,
+                    slack_cfg.bot_token, channel, message_ts, body, poster=poster,
                 )
         except Exception:  # noqa: BLE001
             pass
@@ -573,11 +695,10 @@ def cmd_install(args: argparse.Namespace) -> int:
             "  2. Install to workspace, then copy the bot token (xoxb-…). On\n"
             "     the app's Basic Information page, generate an App-Level token\n"
             "     with `connections:write` scope — that's your xapp-… token.\n"
-            "  3. export SLACK_BOT_TOKEN=xoxb-… SLACK_APP_TOKEN=xapp-…\n"
-            "  4. Edit ~/.config/coding-agent-notifier/config.toml to set\n"
-            "     interactive=true and actionable_approvals=true under\n"
-            "     [sinks.slack] (plus approver_user_ids = [\"U0YOURID\"]).\n"
-            "  5. launchctl load <plist>  (or run `agent-notify daemon` in a terminal).",
+            "  3. Run `agent-notify slack add` — the wizard stores both tokens\n"
+            "     in macOS Keychain and writes [slack.workspaces.default] into\n"
+            "     ~/.agent-notify/config.toml.\n"
+            "  4. launchctl load <plist>  (or run `agent-notify daemon` in a terminal).",
             file=sys.stderr,
         )
         return 0

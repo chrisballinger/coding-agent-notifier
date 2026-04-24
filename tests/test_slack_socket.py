@@ -114,15 +114,117 @@ def test_non_allowlisted_user_rejected(tmp_path: Path):
     assert "not authorized" in ephemerals[0]["text"].lower()
 
 
-def test_empty_allowlist_allows_anyone(tmp_path: Path):
-    """Defaulting to wide-open is a conscious choice (DM mode assumed);
-    config parser nudges users to fill this in."""
+def test_empty_allowlist_allows_dm_channel(tmp_path: Path):
+    """Empty allowlist is secure-by-fallback in a DM: Slack DM channel IDs
+    start with 'D', and only the installing user is in a DM with the bot,
+    so the click author is implicit. Matches the config's DM-friendly
+    default (`channel = "@me"` with no approver_user_ids)."""
+    pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
+              base_dir=tmp_path)
+    pa.set_message_ref("appr-1", "D_BOT_DM", "1.0", base_dir=tmp_path)
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_approve", user_id="U_SELF", channel_id="D_BOT_DM"),
+        _slack_config(approver_user_ids=()),
+        update_fn=lambda *a, **kw: None,
+        base_dir=tmp_path,
+    )
+    assert res.decision == "allow"
+
+
+def test_empty_allowlist_rejects_shared_channel(tmp_path: Path):
+    """The DM fallback does NOT extend to shared channels — if the config
+    somehow made it through with empty allowlist on a C-prefixed channel,
+    the runtime check rejects."""
+    pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
+              base_dir=tmp_path)
+    ephemerals: list[dict] = []
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_approve", user_id="U_RANDO", channel_id="C_SHARED"),
+        _slack_config(approver_user_ids=()),
+        ephemeral_fn=lambda **kw: ephemerals.append(kw),
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision is None
+    assert res.rejected_reason == "no_allowlist_non_dm"
+    rec = pa.read("appr-1", base_dir=tmp_path)
+    assert rec["decision"] is None
+    assert len(ephemerals) == 1
+
+
+def test_usergroup_membership_authorizes(tmp_path: Path):
+    """A clicker who isn't in `approver_user_ids` but IS in one of the
+    approver_user_groups gets through."""
+    pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
+              base_dir=tmp_path)
+    pa.set_message_ref("appr-1", "C_TEAM", "1.0", base_dir=tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    def _check(group_id: str, user_id: str) -> bool:
+        calls.append((group_id, user_id))
+        return group_id == "S_ONCALL" and user_id == "U_ONCALL"
+
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_approve", user_id="U_ONCALL", channel_id="C_TEAM"),
+        _slack_config(approver_user_ids=(), approver_user_groups=("S_ONCALL",)),
+        update_fn=lambda *a, **kw: None,
+        group_member_check=_check,
+        base_dir=tmp_path,
+    )
+    assert res.decision == "allow"
+    assert calls == [("S_ONCALL", "U_ONCALL")]
+
+
+def test_usergroup_membership_rejects_non_member(tmp_path: Path):
     pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
               base_dir=tmp_path)
     res = slack_socket.handle_block_actions(
-        _payload("agent_notify_approve", user_id="U_RANDO"),
-        _slack_config(approver_user_ids=()),
+        _payload("agent_notify_approve", user_id="U_RANDO", channel_id="C_TEAM"),
+        _slack_config(approver_user_ids=(), approver_user_groups=("S_ONCALL",)),
+        ephemeral_fn=lambda **kw: None,
+        group_member_check=lambda g, u: False,
+        base_dir=tmp_path,
+    )
+    assert res.decision is None
+    assert res.rejected_reason == "not_authorized"
+
+
+def test_usergroup_resolver_failure_does_not_grant_access(tmp_path: Path):
+    """If the Slack API call to resolve group membership blows up, we fall
+    through to the next check (in this case, no other allowlist → reject).
+    Never grant access on resolver failure."""
+    pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
+              base_dir=tmp_path)
+
+    def _broken(_g, _u):
+        raise RuntimeError("Slack API returned 429")
+
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_approve", user_id="U_RANDO", channel_id="C_TEAM"),
+        _slack_config(approver_user_ids=(), approver_user_groups=("S_ONCALL",)),
+        ephemeral_fn=lambda **kw: None,
+        group_member_check=_broken,
+        base_dir=tmp_path,
+    )
+    assert res.decision is None
+    assert res.rejected_reason == "not_authorized"
+
+
+def test_explicit_user_id_wins_over_group_check(tmp_path: Path):
+    """If user_id is in approver_user_ids, we short-circuit and never call
+    the group resolver — cheap, and avoids unnecessary API hits."""
+    pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
+              base_dir=tmp_path)
+    pa.set_message_ref("appr-1", "C_TEAM", "1.0", base_dir=tmp_path)
+
+    def _should_not_be_called(_g, _u):
+        pytest.fail("group_member_check should not run when user is in approver_user_ids")
+
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_approve", user_id="U_OK", channel_id="C_TEAM"),
+        _slack_config(approver_user_groups=("S_ONCALL",)),
         update_fn=lambda *a, **kw: None,
+        group_member_check=_should_not_be_called,
         base_dir=tmp_path,
     )
     assert res.decision == "allow"
@@ -171,3 +273,95 @@ def test_empty_actions_array_not_handled():
     payload = {"type": "block_actions", "user": {"id": "U"}, "actions": []}
     res = slack_socket.handle_block_actions(payload, _slack_config())
     assert res.handled is False
+
+
+# --- daemon-side helpers ---------------------------------------------------
+
+
+def test_interactive_workspaces_picks_only_actionable():
+    from coding_agent_notifier import config as cfgmod
+
+    cfg = cfgmod.parse_config({
+        "slack": {
+            "workspaces": {
+                "home": {  # webhook-only, no actionable
+                    "enabled": True,
+                    "bot_token": "xoxb-h",
+                },
+                "work": {
+                    "enabled": True,
+                    "bot_token": "xoxb-w",
+                    "app_token": "xapp-w",
+                    "actionable_approvals": True,
+                    "approver_user_ids": ["U01"],
+                },
+            },
+        },
+    })
+    selected = slack_socket._interactive_workspaces(cfg)
+    names = [n for n, _ in selected]
+    assert names == ["work"]
+
+
+def test_interactive_workspaces_back_compat_legacy_default():
+    from coding_agent_notifier import config as cfgmod
+
+    # Legacy [sinks.slack] actionable setup — still picked up.
+    cfg = cfgmod.parse_config({
+        "sinks": {
+            "slack": {
+                "enabled": True,
+                "bot_token": "xoxb-l",
+                "app_token": "xapp-l",
+                "actionable_approvals": True,
+                "approver_user_ids": ["U01"],
+            },
+        },
+    })
+    selected = slack_socket._interactive_workspaces(cfg)
+    names = [n for n, _ in selected]
+    assert names == ["default"]
+
+
+class _FakeSlackResponse:
+    def __init__(self, data: dict):
+        self.data = data
+
+
+class _FakeWebClient:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def usergroups_users_list(self, *, usergroup: str) -> _FakeSlackResponse:
+        self.calls.append(usergroup)
+        return _FakeSlackResponse({"ok": True, "users": ["U_A", "U_B"]})
+
+
+def test_group_member_check_caches_within_ttl():
+    web = _FakeWebClient()
+    check = slack_socket._make_group_member_check(web)
+    assert check("S_ONCALL", "U_A") is True
+    assert check("S_ONCALL", "U_B") is True
+    assert check("S_ONCALL", "U_C") is False
+    # All three clicks resolved from a single API call.
+    assert web.calls == ["S_ONCALL"]
+
+
+def test_group_member_check_raises_on_api_failure():
+    class _FailingClient:
+        def usergroups_users_list(self, *, usergroup):
+            return _FakeSlackResponse({"ok": False, "error": "ratelimited"})
+
+    check = slack_socket._make_group_member_check(_FailingClient())
+    with pytest.raises(RuntimeError, match="ratelimited"):
+        check("S_ONCALL", "U_A")
+
+
+def test_group_member_check_caches_per_group():
+    web = _FakeWebClient()
+    check = slack_socket._make_group_member_check(web)
+    check("S_ONE", "U_A")
+    check("S_TWO", "U_A")
+    check("S_ONE", "U_B")
+    # One API call per distinct group, cached afterward.
+    assert web.calls == ["S_ONE", "S_TWO"]

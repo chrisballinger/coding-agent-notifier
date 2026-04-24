@@ -29,8 +29,9 @@ def test_install_slack_bot_subcommand(monkeypatch, capsys):
     out = capsys.readouterr()
     assert "PreToolUse" in out.out
     assert "launchctl load" in out.out
-    # Instructions for next steps go to stderr.
-    assert "SLACK_BOT_TOKEN" in out.err
+    # Instructions for next steps go to stderr. Point users at the wizard
+    # rather than the legacy env-var dance.
+    assert "agent-notify slack add" in out.err
 
 
 def test_install_slack_bot_no_launchd(monkeypatch):

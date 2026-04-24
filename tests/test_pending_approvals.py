@@ -29,6 +29,22 @@ def test_create_writes_record_and_fifo(tmp_path: Path):
     assert data["tool_name"] == "Bash"
     assert data["tool_input"] == {"command": "ls"}
     assert data["decision"] is None
+    # Back-compat: records created without an explicit workspace are tagged
+    # "default" so older records still read fine.
+    assert data["workspace"] == "default"
+
+
+def test_create_persists_workspace(tmp_path: Path):
+    pa.create(
+        "abc",
+        agent="claude-code",
+        session_id="s",
+        tool_name="Bash",
+        workspace="work",
+        base_dir=tmp_path,
+    )
+    data = json.loads((tmp_path / "abc.json").read_text())
+    assert data["workspace"] == "work"
 
 
 def test_set_message_ref_updates_record(tmp_path: Path):

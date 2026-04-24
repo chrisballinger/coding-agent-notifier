@@ -94,17 +94,26 @@ enabled = true                  # include a head/tail snippet of the agent's las
 head_chars = 250
 tail_chars = 250
 
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
-webhook_url = "https://hooks.slack.com/services/…"
-# Or use a bot token for DMs:
-# bot_token = "xoxb-…"
-# channel   = "@me"             # resolved via auth.test
+# Bot token: pick ONE source (Keychain is preferred — see §Credential storage below)
+bot_token_keychain = "default:bot_token"
+# bot_token_env    = "SLACK_BOT_TOKEN"
+# bot_token        = "xoxb-…"
+
+# For interactive approvals (approve/deny buttons, blocking PreToolUse hook):
+# app_token_keychain   = "default:app_token"
+# interactive          = true
+# actionable_approvals = true
+# approver_user_ids    = ["U0YOURID"]   # required for shared channels
+channel = "@me"                          # DM with the bot (secure default)
 
 [sinks.discord]
 enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
 ```
+
+The interactive setup wizard (`agent-notify slack add`) writes this block for you, stores tokens in macOS Keychain, and verifies via Slack's `auth.test`. Run it once per workspace — multi-workspace is supported by naming each block `[slack.workspaces.<name>]` and referencing names from `[[routes]]`. Legacy `[sinks.slack]` still parses as the implicit `default` workspace for backwards compatibility.
 
 ### Phone-first defaults
 
@@ -117,24 +126,30 @@ On iOS the push preview is tight, so the default layout is optimized for a glanc
 
 ## Per-repo routing
 
-Need different projects pinging different Slack channels? Add `[[routes]]` blocks. The first whose `cwd` glob matches the hook's working directory wins; overrides merge on top of the base sink configs.
+Need different projects pinging different Slack workspaces or channels? Add `[[routes]]` blocks. The first whose `cwd` glob matches the hook's working directory wins; overrides merge on top of the selected workspace.
 
 ```toml
-# Work projects → a shared #agents-work channel (bot token)
+# Two workspaces defined up top via `agent-notify slack add --name <name>`
+# [slack.workspaces.home] and [slack.workspaces.work] — tokens live in Keychain.
+
+# Work repos route to the `work` workspace + a shared channel
 [[routes]]
 cwd = "~/work/acme-*"
-slack.channel = "#agents-work"
+slack.workspace = "work"
+slack.channel = "#agents-acme"
 
-# An OSS project → its own webhook
+# OSS stays on the personal workspace
 [[routes]]
 cwd = "~/oss/my-library"
-slack.webhook_url = "https://hooks.slack.com/services/oss/…"
+slack.workspace = "home"
 
 # Personal stuff stays quiet
 [[routes]]
 cwd = "~/personal/*"
 slack.enabled = false
 ```
+
+`slack.workspace = "<name>"` picks the base config; any other `slack.*` key patches a single field on top. Without `slack.workspace`, the route uses the `default` workspace (or the legacy `[sinks.slack]` block if you haven't migrated yet).
 
 Patterns use `fnmatch`-style globs (`*`, `?`, `[abc]`) with `~` expansion. Use `agent-notify doctor` from inside a repo to confirm which route (if any) matches your current `cwd`.
 
@@ -162,11 +177,19 @@ slack.webhook_url = "https://hooks.slack.com/services/personal/…"
 
 **Config permission warning.** On load, if `config.toml` is group/world-readable AND contains any inline `webhook_url` / `bot_token` / `app_token` value (as opposed to an `_env` reference), `agent-notify` prints a loud stderr warning telling you to `chmod 600` it. It does *not* refuse to load — you may have reasons — but the warning is hard to miss.
 
-**Token storage, in order of preference.**
+**Credential storage, in order of preference.**
 
-1. Environment variable — config refers to it via `bot_token_env = "SLACK_BOT_TOKEN"`. Nothing secret on disk.
-2. Inline in `config.toml` — acceptable only if the file is `0600` and on an encrypted disk (e.g. macOS FileVault).
-3. We do *not* currently integrate with macOS Keychain — see "Out of scope" below.
+Each token (bot_token, app_token, webhook_url) resolves from the first matching source:
+
+1. **`bot_token_keychain = "default:bot_token"`** — macOS Keychain via `/usr/bin/security`. Recommended for Mac users; `agent-notify slack add` writes here by default. Keychain entries outlive config resets and are protected by the user's login keychain ACL. *Trade-off:* `security add-generic-password` takes the password on argv during the brief subprocess lifetime — visible to `ps` during that window. Acceptable on a single-user Mac; if that matters on your host, use the secrets-file route instead.
+
+2. **`secrets.toml` (sibling of `config.toml`, 0600 enforced)** — separate TOML file that fills in any keys `config.toml` left unset. Permissions are *enforced* (not just warned): a group/world-readable `secrets.toml` refuses to load. Works on Linux and macOS; the best option when you want to commit `config.toml` to dotfiles but keep secrets out. *Trade-off:* relies on whatever disk encryption you have (FileVault, LUKS, etc.); no per-secret ACL like Keychain.
+
+3. **`bot_token_env = "SLACK_BOT_TOKEN"`** — environment variable. Cross-platform, works in CI. *Trade-off:* env vars leak via process listings (`ps e`), subprocess inheritance, and shell rc-file commits. Prefer Keychain or `secrets.toml` on a developer machine.
+
+4. **Inline `bot_token = "xoxb-…"`** — discouraged. Acceptable only when `config.toml` is 0600 on an encrypted disk; loud stderr warning fires on every load if the file is group/world-readable AND contains an inline secret.
+
+If `bot_token_keychain` is configured but the account is missing or the Keychain subprocess fails, config load fails loudly rather than silently falling through — see `keychain.py`'s module docstring for the rationale.
 
 **What goes into logs.** `logs/defer.log` records metadata only — approval IDs, session IDs (short), tool names, decisions — and is created at `0600`. `tool_input` contents are never logged. If you see a stack trace in the log, it's from our own code; no token or command body is printed there either.
 
@@ -186,8 +209,8 @@ slack.webhook_url = "https://hooks.slack.com/services/personal/…"
 
 ### Out of scope (today)
 
-- **macOS Keychain token storage.** Future pass — `security find-generic-password` or PyObjC. For now, env vars are the right answer.
-- **Encryption at rest.** Rely on macOS FileVault.
+- **Linux-native secret stores.** On Linux / WSL use `secrets.toml` or env vars — we don't integrate with `libsecret` / GNOME Keyring today.
+- **Encryption at rest.** Rely on macOS FileVault / LUKS / dm-crypt.
 - **Audit log of approve/deny decisions.** Separate feature — file if you want it.
 - **End-to-end encryption of push payloads.** See `docs/plans/ios-live-activities.md` for a native-iOS design that does E2EE; Slack itself is in-band encrypted but Slack-readable.
 
@@ -199,6 +222,7 @@ slack.webhook_url = "https://hooks.slack.com/services/personal/…"
 | `agent-notify test [--force] [--kind ...]`       | Sends a synthetic event end-to-end.                   |
 | `agent-notify config init \| path`               | Write / locate the config file.                       |
 | `agent-notify install {claude-code,codex,slack-bot}` | Install hooks into the target agent (slack-bot also writes the launchd plist for the daemon). |
+| `agent-notify slack {add,list,remove,test}`           | Manage Slack workspaces — the `add` wizard stores tokens in Keychain and writes the config block. |
 | `agent-notify daemon`                                 | Run the Slack Socket Mode listener (required when `actionable_approvals` is on).              |
 | `agent-notify doctor`                            | Summarize config, system state, install state.        |
 

@@ -154,3 +154,108 @@ def test_pretooluse_emits_valid_claude_code_json_shape():
     assert "hookSpecificOutput" in out
     assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert out["hookSpecificOutput"]["permissionDecision"] in ("allow", "deny", "ask")
+
+
+def test_pretooluse_picks_workspace_by_route_and_stamps_record(tmp_path, monkeypatch):
+    """cmd_pretooluse should resolve the workspace for the payload's cwd and
+    persist it on the approval record so the hook's timeout-cleanup can look
+    up the right bot_token later."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    from coding_agent_notifier import config as cfgmod
+
+    (tmp_path / "acme").mkdir()
+
+    cfg = cfgmod.parse_config({
+        "slack": {
+            "workspaces": {
+                "home": {
+                    "enabled": True,
+                    "bot_token": "xoxb-home",
+                    "app_token": "xapp-home",
+                    "actionable_approvals": True,
+                    "approver_user_ids": ["U_HOME"],
+                    "approval_timeout_seconds": 1.0,
+                },
+                "work": {
+                    "enabled": True,
+                    "bot_token": "xoxb-work",
+                    "app_token": "xapp-work",
+                    "actionable_approvals": True,
+                    "approver_user_ids": ["U_WORK"],
+                    "approval_timeout_seconds": 1.0,
+                    "channel": "#agents-work",
+                },
+            },
+        },
+        "routes": [
+            {"cwd": f"{tmp_path}/acme", "slack": {"workspace": "work"}},
+        ],
+        "display": {"verbosity": "terse"},
+        "summary": {"enabled": False},
+    })
+
+    # Stub the Slack API so we can see which bot_token was used.
+    used_bot_tokens: list[str] = []
+
+    def post(url, payload, *, headers=None, timeout=10.0):
+        auth = (headers or {}).get("Authorization", "")
+        if auth.startswith("Bearer "):
+            used_bot_tokens.append(auth[len("Bearer "):])
+        if url.endswith("/chat.postMessage"):
+            return 200, json.dumps({"ok": True, "ts": "1.0", "channel": "C_WORK"})
+        if url.endswith("/chat.update"):
+            return 200, json.dumps({"ok": True})
+        return 200, json.dumps({"ok": True})
+
+    buf = io.StringIO()
+    rc = cli.cmd_pretooluse(
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "session_id": "s1",
+            "cwd": str(tmp_path / "acme"),
+        },
+        cfg,
+        poster=post,
+        stdout=buf,
+    )
+    assert rc == 0
+    # Route selected the "work" workspace, so xoxb-work was used (not home)
+    # for both chat.postMessage and the timeout chat.update.
+    assert any(t == "xoxb-work" for t in used_bot_tokens)
+    assert all(t != "xoxb-home" for t in used_bot_tokens)
+
+
+def test_pretooluse_strict_routing_no_match_emits_ask(tmp_path, monkeypatch):
+    """If routes are configured and none match the cwd, strict mode returns
+    None from sinks_for. The hook should fall back to 'ask' so Claude Code
+    shows its own prompt rather than denying every tool call."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    from coding_agent_notifier import config as cfgmod
+
+    cfg = cfgmod.parse_config({
+        "slack": {
+            "workspaces": {
+                "work": {
+                    "enabled": True,
+                    "bot_token": "xoxb",
+                    "app_token": "xapp",
+                    "actionable_approvals": True,
+                    "approver_user_ids": ["U"],
+                },
+            },
+        },
+        "routes": [
+            {"cwd": "/nonexistent/*", "slack": {"workspace": "work"}},
+        ],
+    })
+
+    buf = io.StringIO()
+    rc = cli.cmd_pretooluse(
+        {"tool_name": "Bash", "cwd": str(tmp_path)},
+        cfg,
+        stdout=buf,
+    )
+    assert rc == 0
+    out = json.loads(buf.getvalue())
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"

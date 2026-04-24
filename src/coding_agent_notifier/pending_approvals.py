@@ -72,10 +72,17 @@ def create(
     session_id: str | None,
     tool_name: str | None,
     tool_input: dict | None = None,
+    workspace: str = "default",
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> Path:
-    """Write the initial record and mkfifo the wake pipe. Returns record path."""
+    """Write the initial record and mkfifo the wake pipe. Returns record path.
+
+    `workspace` names the Slack workspace the message was posted to. The
+    hook's timeout-update path reads it back to pick the right bot_token
+    for `chat.update`; older records that predate this field default to
+    "default" at read time.
+    """
     record = _record_path(approval_id, base_dir)
     fifo = _fifo_path(approval_id, base_dir)
     record.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +92,7 @@ def create(
         "session_id": session_id,
         "tool_name": tool_name,
         "tool_input": tool_input if isinstance(tool_input, dict) else None,
+        "workspace": workspace,
         "created_at": clock(),
         "decision": None,
         "actor": None,
