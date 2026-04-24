@@ -15,8 +15,15 @@ from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config, m
 from .event import Event
 from .gating import SystemState, should_send
 
-DEDUP_TTL = 5.0
-DEDUPED_KINDS = frozenset({"permission", "turn_complete"})
+# Per-kind dedup windows. Permission gets a much longer window because Claude
+# Code's `Notification:permission_prompt` can fire tens of seconds after the
+# `PermissionRequest` hook for the same logical event (especially when the user
+# is slow to respond). Both hooks fire per-session so collisions across distinct
+# permissions within 60s are unusual enough to accept as a tradeoff.
+DEDUP_TTLS: dict[str, float] = {
+    "permission": 60.0,
+    "turn_complete": 5.0,
+}
 from .sinks.base import Sink, SinkError
 from .sinks.discord import DiscordSink
 from .sinks.slack import SlackSink
@@ -212,14 +219,16 @@ def _spawn_defer_child(
 def _is_duplicate(event: Event) -> bool:
     # Both agents can fire two hooks for the same logical event:
     #   - Claude Code: `PermissionRequest` + `Notification:permission_prompt`
+    #                  (can be delayed up to ~60s when the user is slow to answer)
     #   - Codex:       `notify` (agent-turn-complete) + the `Stop` hook
-    # Collapse pairs within a short TTL keyed on (agent, kind, session). We
-    # deliberately ignore tool_name — the Notification payload doesn't carry it
-    # so the keys would diverge otherwise.
-    if event.kind not in DEDUPED_KINDS:
+    # Collapse pairs within a kind-specific TTL keyed on (agent, kind, session).
+    # We deliberately ignore tool_name — the Notification payload doesn't carry
+    # it so the keys would diverge otherwise.
+    ttl = DEDUP_TTLS.get(event.kind)
+    if ttl is None:
         return False
     key = dedup.dedup_key(event.agent, event.kind, event.session_id, None)
-    return dedup.recently_seen(key, ttl=DEDUP_TTL)
+    return dedup.recently_seen(key, ttl=ttl)
 
 
 def cmd_config(args: argparse.Namespace) -> int:

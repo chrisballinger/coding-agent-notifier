@@ -309,6 +309,59 @@ def test_doctor_reports_config_error(monkeypatch, tmp_path: Path, capsys):
     assert "failed to load" in capsys.readouterr().out
 
 
+def test_hook_deduplicates_delayed_permission_notification(monkeypatch, tmp_path: Path):
+    """PermissionRequest fires first, user takes 30s to engage, then Claude
+    Code fires Notification:permission_prompt as a nudge — we should still
+    collapse them into a single ping. Regression for a real-world report where
+    the short 5s window missed the delayed twin."""
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[sinks.slack]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    dedup_path = tmp_path / "dedup.json"
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.default_state_path", lambda: dedup_path
+    )
+    # Simulate time advancing between the two hook fires: 30 seconds.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "coding_agent_notifier.cli.dedup.time.monotonic", lambda: clock[0]
+    )
+    calls = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda *a, **k: (calls.append(a) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    perm_req = {
+        "hook_event_name": "PermissionRequest",
+        "cwd": "/tmp",
+        "session_id": "s1",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": [{"question": "ok?"}]},
+    }
+    notif = {
+        "hook_event_name": "Notification",
+        "notification_type": "permission_prompt",
+        "cwd": "/tmp",
+        "session_id": "s1",
+        "message": "Claude Code needs your attention",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(perm_req)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    clock[0] += 30.0  # 30 seconds later — past the old 5s window
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(notif)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+
+
 def test_hook_deduplicates_permission_twin_fire(monkeypatch, tmp_path: Path):
     cfg = _write_config(
         tmp_path,
