@@ -10,23 +10,30 @@ from coding_agent_notifier.config import DiscordConfig, SlackConfig
 from coding_agent_notifier.event import Event
 from coding_agent_notifier.sinks import base as sink_base
 from coding_agent_notifier.sinks import slack as slack_mod
-from coding_agent_notifier.sinks.discord import DiscordSink, build_discord_message
+from coding_agent_notifier.sinks.discord import (
+    DiscordSink,
+    build_discord_message,
+    _KIND_COLORS as DISCORD_COLORS,
+    _DANGER_COLOR as DISCORD_DANGER,
+)
 from coding_agent_notifier.sinks.slack import (
     SlackSink,
+    _KIND_COLORS as SLACK_COLORS,
+    _DANGER_COLOR as SLACK_DANGER,
     build_slack_message,
     resolve_self_channel,
 )
 
 
 def _event(**kw) -> Event:
-    base = dict(
+    base: dict[str, Any] = dict(
         agent="claude-code",
         kind="permission",
-        message="Claude needs your permission",
+        message="",
         cwd=Path("/Users/me/myproj"),
         session_id="abc123def456",
         tool_name="Bash",
-        tool_input_preview="echo hi",
+        tool_input={"command": "echo hi"},
         source_app="iTerm2",
     )
     base.update(kw)
@@ -36,10 +43,13 @@ def _event(**kw) -> Event:
 # --- Slack payload shape ---
 
 
-def test_slack_message_blocks_have_header_and_fields():
+def test_slack_message_wraps_blocks_in_colored_attachment():
     body = build_slack_message(_event())
-    assert body["text"].startswith("Claude Code")
-    kinds = [b["type"] for b in body["blocks"]]
+    assert "attachments" in body
+    assert len(body["attachments"]) == 1
+    att = body["attachments"][0]
+    assert att["color"] == SLACK_COLORS["permission"]
+    kinds = [b["type"] for b in att["blocks"]]
     assert kinds[0] == "header"
     assert "section" in kinds
 
@@ -57,12 +67,41 @@ def test_slack_message_omits_session_when_none():
     assert "abc123" not in joined
 
 
+def test_slack_message_turn_complete_color():
+    body = build_slack_message(_event(kind="turn_complete", tool_name=None, tool_input=None, message="done"))
+    assert body["attachments"][0]["color"] == SLACK_COLORS["turn_complete"]
+
+
+def test_slack_message_dangerous_command_highlight():
+    body = build_slack_message(_event(tool_input={"command": "sudo rm -rf /"}))
+    att = body["attachments"][0]
+    assert att["color"] == SLACK_DANGER
+    header = att["blocks"][0]["text"]["text"]
+    assert ":rotating_light:" in header
+    assert "DANGEROUS" in body["text"]
+
+
+def test_slack_message_polishes_paths_to_inline_code():
+    body = build_slack_message(
+        _event(tool_name=None, tool_input=None, message="edit /Users/me/file.py please")
+    )
+    found = json.dumps(body)
+    assert "`/Users/me/file.py`" in found
+
+
+def test_slack_message_linkifies_urls():
+    body = build_slack_message(
+        _event(tool_name=None, tool_input=None, message="see https://docs.example.com/x for details")
+    )
+    found = json.dumps(body)
+    assert "<https://docs.example.com/x|docs.example.com>" in found
+
+
 # --- Slack sink dispatch ---
 
 
 class _FakePoster:
     def __init__(self, responses):
-        # responses: list of (status, body) tuples consumed in order
         self._queue = list(responses)
         self.calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
@@ -87,8 +126,7 @@ def test_slack_webhook_happy_path(fake_post):
     sink = SlackSink(SlackConfig(enabled=True, webhook_url="https://hook.test/x"))
     sink.send(_event())
     assert len(poster.calls) == 1
-    url, _body, _h = poster.calls[0]
-    assert url == "https://hook.test/x"
+    assert poster.calls[0][0] == "https://hook.test/x"
 
 
 def test_slack_webhook_non_ok_body_raises(fake_post):
@@ -109,8 +147,8 @@ def test_slack_bot_token_resolves_self_and_posts(fake_post):
     poster = fake_post(
         slack_mod,
         [
-            (200, json.dumps({"ok": True, "user_id": "U1"})),  # auth.test
-            (200, json.dumps({"ok": True})),                    # chat.postMessage
+            (200, json.dumps({"ok": True, "user_id": "U1"})),
+            (200, json.dumps({"ok": True})),
         ],
     )
     sink = SlackSink(SlackConfig(enabled=True, bot_token="xoxb-abc"))
@@ -163,17 +201,26 @@ def test_resolve_self_channel_http_error(fake_post):
 # --- Discord sink ---
 
 
-def test_discord_message_shape():
+def test_discord_message_shape_and_color():
     body = build_discord_message(_event())
-    assert "embeds" in body
     embed = body["embeds"][0]
     assert embed["title"].startswith("Claude Code")
+    assert embed["color"] == DISCORD_COLORS["permission"]
     names = [f["name"] for f in embed["fields"]]
     assert "Project" in names
+    assert "echo hi" in embed["description"]
+
+
+def test_discord_message_dangerous_highlight():
+    body = build_discord_message(_event(tool_input={"command": "git push --force"}))
+    embed = body["embeds"][0]
+    assert embed["color"] == DISCORD_DANGER
+    assert embed["title"].startswith("🚨")
 
 
 def test_discord_sink_posts(fake_post):
-    poster = fake_post(__import__("coding_agent_notifier.sinks.discord", fromlist=["x"]), [(200, "")])
+    mod = __import__("coding_agent_notifier.sinks.discord", fromlist=["x"])
+    poster = fake_post(mod, [(200, "")])
     sink = DiscordSink(DiscordConfig(enabled=True, webhook_url="https://discord.test/h"))
     sink.send(_event())
     assert len(poster.calls) == 1

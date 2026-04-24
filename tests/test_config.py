@@ -12,6 +12,17 @@ def test_defaults_when_file_missing(tmp_path: Path):
     assert c.gating == "idle_or_background"
     assert c.slack.enabled is False
     assert c.event("permission").enabled is True
+    assert c.tool_input_max_chars == 400
+
+
+def test_tool_input_max_chars_override():
+    c = cfgmod.parse_config({"tool_input_max_chars": 80})
+    assert c.tool_input_max_chars == 80
+
+
+def test_tool_input_max_chars_rejects_non_positive():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"tool_input_max_chars": 0})
 
 
 def test_full_parse(tmp_path: Path):

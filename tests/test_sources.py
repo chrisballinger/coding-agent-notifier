@@ -28,7 +28,6 @@ def test_claude_notification_elicitation(load_fixture):
 
 
 def test_claude_notification_auth_success_skipped():
-    # auth_success isn't a kind we route on
     payload = {
         "hook_event_name": "Notification",
         "notification_type": "auth_success",
@@ -42,22 +41,16 @@ def test_claude_permission_request_with_bash(load_fixture):
     assert ev is not None
     assert ev.kind == "permission"
     assert ev.tool_name == "Bash"
-    assert ev.tool_input_preview == "rm -rf node_modules"
-
-
-def test_claude_permission_request_falls_back_to_description():
-    payload = {
-        "hook_event_name": "PermissionRequest",
-        "tool_name": "Edit",
-        "tool_input": {"description": "apply a patch"},
-        "cwd": "/tmp",
+    assert ev.tool_input == {
+        "command": "rm -rf node_modules",
+        "description": "Remove node_modules directory",
     }
-    ev = claude_code.parse(payload)
-    assert ev is not None
-    assert ev.tool_input_preview == "apply a patch"
+    # Permission events should leave `message` empty — sink layout carries the
+    # tool name as a field, so "Tool: X" duplication is the anti-pattern.
+    assert ev.message == ""
 
 
-def test_claude_permission_request_falls_back_to_json():
+def test_claude_permission_request_passes_through_arbitrary_tool():
     payload = {
         "hook_event_name": "PermissionRequest",
         "tool_name": "CustomTool",
@@ -66,8 +59,30 @@ def test_claude_permission_request_falls_back_to_json():
     }
     ev = claude_code.parse(payload)
     assert ev is not None
-    assert ev.tool_input_preview is not None
-    assert "target" in ev.tool_input_preview
+    assert ev.tool_input == {"target": "foo", "mode": "bar"}
+
+
+def test_claude_permission_request_missing_tool_input():
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Something",
+        "cwd": "/tmp",
+    }
+    ev = claude_code.parse(payload)
+    assert ev is not None
+    assert ev.tool_input is None
+
+
+def test_claude_permission_request_non_dict_tool_input_discarded():
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Odd",
+        "tool_input": "not a dict",
+        "cwd": "/tmp",
+    }
+    ev = claude_code.parse(payload)
+    assert ev is not None
+    assert ev.tool_input is None
 
 
 def test_claude_stop(load_fixture):
@@ -107,20 +122,21 @@ def test_codex_hooks_permission(load_fixture):
     assert ev is not None
     assert ev.kind == "permission"
     assert ev.tool_name == "shell"
-    assert ev.tool_input_preview == "git push origin main"
+    assert ev.tool_input == {"command": "git push origin main"}
+    assert ev.message == ""
 
 
 def test_codex_unknown_returns_none():
     assert codex.parse({"type": "something-else", "cwd": "/"}) is None
 
 
-def test_codex_permission_fallback_json():
+def test_codex_permission_non_dict_tool_input_discarded():
     payload = {
         "hook_event_name": "PermissionRequest",
         "tool_name": "weird",
-        "tool_input": {"x": 1},
+        "tool_input": ["not a dict"],
         "cwd": "/",
     }
     ev = codex.parse(payload)
     assert ev is not None
-    assert ev.tool_input_preview is not None
+    assert ev.tool_input is None

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -22,47 +21,36 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
         return Event(
             agent="codex",
             kind="turn_complete",
-            message=truncate(str(payload.get("message") or "Turn complete")),
+            message=truncate(str(payload.get("message") or "")),
             cwd=cwd,
             session_id=payload.get("session_id"),
             source_app=source_app,
         )
     if hook == "PermissionRequest":
         tool_name = payload.get("tool_name")
-        preview = _tool_input_preview(payload.get("tool_input") or {})
+        tool_input = payload.get("tool_input") or None
         return Event(
             agent="codex",
             kind="permission",
-            message=f"Tool: {tool_name}" if tool_name else "Permission requested",
+            message="",
             cwd=cwd,
             session_id=payload.get("session_id"),
             tool_name=tool_name,
-            tool_input_preview=preview,
+            tool_input=tool_input if isinstance(tool_input, dict) else None,
             source_app=source_app,
         )
 
     # Legacy notify shape
     ntype = payload.get("type")
     if ntype == "agent-turn-complete":
-        msg = payload.get("last-assistant-message") or "Turn complete"
+        msg = payload.get("last-assistant-message") or ""
         return Event(
             agent="codex",
             kind="turn_complete",
-            message=truncate(str(msg)),
+            message=truncate(str(msg)) if msg else "",
             cwd=cwd,
             session_id=payload.get("turn-id") or payload.get("session_id"),
             source_app=source_app,
         )
 
     return None
-
-
-def _tool_input_preview(tool_input: dict[str, Any]) -> str | None:
-    if not tool_input:
-        return None
-    if isinstance(tool_input.get("command"), str):
-        return truncate(tool_input["command"])
-    try:
-        return truncate(json.dumps(tool_input, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return None

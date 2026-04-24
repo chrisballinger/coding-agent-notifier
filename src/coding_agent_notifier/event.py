@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 EventKind = Literal["permission", "idle_prompt", "turn_complete", "elicitation"]
 AgentName = Literal["claude-code", "codex"]
@@ -35,7 +35,7 @@ class Event:
     cwd: Path
     session_id: str | None = None
     tool_name: str | None = None
-    tool_input_preview: str | None = None
+    tool_input: dict[str, Any] | None = None
     source_app: str | None = None
 
     @property

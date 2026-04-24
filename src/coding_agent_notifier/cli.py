@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--kind", default="permission",
                       choices=["permission", "idle_prompt", "turn_complete", "elicitation"])
     test.add_argument("--force", action="store_true", help="Bypass gating.")
+    test.add_argument("--dangerous", action="store_true",
+                      help="Use a dangerous command in the synthetic tool_input (for permission kind).")
 
     sub.add_parser("doctor", help="Check config, connectivity, and install state.")
 
@@ -159,6 +161,12 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_test(args: argparse.Namespace) -> int:
+    tool_input = None
+    if args.kind == "permission":
+        if args.dangerous:
+            tool_input = {"command": "sudo rm -rf /tmp/agent-notify-test", "description": "synthetic dangerous command"}
+        else:
+            tool_input = {"command": "echo 'hello from agent-notify'"}
     event = Event(
         agent="claude-code",
         kind=args.kind,
@@ -166,7 +174,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         cwd=Path.cwd(),
         session_id="test1234",
         tool_name="Bash" if args.kind == "permission" else None,
-        tool_input_preview="echo 'hello from agent-notify'" if args.kind == "permission" else None,
+        tool_input=tool_input,
         source_app=macos.term_program_to_app(os.environ.get("TERM_PROGRAM")),
     )
     config = load_config(args.config)
@@ -216,9 +224,9 @@ def _snapshot_state() -> SystemState:
 def _dispatch(event: Event, config: Config) -> None:
     sinks: list[Sink] = []
     if config.slack.enabled:
-        sinks.append(SlackSink(config.slack))
+        sinks.append(SlackSink(config.slack, tool_input_max_chars=config.tool_input_max_chars))
     if config.discord.enabled:
-        sinks.append(DiscordSink(config.discord))
+        sinks.append(DiscordSink(config.discord, tool_input_max_chars=config.tool_input_max_chars))
     for sink in sinks:
         try:
             sink.send(event)

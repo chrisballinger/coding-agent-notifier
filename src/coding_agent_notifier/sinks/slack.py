@@ -1,25 +1,37 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from ..config import SlackConfig
-from ..event import Event
+from ..event import Event, EventKind
+from ..tool_formatters import DEFAULT_MAX_CHARS, ToolRender, render
 from .base import SinkError, http_post_json
 
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
+
+# Slack attachment color bar per event kind (hex without #).
+_KIND_COLORS: dict[EventKind, str] = {
+    "permission": "#e01e5a",
+    "idle_prompt": "#ecb22e",
+    "elicitation": "#ecb22e",
+    "turn_complete": "#2eb67d",
+}
+_DANGER_COLOR = "#a30f18"
 
 
 @dataclass
 class SlackSink:
     config: SlackConfig
     name: str = "slack"
+    tool_input_max_chars: int = DEFAULT_MAX_CHARS
 
     def send(self, event: Event) -> None:
         if not self.config.enabled:
             return
-        body = build_slack_message(event)
+        body = build_slack_message(event, max_chars=self.tool_input_max_chars)
         if self.config.webhook_url:
             status, text = http_post_json(self.config.webhook_url, body)
             if status >= 300 or text.strip() not in ("ok", ""):
@@ -59,7 +71,10 @@ def resolve_self_channel(bot_token: str) -> str:
     return parsed["user_id"]
 
 
-def build_slack_message(event: Event) -> dict:
+def build_slack_message(event: Event, *, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
+    dangerous = tool.dangerous
+
     cwd_name = event.cwd.name or str(event.cwd)
     session_short = (event.session_id or "")[:8] or "—"
     fields = [
@@ -71,29 +86,67 @@ def build_slack_message(event: Event) -> dict:
     if event.source_app:
         fields.append({"type": "mrkdwn", "text": f"*App:*\n{event.source_app}"})
 
+    header = f"{':rotating_light: ' if dangerous else ''}{event.emoji} {event.title}"
     blocks: list[dict] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"{event.emoji} {event.title}", "emoji": True},
-        },
+        {"type": "header", "text": {"type": "plain_text", "text": header, "emoji": True}},
         {"type": "section", "fields": fields},
     ]
-    if event.message:
+
+    body = _compose_body(event.message, tool)
+    if body:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
+    if tool.detail:
         blocks.append(
-            {"type": "section", "text": {"type": "mrkdwn", "text": event.message}}
-        )
-    if event.tool_input_preview:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"```\n{event.tool_input_preview}\n```",
-                },
-            }
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": f"```\n{tool.detail}\n```"}}
         )
 
-    return {"text": f"{event.title} — {event.message}".strip(" —"), "blocks": blocks}
+    attachment = {
+        "color": _DANGER_COLOR if dangerous else _KIND_COLORS.get(event.kind, ""),
+        "blocks": blocks,
+    }
+    return {
+        "text": _fallback_text(event, tool, dangerous),
+        "attachments": [attachment],
+    }
+
+
+def _compose_body(message: str, tool: ToolRender) -> str:
+    parts = []
+    if message:
+        parts.append(_mrkdwn_polish(message))
+    if tool.summary:
+        parts.append(tool.summary)
+    return "\n".join(parts)
+
+
+# Path regex excludes URL-like contexts: `/` preceded by `:`, letter, digit, or
+# backtick shouldn't become inline code. So `https://...`, `a/b` (path fragments
+# in identifiers), and already-quoted paths all pass through untouched.
+_PATH_RE = re.compile(r"(?<![`:/A-Za-z0-9])(/[^\s`<>]+)")
+_URL_RE = re.compile(r"(?<![<`])\bhttps?://\S+")
+
+
+def _mrkdwn_polish(text: str) -> str:
+    """Lightly format paths as inline code and URLs as Slack links."""
+    def _link(m: re.Match[str]) -> str:
+        url = m.group(0).rstrip(".,)")
+        host = re.sub(r"^https?://", "", url).split("/", 1)[0]
+        return f"<{url}|{host}>"
+    text = _URL_RE.sub(_link, text)
+    text = _PATH_RE.sub(lambda m: f"`{m.group(1).rstrip('.,)')}`", text)
+    return text
+
+
+def _fallback_text(event: Event, tool: ToolRender, dangerous: bool) -> str:
+    bits = []
+    if dangerous:
+        bits.append("⚠️ DANGEROUS")
+    bits.append(event.title)
+    summary = tool.summary or event.message
+    if summary:
+        bits.append(summary)
+    return " — ".join(b for b in bits if b)
 
 
 def _safe_json(text: str) -> dict:

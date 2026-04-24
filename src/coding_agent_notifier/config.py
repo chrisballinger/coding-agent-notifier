@@ -51,6 +51,7 @@ class DiscordConfig:
 class Config:
     idle_threshold_seconds: float = 60.0
     gating: GatingMode = "idle_or_background"
+    tool_input_max_chars: int = 400
     events: dict[EventKind, EventConfig] = field(default_factory=dict)
     slack: SlackConfig = field(default_factory=SlackConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
@@ -81,6 +82,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     gating = raw.get("gating", "idle_or_background")
     if gating not in VALID_GATING_MODES:
         raise ConfigError(f"invalid gating mode: {gating!r}")
+    tool_input_max_chars = int(raw.get("tool_input_max_chars", 400))
+    if tool_input_max_chars <= 0:
+        raise ConfigError(f"tool_input_max_chars must be positive, got {tool_input_max_chars}")
 
     events_raw = raw.get("events", {}) or {}
     events: dict[EventKind, EventConfig] = {}
@@ -117,6 +121,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     return Config(
         idle_threshold_seconds=idle,
         gating=gating,  # type: ignore[arg-type]
+        tool_input_max_chars=tool_input_max_chars,
         events=events,
         slack=slack,
         discord=discord,
@@ -127,6 +132,7 @@ CONFIG_TEMPLATE = """\
 # coding-agent-notifier config
 idle_threshold_seconds = 60
 gating = "idle_or_background"  # idle_only | background_only | idle_or_background | always
+tool_input_max_chars = 400     # truncation cap for tool input code blocks in notifications
 
 [events.permission]
 enabled = true

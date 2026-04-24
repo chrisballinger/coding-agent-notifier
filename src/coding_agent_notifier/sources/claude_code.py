@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -42,16 +41,18 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
 
     if hook == _PERMISSION_REQUEST:
         tool_name = payload.get("tool_name")
-        tool_input = payload.get("tool_input") or {}
-        preview = _tool_input_preview(tool_input)
+        tool_input = payload.get("tool_input") or None
         return Event(
             agent="claude-code",
             kind="permission",
-            message=f"Tool: {tool_name}" if tool_name else "Permission requested",
+            # Leave message empty — the Slack/Discord layouts already surface the
+            # tool name as a structured field, and `tool_input` is rendered by
+            # the sink via tool_formatters. Setting `"Tool: X"` here duplicates.
+            message="",
             cwd=cwd,
             session_id=session_id,
             tool_name=tool_name,
-            tool_input_preview=preview,
+            tool_input=tool_input if isinstance(tool_input, dict) else None,
             source_app=source_app,
         )
 
@@ -59,25 +60,10 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
         return Event(
             agent="claude-code",
             kind="turn_complete",
-            message="Turn complete",
+            message="",
             cwd=cwd,
             session_id=session_id,
             source_app=source_app,
         )
 
     return None
-
-
-def _tool_input_preview(tool_input: dict[str, Any]) -> str | None:
-    if not tool_input:
-        return None
-    # Bash-like tools carry the command directly.
-    if isinstance(tool_input.get("command"), str):
-        return truncate(tool_input["command"])
-    if isinstance(tool_input.get("description"), str):
-        return truncate(tool_input["description"])
-    # Fall back to compact JSON for other tools.
-    try:
-        return truncate(json.dumps(tool_input, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return None
