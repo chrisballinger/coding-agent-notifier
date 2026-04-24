@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 
 from . import __version__, dedup, install, macos
-from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config
+from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config, match_route, sinks_for
 from .event import Event
 from .gating import SystemState, should_send
 
@@ -200,6 +200,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  gating: {config.gating}  idle_threshold: {config.idle_threshold_seconds}s")
     print(f"  slack:   enabled={config.slack.enabled} webhook={bool(config.slack.webhook_url)} bot={bool(config.slack.bot_token)}")
     print(f"  discord: enabled={config.discord.enabled} webhook={bool(config.discord.webhook_url)}")
+    if config.routes:
+        print(f"  routes:  {len(config.routes)} configured")
+        matched = match_route(Path.cwd(), config)
+        if matched is not None:
+            print(f"    cwd={Path.cwd()} → matches {matched.cwd!r}")
+        else:
+            print(f"    cwd={Path.cwd()} → no route matches (falls back to global sinks)")
 
     state = _snapshot_state()
     print(f"System: idle={state.idle_seconds}s frontmost={state.frontmost_app!r}")
@@ -222,11 +229,12 @@ def _snapshot_state() -> SystemState:
 
 
 def _dispatch(event: Event, config: Config) -> None:
+    slack_cfg, discord_cfg = sinks_for(event.cwd, config)
     sinks: list[Sink] = []
-    if config.slack.enabled:
-        sinks.append(SlackSink(config.slack, tool_input_max_chars=config.tool_input_max_chars))
-    if config.discord.enabled:
-        sinks.append(DiscordSink(config.discord, tool_input_max_chars=config.tool_input_max_chars))
+    if slack_cfg.enabled:
+        sinks.append(SlackSink(slack_cfg, tool_input_max_chars=config.tool_input_max_chars))
+    if discord_cfg.enabled:
+        sinks.append(DiscordSink(discord_cfg, tool_input_max_chars=config.tool_input_max_chars))
     for sink in sinks:
         try:
             sink.send(event)

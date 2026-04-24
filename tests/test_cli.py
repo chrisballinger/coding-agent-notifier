@@ -183,6 +183,41 @@ webhook_url = "https://hook.test/x"
     assert "Gating suppressed" in capsys.readouterr().err
 
 
+def test_hook_routes_to_per_repo_webhook(monkeypatch, tmp_path: Path):
+    repo = tmp_path / "work" / "acme"
+    repo.mkdir(parents=True)
+    cfg = _write_config(
+        tmp_path,
+        f"""
+gating = "always"
+[sinks.slack]
+enabled = true
+webhook_url = "https://default.test/hook"
+
+[[routes]]
+cwd = "{tmp_path / 'work' / '*'}"
+slack.webhook_url = "https://work.test/acme"
+""".strip(),
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.slack.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (calls.append((url, body)) or (200, "ok")),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: "iTerm2")
+
+    payload = {
+        "hook_event_name": "Stop",
+        "cwd": str(repo),
+        "session_id": "sess-1",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    cli.main(["--config", str(cfg), "hook", "--source", "claude-code"])
+    assert len(calls) == 1
+    assert calls[0][0] == "https://work.test/acme"
+
+
 def test_doctor_runs(monkeypatch, tmp_path: Path, capsys):
     cfg = _write_config(tmp_path, "gating = \"always\"\n")
     monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 12.0)
@@ -192,6 +227,42 @@ def test_doctor_runs(monkeypatch, tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert "gating: always" in out
     assert "idle=12.0s" in out
+
+
+def test_doctor_surfaces_route_match(monkeypatch, tmp_path: Path, capsys):
+    cwd_glob = str(Path.cwd())  # will definitely match Path.cwd()
+    cfg = _write_config(
+        tmp_path,
+        f"""
+gating = "always"
+[[routes]]
+cwd = "{cwd_glob}"
+slack.channel = "#matched"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "routes:  1 configured" in out
+    assert "→ matches" in out
+
+
+def test_doctor_reports_no_route_match(monkeypatch, tmp_path: Path, capsys):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[[routes]]
+cwd = "/definitely/not/current/cwd/*"
+slack.channel = "#never"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "no route matches" in out
 
 
 def test_doctor_reports_config_error(monkeypatch, tmp_path: Path, capsys):

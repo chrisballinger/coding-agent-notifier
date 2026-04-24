@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import fnmatch
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -47,6 +48,19 @@ class DiscordConfig:
     webhook_url: str | None = None
 
 
+_VALID_SLACK_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url", "bot_token", "channel"})
+_VALID_DISCORD_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url"})
+
+
+@dataclass(frozen=True)
+class Route:
+    """A `cwd` glob + partial sink overrides applied when a repo path matches."""
+
+    cwd: str
+    slack: dict[str, Any] = field(default_factory=dict)
+    discord: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Config:
     idle_threshold_seconds: float = 60.0
@@ -55,6 +69,7 @@ class Config:
     events: dict[EventKind, EventConfig] = field(default_factory=dict)
     slack: SlackConfig = field(default_factory=SlackConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
+    routes: tuple[Route, ...] = ()
 
     def event(self, kind: EventKind) -> EventConfig:
         return self.events.get(kind, EventConfig())
@@ -118,6 +133,30 @@ def parse_config(raw: dict[str, Any]) -> Config:
         webhook_url=discord_raw.get("webhook_url"),
     )
 
+    routes_raw = raw.get("routes", []) or []
+    if not isinstance(routes_raw, list):
+        raise ConfigError("routes must be an array of tables")
+    routes: list[Route] = []
+    for i, entry in enumerate(routes_raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"routes[{i}] must be a table")
+        cwd = entry.get("cwd")
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise ConfigError(f"routes[{i}].cwd must be a non-empty string")
+        slack_override = entry.get("slack", {}) or {}
+        discord_override = entry.get("discord", {}) or {}
+        if not isinstance(slack_override, dict):
+            raise ConfigError(f"routes[{i}].slack must be a table")
+        if not isinstance(discord_override, dict):
+            raise ConfigError(f"routes[{i}].discord must be a table")
+        unknown = set(slack_override) - _VALID_SLACK_OVERRIDE_KEYS
+        if unknown:
+            raise ConfigError(f"routes[{i}].slack has unknown keys: {sorted(unknown)}")
+        unknown = set(discord_override) - _VALID_DISCORD_OVERRIDE_KEYS
+        if unknown:
+            raise ConfigError(f"routes[{i}].discord has unknown keys: {sorted(unknown)}")
+        routes.append(Route(cwd=cwd, slack=dict(slack_override), discord=dict(discord_override)))
+
     return Config(
         idle_threshold_seconds=idle,
         gating=gating,  # type: ignore[arg-type]
@@ -125,7 +164,48 @@ def parse_config(raw: dict[str, Any]) -> Config:
         events=events,
         slack=slack,
         discord=discord,
+        routes=tuple(routes),
     )
+
+
+def match_route(cwd: Path, config: Config) -> Route | None:
+    """Return the first route whose `cwd` glob matches the given path.
+
+    The glob supports `~` expansion and `fnmatch` wildcards. Matching runs
+    against the absolute, symlink-resolved form of `cwd` so relative paths
+    and `~/project` both land at the same canonical string.
+    """
+    try:
+        target = str(cwd.expanduser().resolve())
+    except (OSError, RuntimeError):
+        target = str(cwd)
+    for route in config.routes:
+        pattern = os.path.expanduser(route.cwd)
+        if fnmatch.fnmatch(target, pattern):
+            return route
+    return None
+
+
+def sinks_for(cwd: Path, config: Config) -> tuple[SlackConfig, DiscordConfig]:
+    """Apply any matching route's sink overrides on top of the base configs."""
+    route = match_route(cwd, config)
+    if route is None:
+        return config.slack, config.discord
+    slack = _override_slack(config.slack, route.slack)
+    discord = _override_discord(config.discord, route.discord)
+    return slack, discord
+
+
+def _override_slack(base: SlackConfig, override: dict[str, Any]) -> SlackConfig:
+    if not override:
+        return base
+    return replace(base, **{k: override[k] for k in override if k in _VALID_SLACK_OVERRIDE_KEYS})
+
+
+def _override_discord(base: DiscordConfig, override: dict[str, Any]) -> DiscordConfig:
+    if not override:
+        return base
+    return replace(base, **{k: override[k] for k in override if k in _VALID_DISCORD_OVERRIDE_KEYS})
 
 
 CONFIG_TEMPLATE = """\
@@ -158,4 +238,16 @@ enabled = false
 [sinks.discord]
 enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
+
+# Per-repo routing. First matching route wins. Paths expand `~` and support
+# `fnmatch` wildcards (`*`, `?`, `[abc]`). Override just the fields you want
+# to change; everything else inherits from the sink blocks above.
+#
+# [[routes]]
+# cwd = "~/work/acme-*"
+# slack.webhook_url = "https://hooks.slack.com/services/acme-work/…"
+#
+# [[routes]]
+# cwd = "~/personal/*"
+# slack.channel = "#me-only"       # overrides channel when using a bot_token
 """

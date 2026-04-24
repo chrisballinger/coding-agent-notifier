@@ -86,6 +86,29 @@ enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
 ```
 
+## Per-repo routing
+
+Need different projects pinging different Slack channels? Add `[[routes]]` blocks. The first whose `cwd` glob matches the hook's working directory wins; overrides merge on top of the base sink configs.
+
+```toml
+# Work projects → a shared #agents-work channel (bot token)
+[[routes]]
+cwd = "~/work/acme-*"
+slack.channel = "#agents-work"
+
+# An OSS project → its own webhook
+[[routes]]
+cwd = "~/oss/my-library"
+slack.webhook_url = "https://hooks.slack.com/services/oss/…"
+
+# Personal stuff stays quiet
+[[routes]]
+cwd = "~/personal/*"
+slack.enabled = false
+```
+
+Patterns use `fnmatch`-style globs (`*`, `?`, `[abc]`) with `~` expansion. Use `agent-notify doctor` from inside a repo to confirm which route (if any) matches your current `cwd`.
+
 ## Commands
 
 | Command                                | What it does                                                   |
