@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
-from . import __version__, dedup, install, macos
+from . import __version__, dedup, install, macos, pending, transcript
 from .config import CONFIG_TEMPLATE, Config, default_config_path, load_config, match_route, sinks_for
 from .event import Event
 from .gating import SystemState, should_send
@@ -19,6 +22,9 @@ from .sinks.discord import DiscordSink
 from .sinks.slack import SlackSink
 from .sources import claude_code as src_claude
 from .sources import codex as src_codex
+
+# Indirection so tests can neutralize the sleep without touching `time`.
+_sleep = time.sleep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Check config, connectivity, and install state.")
 
+    # Hidden: internal deferred-dispatch subcommand invoked by a detached child
+    # to coalesce a queued turn_complete after a short window.
+    defer = sub.add_parser("_defer-dispatch", add_help=False)
+    defer.add_argument("agent")
+    defer.add_argument("session_id", nargs="?", default="")
+
     return p
 
 
@@ -73,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_test(args)
         if args.cmd == "doctor":
             return cmd_doctor(args)
+        if args.cmd == "_defer-dispatch":
+            return cmd_defer_dispatch(args)
     except Exception:  # noqa: BLE001 - never block the agent
         traceback.print_exc(file=sys.stderr)
         return 0
@@ -102,10 +116,77 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
 
     config = load_config(args.config)
+
+    # An idle_prompt supersedes a queued turn_complete for the same session —
+    # discard the queued event so the deferred dispatcher's subsequent claim
+    # returns None.
+    if event.kind == "idle_prompt":
+        pending.claim(event.agent, event.session_id)
+
+    if (
+        event.kind == "turn_complete"
+        and config.display.coalesce_window_seconds > 0
+        and not args.force
+    ):
+        if not should_send(event, config, _snapshot_state()):
+            return 0
+        pending.write(event)
+        _spawn_defer_child(args.config, event.agent, event.session_id)
+        return 0
+
     if not args.force and not should_send(event, config, _snapshot_state()):
         return 0
     _dispatch(event, config)
     return 0
+
+
+def cmd_defer_dispatch(args: argparse.Namespace) -> int:
+    agent = args.agent
+    session_id = args.session_id or None
+    config = load_config(args.config)
+    if config.display.coalesce_window_seconds > 0:
+        _sleep(config.display.coalesce_window_seconds)
+    event = pending.claim(agent, session_id)
+    if event is None:
+        return 0  # superseded by a follow-up idle_prompt, or expired
+    if config.summary.enabled and event.transcript_path is not None:
+        text = transcript.read_last_assistant_text(event.transcript_path)
+        if text:
+            snippet = transcript.head_tail_snippet(
+                text,
+                head=config.summary.head_chars,
+                tail=config.summary.tail_chars,
+            )
+            if snippet:
+                event = replace(event, message=snippet)
+    _dispatch(event, config)
+    return 0
+
+
+def _spawn_defer_child(
+    config_path: Path | None, agent: str, session_id: str | None
+) -> None:
+    """Fork-and-forget a detached child that runs `_defer-dispatch` later.
+
+    Using `start_new_session=True` with stdin/stdout/stderr redirected to
+    /dev/null so Claude Code's hook returns instantly without waiting on the
+    child. Exceptions during spawn are swallowed — a coalesce miss is far less
+    bad than blocking the agent.
+    """
+    try:
+        argv: list[str] = [sys.executable, "-m", "coding_agent_notifier.cli"]
+        if config_path is not None:
+            argv += ["--config", str(config_path)]
+        argv += ["_defer-dispatch", agent, session_id or ""]
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        print(f"agent-notify: failed to spawn defer child: {e}", file=sys.stderr)
 
 
 def _is_duplicate(event: Event) -> bool:
@@ -245,9 +326,17 @@ def _dispatch(event: Event, config: Config) -> None:
     slack_cfg, discord_cfg = resolved
     sinks: list[Sink] = []
     if slack_cfg.enabled:
-        sinks.append(SlackSink(slack_cfg, tool_input_max_chars=config.tool_input_max_chars))
+        sinks.append(SlackSink(
+            slack_cfg,
+            tool_input_max_chars=config.tool_input_max_chars,
+            verbosity=config.display.verbosity,
+        ))
     if discord_cfg.enabled:
-        sinks.append(DiscordSink(discord_cfg, tool_input_max_chars=config.tool_input_max_chars))
+        sinks.append(DiscordSink(
+            discord_cfg,
+            tool_input_max_chars=config.tool_input_max_chars,
+            verbosity=config.display.verbosity,
+        ))
     for sink in sinks:
         try:
             sink.send(event)

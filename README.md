@@ -74,6 +74,15 @@ enabled = true
 [events.turn_complete]
 enabled = true
 
+[display]
+verbosity = "terse"             # terse | normal. terse drops the Project/Session/Tool/App grid in favor of a compact footer.
+coalesce_window_seconds = 2.5   # hold a `turn_complete` this long so a follow-up `idle_prompt` can cancel it; 0 disables.
+
+[summary]
+enabled = true                  # include a head/tail snippet of the agent's last message on `turn_complete`
+head_chars = 250
+tail_chars = 250
+
 [sinks.slack]
 enabled = true
 webhook_url = "https://hooks.slack.com/services/…"
@@ -85,6 +94,15 @@ webhook_url = "https://hooks.slack.com/services/…"
 enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
 ```
+
+### Phone-first defaults
+
+On iOS the push preview is tight, so the default layout is optimized for a glance:
+
+- **Terse verbosity** (default) drops the repeated Project/Session/Tool/App field block and shows `project · session · app` as a compact footer instead. Set `display.verbosity = "normal"` for the verbose grid.
+- **Coalesce window** (default 2.5s) defers `turn_complete` briefly so a follow-up `idle_prompt` can suppress it — you get one "waiting on you" ping rather than "finished a turn" + "waiting on you" back-to-back. Set `display.coalesce_window_seconds = 0` to disable.
+- **Turn-complete snippet** (default on) reads the last assistant message from the transcript and shows its head + tail. Purely local — no API keys, no network.
+- **AskUserQuestion rendering** formats the question + options as a bulleted list rather than raw JSON.
 
 ## Per-repo routing
 

@@ -37,6 +37,7 @@ class Event:
     tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
     source_app: str | None = None
+    transcript_path: Path | None = None
 
     @property
     def title(self) -> str:

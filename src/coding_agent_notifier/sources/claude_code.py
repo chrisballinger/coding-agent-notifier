@@ -23,6 +23,8 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
     hook = payload.get("hook_event_name")
     cwd = Path(payload.get("cwd") or ".")
     session_id = payload.get("session_id")
+    raw_transcript = payload.get("transcript_path")
+    transcript_path = Path(raw_transcript) if isinstance(raw_transcript, str) and raw_transcript else None
 
     if hook == _NOTIFICATION:
         ntype = payload.get("notification_type")
@@ -37,6 +39,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
             cwd=cwd,
             session_id=session_id,
             source_app=source_app,
+            transcript_path=transcript_path,
         )
 
     if hook == _PERMISSION_REQUEST:
@@ -54,6 +57,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
             tool_name=tool_name,
             tool_input=tool_input if isinstance(tool_input, dict) else None,
             source_app=source_app,
+            transcript_path=transcript_path,
         )
 
     if hook == _STOP:
@@ -64,6 +68,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
             cwd=cwd,
             session_id=session_id,
             source_app=source_app,
+            transcript_path=transcript_path,
         )
 
     return None

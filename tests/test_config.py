@@ -102,6 +102,57 @@ def test_template_is_valid_toml():
     assert c.slack.enabled is True or c.slack.enabled is False  # template shape OK
 
 
+def test_defaults_display_and_summary():
+    c = cfgmod.parse_config({})
+    assert c.display.verbosity == "terse"
+    assert c.display.coalesce_window_seconds == 2.5
+    assert c.summary.enabled is True
+    assert c.summary.head_chars == 250
+    assert c.summary.tail_chars == 250
+
+
+def test_display_overrides():
+    c = cfgmod.parse_config(
+        {"display": {"verbosity": "normal", "coalesce_window_seconds": 0}}
+    )
+    assert c.display.verbosity == "normal"
+    assert c.display.coalesce_window_seconds == 0
+
+
+def test_display_verbosity_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": {"verbosity": "chatty"}})
+
+
+def test_display_negative_window_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": {"coalesce_window_seconds": -1}})
+
+
+def test_display_must_be_table():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": "nope"})
+
+
+def test_summary_overrides():
+    c = cfgmod.parse_config(
+        {"summary": {"enabled": False, "head_chars": 100, "tail_chars": 50}}
+    )
+    assert c.summary.enabled is False
+    assert c.summary.head_chars == 100
+    assert c.summary.tail_chars == 50
+
+
+def test_summary_negative_chars_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"summary": {"head_chars": -5}})
+
+
+def test_summary_must_be_table():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"summary": "bad"})
+
+
 def _loads_toml(text: str) -> dict:
     import tomllib
     return tomllib.loads(text)

@@ -147,6 +147,71 @@ def test_task_without_prompt():
     assert r.detail is None
 
 
+def test_ask_user_question_single_question():
+    payload = {
+        "questions": [
+            {
+                "question": "How should per-repo routing be configured?",
+                "header": "Routing shape",
+                "options": [
+                    {"label": "Global config only (Recommended)", "description": "Routes live in config.toml."},
+                    {"label": "Per-repo files", "description": "Each repo has its own."},
+                ],
+                "multiSelect": False,
+            }
+        ]
+    }
+    r = render("AskUserQuestion", payload)
+    assert r.summary.startswith("How should per-repo routing")
+    assert r.detail is not None
+    assert r.code_block is False
+    assert "*Q:* How should per-repo routing" in r.detail
+    assert "Global config only (Recommended)" in r.detail
+    assert "Routes live in config.toml." in r.detail
+    assert "Per-repo files" in r.detail
+
+
+def test_ask_user_question_multi_question():
+    payload = {
+        "questions": [
+            {
+                "question": "First?",
+                "options": [{"label": "A", "description": "a-desc"}, {"label": "B", "description": ""}],
+            },
+            {
+                "question": "Second?",
+                "options": [{"label": "C", "description": "c-desc"}],
+            },
+        ]
+    }
+    r = render("AskUserQuestion", payload)
+    assert "First?" in r.summary
+    assert r.detail.count("*Q:*") == 2
+    assert "a-desc" in r.detail
+    assert "c-desc" in r.detail
+
+
+def test_ask_user_question_handles_missing_options():
+    payload = {"questions": [{"question": "Free text?", "options": []}]}
+    r = render("AskUserQuestion", payload)
+    assert "Free text?" in r.summary
+    assert r.detail == "*Q:* Free text?"
+    assert r.code_block is False
+
+
+def test_ask_user_question_malformed_falls_through_to_generic():
+    # Missing `questions` key → generic JSON fallback
+    r = render("AskUserQuestion", {"foo": "bar"})
+    assert r.detail is not None
+    assert r.code_block is True  # generic uses code block
+
+
+def test_ask_user_question_blank_question_falls_through_to_generic():
+    r = render("AskUserQuestion", {"questions": [{"question": "", "options": []}]})
+    assert r.detail is not None
+    assert r.code_block is True
+
+
 def test_generic_fallback_produces_pretty_json():
     r = render("MysteryTool", {"a": 1, "b": {"nested": "value"}})
     assert r.detail is not None

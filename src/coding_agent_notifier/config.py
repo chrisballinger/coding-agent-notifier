@@ -23,6 +23,9 @@ VALID_EVENT_KINDS: tuple[EventKind, ...] = (
     "elicitation",
 )
 
+Verbosity = Literal["terse", "normal"]
+VALID_VERBOSITIES: tuple[Verbosity, ...] = ("terse", "normal")
+
 
 class ConfigError(ValueError):
     """Raised when the config file is missing fields, misshapen, or invalid."""
@@ -48,6 +51,21 @@ class DiscordConfig:
     webhook_url: str | None = None
 
 
+@dataclass(frozen=True)
+class DisplayConfig:
+    verbosity: Verbosity = "terse"
+    # Seconds to hold a `turn_complete` ping before dispatching so that a
+    # follow-up `idle_prompt` can cancel it. 0 disables coalescing.
+    coalesce_window_seconds: float = 2.5
+
+
+@dataclass(frozen=True)
+class SummaryConfig:
+    enabled: bool = True
+    head_chars: int = 250
+    tail_chars: int = 250
+
+
 _VALID_SLACK_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url", "bot_token", "channel"})
 _VALID_DISCORD_OVERRIDE_KEYS = frozenset({"enabled", "webhook_url"})
 
@@ -70,6 +88,8 @@ class Config:
     slack: SlackConfig = field(default_factory=SlackConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     routes: tuple[Route, ...] = ()
+    display: DisplayConfig = field(default_factory=DisplayConfig)
+    summary: SummaryConfig = field(default_factory=SummaryConfig)
 
     def event(self, kind: EventKind) -> EventConfig:
         return self.events.get(kind, EventConfig())
@@ -157,6 +177,33 @@ def parse_config(raw: dict[str, Any]) -> Config:
             raise ConfigError(f"routes[{i}].discord has unknown keys: {sorted(unknown)}")
         routes.append(Route(cwd=cwd, slack=dict(slack_override), discord=dict(discord_override)))
 
+    display_raw = raw.get("display", {}) or {}
+    if not isinstance(display_raw, dict):
+        raise ConfigError("display must be a table")
+    verbosity = display_raw.get("verbosity", "terse")
+    if verbosity not in VALID_VERBOSITIES:
+        raise ConfigError(f"invalid display.verbosity: {verbosity!r}")
+    coalesce_window = float(display_raw.get("coalesce_window_seconds", 2.5))
+    if coalesce_window < 0:
+        raise ConfigError(f"display.coalesce_window_seconds must be >= 0, got {coalesce_window}")
+    display = DisplayConfig(
+        verbosity=verbosity,  # type: ignore[arg-type]
+        coalesce_window_seconds=coalesce_window,
+    )
+
+    summary_raw = raw.get("summary", {}) or {}
+    if not isinstance(summary_raw, dict):
+        raise ConfigError("summary must be a table")
+    head_chars = int(summary_raw.get("head_chars", 250))
+    tail_chars = int(summary_raw.get("tail_chars", 250))
+    if head_chars < 0 or tail_chars < 0:
+        raise ConfigError("summary.head_chars and summary.tail_chars must be >= 0")
+    summary = SummaryConfig(
+        enabled=bool(summary_raw.get("enabled", True)),
+        head_chars=head_chars,
+        tail_chars=tail_chars,
+    )
+
     return Config(
         idle_threshold_seconds=idle,
         gating=gating,  # type: ignore[arg-type]
@@ -165,6 +212,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         slack=slack,
         discord=discord,
         routes=tuple(routes),
+        display=display,
+        summary=summary,
     )
 
 
@@ -237,6 +286,15 @@ enabled = true
 
 [events.turn_complete]
 enabled = true
+
+[display]
+verbosity = "terse"           # terse | normal. terse drops the 4-field block in favor of a compact footer.
+coalesce_window_seconds = 2.5  # hold turn_complete this long so a follow-up idle_prompt can cancel it. 0 disables.
+
+[summary]
+enabled = true                 # include a head/tail snippet of the agent's last message on turn_complete
+head_chars = 250
+tail_chars = 250
 
 [sinks.slack]
 # Set enabled = true after filling in a webhook_url or bot_token below.

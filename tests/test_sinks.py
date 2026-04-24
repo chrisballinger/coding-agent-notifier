@@ -97,6 +97,51 @@ def test_slack_message_linkifies_urls():
     assert "<https://docs.example.com/x|docs.example.com>" in found
 
 
+# --- Slack terse mode ---
+
+
+def test_slack_terse_drops_fields_block_and_adds_footer():
+    body = build_slack_message(_event(), verbosity="terse")
+    att = body["attachments"][0]
+    types = [b["type"] for b in att["blocks"]]
+    # header, body section, detail section, footer context — no 4-field block
+    assert "context" in types
+    # Confirm no block is a section with a `fields` array (the 4-field layout)
+    assert not any(b.get("fields") for b in att["blocks"])
+    footer = next(b for b in att["blocks"] if b["type"] == "context")
+    footer_text = footer["elements"][0]["text"]
+    assert "myproj" in footer_text
+    assert "abc123de" in footer_text  # session[:8]
+    assert "iTerm2" in footer_text
+
+
+def test_slack_terse_inlines_tool_name_in_body():
+    body = build_slack_message(_event(), verbosity="terse")
+    att = body["attachments"][0]
+    body_sections = [b for b in att["blocks"] if b.get("type") == "section"]
+    body_text = "\n".join(b["text"]["text"] for b in body_sections if "text" in b)
+    assert "*Bash:*" in body_text
+
+
+def test_slack_terse_footer_omits_missing_bits():
+    body = build_slack_message(
+        _event(session_id=None, source_app=None), verbosity="terse"
+    )
+    att = body["attachments"][0]
+    contexts = [b for b in att["blocks"] if b["type"] == "context"]
+    # Still has a footer with the project bit
+    text = contexts[0]["elements"][0]["text"]
+    assert "myproj" in text
+    assert "·" not in text or text.count("·") == 0  # only project, no separators
+
+
+def test_slack_normal_mode_still_has_fields_block():
+    body = build_slack_message(_event(), verbosity="normal")
+    att = body["attachments"][0]
+    assert any(b.get("fields") for b in att["blocks"])
+    assert not any(b.get("type") == "context" for b in att["blocks"])
+
+
 # --- Slack sink dispatch ---
 
 
@@ -237,6 +282,22 @@ def test_discord_sink_requires_webhook():
     sink = DiscordSink(DiscordConfig(enabled=True, webhook_url=None))
     with pytest.raises(sink_base.SinkError):
         sink.send(_event())
+
+
+def test_discord_terse_drops_fields_uses_footer():
+    body = build_discord_message(_event(), verbosity="terse")
+    embed = body["embeds"][0]
+    assert "fields" not in embed
+    assert embed["footer"]["text"].startswith("myproj")
+    assert "abc123de" in embed["footer"]["text"]
+    assert "**Bash:**" in embed["description"]
+
+
+def test_discord_normal_keeps_fields_no_footer():
+    body = build_discord_message(_event(), verbosity="normal")
+    embed = body["embeds"][0]
+    assert "fields" in embed
+    assert "footer" not in embed
 
 
 def test_discord_sink_http_failure(fake_post):

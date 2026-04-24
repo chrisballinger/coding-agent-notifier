@@ -41,6 +41,11 @@ class ToolRender:
     summary: str = ""
     detail: str | None = None
     dangerous: bool = False
+    # If False, `detail` is already formatted as mrkdwn (bullets, bold) and the
+    # sink should render it as a regular section rather than wrapping it in a
+    # monospace code fence. Only a handful of renderers (AskUserQuestion) need
+    # this; Bash/Edit/etc. keep the default so commands stay monospaced.
+    code_block: bool = True
 
 
 Renderer = Callable[[dict[str, Any], int], ToolRender]
@@ -124,6 +129,49 @@ def _render_read(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
     return ToolRender(summary=f"Read `{path}`")
 
 
+def _render_ask_user_question(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return _render_generic(tool_input, max_chars)
+
+    first_q = questions[0]
+    if not isinstance(first_q, dict):
+        return _render_generic(tool_input, max_chars)
+    first_text = str(first_q.get("question") or "").strip()
+    if not first_text:
+        return _render_generic(tool_input, max_chars)
+
+    summary = _one_line(first_text, 160)
+
+    blocks: list[str] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qtext = str(q.get("question") or "").strip()
+        if not qtext:
+            continue
+        blocks.append(f"*Q:* {qtext}")
+        opts = q.get("options")
+        if isinstance(opts, list):
+            for opt in opts:
+                if not isinstance(opt, dict):
+                    continue
+                label = str(opt.get("label") or "").strip()
+                if not label:
+                    continue
+                desc = str(opt.get("description") or "").strip()
+                line = f"  • *{label}*"
+                if desc:
+                    line += f" — {desc}"
+                blocks.append(line)
+        blocks.append("")  # blank line between questions
+
+    detail = "\n".join(blocks).rstrip() or None
+    if detail is not None:
+        detail = truncate(detail, max_chars)
+    return ToolRender(summary=summary, detail=detail, code_block=False)
+
+
 def _render_task(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
     agent = str(tool_input.get("subagent_type") or tool_input.get("description") or "agent")
     prompt = str(tool_input.get("prompt") or "").strip()
@@ -151,6 +199,7 @@ _REGISTRY: dict[str, Renderer] = {
     "MultiEdit": _render_multi_edit,
     "Read": _render_read,
     "Task": _render_task,
+    "AskUserQuestion": _render_ask_user_question,
     # Codex names its shell tool `shell`
     "shell": _render_bash,
 }
