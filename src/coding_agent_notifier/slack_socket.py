@@ -30,8 +30,10 @@ from .sinks.slack import (
     APPROVE_ACTION_ID,
     DENY_ACTION_ID,
     OPTION_ACTION_ID_PREFIX,
+    SUGGESTION_ACTION_ID_PREFIX,
     _ask_user_question_questions,
     _selected_label_from_record,
+    _suggestion_label,
     build_approval_message,
     build_resolved_message,
     update_message,
@@ -92,12 +94,20 @@ def handle_block_actions(
     action_id = action.get("action_id", "")
     # Single-question (legacy) click: agent_notify_option_<o>
     # Multi-question click: agent_notify_option_<q>_<o>
+    # Suggestion click:    agent_notify_suggestion_<i>
     selected_option: int | None = None
     selected_question: int | None = None
+    selected_suggestion: int | None = None
     if action_id == APPROVE_ACTION_ID:
         decision = "allow"
     elif action_id == DENY_ACTION_ID:
         decision = "deny"
+    elif action_id.startswith(SUGGESTION_ACTION_ID_PREFIX):
+        try:
+            selected_suggestion = int(action_id[len(SUGGESTION_ACTION_ID_PREFIX):])
+        except ValueError:
+            return ButtonClickResult(False, None, None, None, None)
+        decision = "allow"
     elif action_id.startswith(OPTION_ACTION_ID_PREFIX):
         suffix = action_id[len(OPTION_ACTION_ID_PREFIX):]
         parts = suffix.split("_")
@@ -139,14 +149,15 @@ def handle_block_actions(
     # Multi-question: an option click is a partial answer if other
     # questions still need answering. We record it (without resolving),
     # update the message to reflect progress, and only resolve once every
-    # question has an entry. Single-question clicks (legacy) and Approve/
-    # Deny clicks resolve immediately.
+    # question has an entry. Single-question clicks (legacy), suggestion
+    # clicks, and Approve/Deny clicks resolve immediately.
     rec = _record_or_resolve(
         approval_id,
         decision,
         user_id,
         selected_question,
         selected_option,
+        selected_suggestion,
         base_dir,
         resolve_fn=resolve_fn,
     )
@@ -171,10 +182,21 @@ def handle_block_actions(
             if is_resolved:
                 selected_label = _selected_label_from_record(rec) if selected_option is not None else None
                 selected_options = rec.get("selected_options") if rec.get("selected_options") else None
+                # Suggestion-click: look up the chosen suggestion's
+                # human label so the resolved message tells the user
+                # what rule edit was applied.
+                suggestion_label = None
+                sugg_idx = rec.get("selected_suggestion_index")
+                suggestions = rec.get("permission_suggestions")
+                if (isinstance(sugg_idx, int) and isinstance(suggestions, list)
+                        and 0 <= sugg_idx < len(suggestions)
+                        and isinstance(suggestions[sugg_idx], dict)):
+                    suggestion_label = _suggestion_label(suggestions[sugg_idx])
                 body = build_resolved_message(
                     event, decision, f"<@{user_id}>",
                     selected_label=selected_label,
                     selected_options=selected_options,
+                    selected_suggestion_label=suggestion_label,
                 )
             else:
                 # Partial answer: re-render the approval message with
@@ -198,24 +220,27 @@ def _record_or_resolve(
     user_id: str,
     selected_question: int | None,
     selected_option: int | None,
+    selected_suggestion: int | None,
     base_dir: Path | None,
     *,
     resolve_fn: Callable[..., dict | None],
 ) -> dict | None:
-    """For Approve/Deny and single-question (legacy) clicks, resolve
-    immediately. For multi-question option clicks, record the partial
-    answer and resolve only when every question has an entry — otherwise
-    return the partially-answered record so the daemon updates the
-    message without unblocking the hook.
+    """For Approve/Deny, suggestion, and single-question (legacy) clicks,
+    resolve immediately. For multi-question option clicks, record the
+    partial answer and resolve only when every question has an entry —
+    otherwise return the partially-answered record so the daemon updates
+    the message without unblocking the hook.
 
     Returns the (partial or final) record, or None if the approval doesn't
     exist.
     """
-    # Approve / Deny short-circuits multi-question logic.
+    # Approve / Deny / Suggestion short-circuit multi-question logic.
     if selected_question is None:
         return resolve_fn(
             approval_id, decision, actor=user_id,
-            selected_option=selected_option, base_dir=base_dir,
+            selected_option=selected_option,
+            selected_suggestion=selected_suggestion,
+            base_dir=base_dir,
         )
 
     # Read the existing record to know how many questions there are.
@@ -287,8 +312,10 @@ def _authorize(
 
 
 def _event_from_record(rec: dict) -> Event:
-    # Reconstruct just enough of the original Event for `build_resolved_message`.
-    # cwd isn't persisted yet; a `.` here only affects the footer folder name.
+    # Reconstruct just enough of the original Event for `build_resolved_message`
+    # / `build_approval_message`. cwd isn't persisted yet; a `.` here only
+    # affects the footer folder name.
+    suggestions = rec.get("permission_suggestions")
     return Event(
         agent=rec.get("agent") or "claude-code",
         kind="permission",
@@ -297,6 +324,10 @@ def _event_from_record(rec: dict) -> Event:
         session_id=rec.get("session_id"),
         tool_name=rec.get("tool_name"),
         tool_input=rec.get("tool_input") if isinstance(rec.get("tool_input"), dict) else None,
+        permission_suggestions=(
+            tuple(s for s in suggestions if isinstance(s, dict))
+            if isinstance(suggestions, list) and suggestions else None
+        ),
     )
 
 

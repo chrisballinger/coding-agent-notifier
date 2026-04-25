@@ -73,6 +73,7 @@ def create(
     tool_name: str | None,
     tool_input: dict | None = None,
     workspace: str = "default",
+    permission_suggestions: list[dict] | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> Path:
@@ -82,6 +83,10 @@ def create(
     hook's timeout-update path reads it back to pick the right bot_token
     for `chat.update`; older records that predate this field default to
     "default" at read time.
+
+    `permission_suggestions` is the PermissionRequest payload's suggestion
+    list — stored on the record so the daemon can look it up at click time
+    (avoids re-shipping it through the action_id value).
     """
     record = _record_path(approval_id, base_dir)
     fifo = _fifo_path(approval_id, base_dir)
@@ -110,6 +115,17 @@ def create(
         # when every question has an entry. Stays empty for non-AskUser-
         # Question approvals.
         "selected_options": {},
+        # PermissionRequest's permission_suggestions payload (the rule
+        # edits Claude Code would offer the user). Stored verbatim so the
+        # daemon can look up which suggestion was clicked. None when the
+        # harness didn't ship any.
+        "permission_suggestions": (
+            list(permission_suggestions) if permission_suggestions else None
+        ),
+        # Index into permission_suggestions when the user clicked a
+        # suggestion button (vs plain Approve/Deny). The hook uses this
+        # to build PermissionRequest's `decision.updatedPermissions`.
+        "selected_suggestion_index": None,
     }
     with _locked(_lock_path(approval_id, base_dir)):
         from . import paths as _paths
@@ -145,6 +161,7 @@ def resolve(
     actor: str | None = None,
     selected_option: int | None = None,
     selected_options: dict[str, int] | None = None,
+    selected_suggestion: int | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict | None:
@@ -174,6 +191,8 @@ def resolve(
             data["selected_option_index"] = selected_option
         if selected_options is not None:
             data["selected_options"] = {str(k): int(v) for k, v in selected_options.items()}
+        if selected_suggestion is not None:
+            data["selected_suggestion_index"] = int(selected_suggestion)
         from . import paths as _paths
         _paths.write_secure(record, json.dumps(data))
     # Wake outside the lock: opening a FIFO for write blocks until a reader

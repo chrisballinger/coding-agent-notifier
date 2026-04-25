@@ -421,6 +421,68 @@ def test_permissionrequest_no_updated_input_for_plain_approve(tmp_path, monkeypa
     assert "updatedInput" not in decision
 
 
+def test_permissionrequest_emits_updated_permissions_for_suggestion(tmp_path, monkeypatch):
+    """When the user clicks a permission_suggestion button, the resolved
+    record carries `selected_suggestion_index`. The hook emits
+    `decision.updatedPermissions` with that single suggestion so Claude
+    Code applies the rule edit."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(
+                    rec["approval_id"], "allow",
+                    actor="U_OK",
+                    selected_suggestion=0,
+                )
+                return
+            time.sleep(0.02)
+
+    suggestion = {
+        "type": "addRules",
+        "rules": [{"toolName": "Bash", "ruleContent": "curl:*"}],
+        "behavior": "allow",
+        "destination": "localSettings",
+    }
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "curl https://example.invalid"},
+                "session_id": "s1",
+                "permission_suggestions": [suggestion],
+            },
+            cfg,
+            poster=poster,
+            stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    out = json.loads(buf.getvalue())
+    decision = out["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert decision["updatedPermissions"] == [suggestion]
+    # No updatedInput on a suggestion click — only the rule edit is applied.
+    assert "updatedInput" not in decision
+
+
 def test_emit_decision_drops_updated_input_when_decision_is_deny():
     """`updatedInput` is allow-only per the PermissionRequest schema —
     silently dropped on deny so we never leak hook intent into a deny path."""

@@ -400,6 +400,12 @@ def cmd_permissionrequest(
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else None
     transcript_raw = payload.get("transcript_path")
     transcript_path = Path(transcript_raw) if isinstance(transcript_raw, str) and transcript_raw else None
+    raw_suggestions = payload.get("permission_suggestions")
+    permission_suggestions = (
+        tuple(s for s in raw_suggestions if isinstance(s, dict))
+        if isinstance(raw_suggestions, list) and raw_suggestions
+        else None
+    )
 
     event = Event(
         agent="claude-code",
@@ -411,11 +417,12 @@ def cmd_permissionrequest(
         tool_input=tool_input,
         source_app=macos.term_program_to_app(os.environ.get("TERM_PROGRAM")),
         transcript_path=transcript_path,
+        permission_suggestions=permission_suggestions,
     )
 
     _log_event(
         f"PermissionRequest approval_id={approval_id} tool={tool_name} sess={session_id} "
-        f"workspace={workspace_name}"
+        f"workspace={workspace_name} suggestions={len(permission_suggestions or ())}"
     )
     pending_approvals.create(
         approval_id,
@@ -424,6 +431,7 @@ def cmd_permissionrequest(
         tool_name=tool_name,
         tool_input=tool_input,
         workspace=workspace_name,
+        permission_suggestions=list(permission_suggestions) if permission_suggestions else None,
     )
 
     try:
@@ -466,25 +474,56 @@ def cmd_permissionrequest(
     decision = record["decision"]
     selected_idx = record.get("selected_option_index")
     selected_options = record.get("selected_options") or {}
+    selected_suggestion_idx = record.get("selected_suggestion_index")
     _log_event(
         f"PermissionRequest resolved approval_id={approval_id} decision={decision} "
-        f"selected_option_index={selected_idx} selected_options={selected_options}"
+        f"selected_option_index={selected_idx} selected_options={selected_options} "
+        f"selected_suggestion_index={selected_suggestion_idx}"
     )
     pending_approvals.cleanup(approval_id)
 
-    # If the user clicked AskUserQuestion option button(s), pre-fill the
-    # tool's `answers` field via updatedInput so the AskUserQuestion tool
-    # returns the answer(s) immediately instead of prompting in terminal.
-    # Multi-question (selected_options dict) takes precedence over the
-    # legacy single-question (selected_option_index int).
     updated_input = None
+    updated_permissions = None
     if decision == "allow":
-        if selected_options:
+        # Suggestion clicks → updatedPermissions (apply the rule edit
+        # the user picked). Mutually exclusive with AskUserQuestion
+        # option clicks since suggestion buttons don't render alongside
+        # option buttons.
+        if isinstance(selected_suggestion_idx, int):
+            updated_permissions = _suggestion_to_updated_permissions(
+                record, selected_suggestion_idx,
+            )
+        # AskUserQuestion option button(s) → updatedInput.answers so the
+        # tool returns the answer immediately instead of prompting in
+        # terminal. Multi-Q (dict) preferred over legacy single-Q (int).
+        elif selected_options:
             updated_input = _ask_user_question_updated_input_multi(record, selected_options)
         elif isinstance(selected_idx, int):
             updated_input = _ask_user_question_updated_input(record, selected_idx)
-    _emit_decision(out, decision, updated_input=updated_input)
+    _emit_decision(
+        out, decision,
+        updated_input=updated_input,
+        updated_permissions=updated_permissions,
+    )
     return 0
+
+
+def _suggestion_to_updated_permissions(record: dict, idx: int) -> list | None:
+    """Pull the indexed suggestion off the record and shape it as
+    PermissionRequest's `decision.updatedPermissions` payload (a single-
+    element list — the suggestion is already in the right shape).
+    Returns None if the index is out of range or the record's
+    permission_suggestions is missing/malformed.
+    """
+    suggestions = record.get("permission_suggestions")
+    if not isinstance(suggestions, list):
+        return None
+    if not (0 <= idx < len(suggestions)):
+        return None
+    suggestion = suggestions[idx]
+    if not isinstance(suggestion, dict):
+        return None
+    return [suggestion]
 
 
 def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | None:
@@ -566,19 +605,23 @@ def _emit_decision(
     *,
     reason: str | None = None,
     updated_input: dict | None = None,
+    updated_permissions: list | None = None,
 ) -> None:
     # PermissionRequest's decision schema only allows allow/deny — no "ask"
     # or "defer" (those are PreToolUse-only). Reason is carried as
     # decision.message and is only meaningful when denying. updated_input
-    # is allow-only and modifies the tool's parameters before execution
-    # (used to pre-fill an AskUserQuestion's `answers` from a clicked Slack
-    # option button).
+    # and updated_permissions are allow-only — they modify the tool's
+    # parameters / extend the user's permission rules respectively. Used
+    # for AskUserQuestion option clicks (updated_input) and for
+    # permission_suggestion clicks (updated_permissions).
     assert decision in ("allow", "deny"), f"invalid decision: {decision!r}"
     decision_obj: dict = {"behavior": decision}
     if reason and decision == "deny":
         decision_obj["message"] = reason
     if updated_input is not None and decision == "allow":
         decision_obj["updatedInput"] = updated_input
+    if updated_permissions is not None and decision == "allow":
+        decision_obj["updatedPermissions"] = updated_permissions
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",

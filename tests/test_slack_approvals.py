@@ -13,6 +13,7 @@ from coding_agent_notifier.sinks.base import SinkError
 from coding_agent_notifier.sinks.slack import (
     APPROVE_ACTION_ID,
     DENY_ACTION_ID,
+    SUGGESTION_ACTION_ID_PREFIX,
     build_approval_message,
     build_resolved_message,
     post_approval_message,
@@ -393,6 +394,76 @@ def test_build_resolved_message_renders_qa_summary_for_multi_question():
     full_text = "\n".join(section_texts)
     assert "Mascot?" in full_text and "Raccoon" in full_text
     assert "Color?" in full_text and "Yellow" in full_text
+
+
+def test_permission_suggestions_render_extra_buttons():
+    """When the PermissionRequest payload includes permission_suggestions,
+    each one renders as an extra button below Approve/Deny on a non-
+    AskUserQuestion tool. Tapping resolves the approval AND applies the
+    rule edit via PermissionRequest's `decision.updatedPermissions`."""
+    ev = _event(permission_suggestions=(
+        {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "npm test"}],
+         "behavior": "allow", "destination": "localSettings"},
+        {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "*"}],
+         "behavior": "allow", "destination": "localSettings"},
+    ))
+    body = build_approval_message(ev, "appr-sugg-1")
+    actions_blocks = _find_blocks(body, "actions")
+    # Two actions blocks: Approve/Deny + suggestions.
+    assert len(actions_blocks) == 2
+    approve_deny, suggestions = actions_blocks
+    approve_deny_ids = [el["action_id"] for el in approve_deny["elements"]]
+    assert approve_deny_ids == [APPROVE_ACTION_ID, DENY_ACTION_ID]
+    suggestion_ids = [el["action_id"] for el in suggestions["elements"]]
+    assert suggestion_ids == [
+        f"{SUGGESTION_ACTION_ID_PREFIX}0",
+        f"{SUGGESTION_ACTION_ID_PREFIX}1",
+    ]
+    # Labels surface the rule + destination so the user knows what tap
+    # will actually do.
+    assert "npm test" in suggestions["elements"][0]["text"]["text"]
+    assert "localSettings" in suggestions["elements"][0]["text"]["text"]
+
+
+def test_no_suggestion_buttons_without_suggestions():
+    """No permission_suggestions → just the standard Approve/Deny block."""
+    body = build_approval_message(_event(), "appr-no-sugg")
+    actions_blocks = _find_blocks(body, "actions")
+    assert len(actions_blocks) == 1
+    assert [el["action_id"] for el in actions_blocks[0]["elements"]] == [
+        APPROVE_ACTION_ID, DENY_ACTION_ID,
+    ]
+
+
+def test_no_suggestion_buttons_for_ask_user_question():
+    """AskUserQuestion's option buttons ARE the answer; suggestion
+    buttons would conflict, so we suppress them even if present in the
+    payload."""
+    ev = _ask_user_question_event(permission_suggestions=(
+        {"type": "addRules", "rules": [{"toolName": "AskUserQuestion", "ruleContent": "*"}],
+         "behavior": "allow", "destination": "localSettings"},
+    ))
+    body = build_approval_message(ev, "appr-aq-no-sugg")
+    actions_blocks = _find_blocks(body, "actions")
+    suggestion_ids = [
+        el["action_id"]
+        for block in actions_blocks
+        for el in block["elements"]
+        if el["action_id"].startswith(SUGGESTION_ACTION_ID_PREFIX)
+    ]
+    assert suggestion_ids == []
+
+
+def test_build_resolved_message_uses_suggestion_label():
+    """When a suggestion was clicked, the resolved message header tells
+    the user what rule edit was applied."""
+    body = build_resolved_message(
+        _event(), "allow", "<@U1>",
+        selected_suggestion_label="Approve & add `Bash(npm test)` to localSettings",
+    )
+    text = body["text"]
+    assert "Approved & applied" in text
+    assert "npm test" in text
 
 
 def test_recommended_option_gets_primary_style():

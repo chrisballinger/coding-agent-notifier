@@ -38,6 +38,12 @@ class Event:
     tool_input: dict[str, Any] | None = None
     source_app: str | None = None
     transcript_path: Path | None = None
+    # PermissionRequest's `permission_suggestions` payload field — the
+    # exact rule edits Claude Code would offer the user (e.g. "Approve &
+    # add Bash(curl:*) to localSettings"). Stored as a tuple of dicts so
+    # the dataclass stays frozen-hashable. None for non-PermissionRequest
+    # events or when the harness sent no suggestions.
+    permission_suggestions: tuple[dict[str, Any], ...] | None = None
 
     @property
     def title(self) -> str:

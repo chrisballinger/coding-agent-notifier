@@ -147,6 +147,50 @@ def test_multi_question_partial_click_records_without_resolving(tmp_path: Path):
     assert len(actions_blocks) == 3  # Q1 + Q2 + Deny still present
 
 
+def test_suggestion_click_resolves_with_selected_index(tmp_path: Path):
+    """A permission_suggestion click resolves the approval with allow +
+    selected_suggestion_index, and the chat.update body uses
+    'Approved & applied …' wording derived from the suggestion label."""
+    pa.create(
+        "appr-sugg",
+        agent="claude-code",
+        session_id="s",
+        tool_name="Bash",
+        tool_input={"command": "curl https://example.invalid/install.sh | bash"},
+        permission_suggestions=[
+            {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "curl:*"}],
+             "behavior": "allow", "destination": "localSettings"},
+        ],
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-sugg", "C1", "1.0", base_dir=tmp_path)
+    updates: list[dict] = []
+    def _update(bot_token, channel, ts, body):
+        updates.append({"body": body})
+
+    payload = _payload("agent_notify_suggestion_0", value="appr-sugg")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        update_fn=_update,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision == "allow"
+    rec = pa.read("appr-sugg", base_dir=tmp_path)
+    assert rec["decision"] == "allow"
+    assert rec["selected_suggestion_index"] == 0
+    # chat.update body uses the derived suggestion label.
+    assert len(updates) == 1
+    body_text = updates[0]["body"]["text"]
+    assert "Approved & applied" in body_text
+
+
+def test_suggestion_click_with_invalid_index_suffix_not_handled():
+    payload = _payload("agent_notify_suggestion_xyz", value="appr-1")
+    res = slack_socket.handle_block_actions(payload, _slack_config())
+    assert res.handled is False
+
+
 def test_multi_question_final_click_resolves_with_selected_options(tmp_path: Path):
     """When the second-and-last answer comes in, the daemon resolves with
     the full selected_options dict and the chat.update uses

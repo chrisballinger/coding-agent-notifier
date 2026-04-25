@@ -19,6 +19,11 @@ DENY_ACTION_ID = "agent_notify_deny"
 # tool_input["questions"][0]["options"]. Daemon parses the index out of
 # action_id and stores it on the resolved approval record.
 OPTION_ACTION_ID_PREFIX = "agent_notify_option_"
+# Per-suggestion approve buttons rendered alongside Approve/Deny on
+# non-AskUserQuestion tools. Suffix is the index into the approval's
+# permission_suggestions list. Tapping one resolves the approval as
+# allow + emits PermissionRequest's `decision.updatedPermissions`.
+SUGGESTION_ACTION_ID_PREFIX = "agent_notify_suggestion_"
 # Slack button text limit; truncate option labels to fit.
 _BUTTON_TEXT_MAX = 75
 
@@ -494,6 +499,58 @@ def q_idx_str_in_dict(selected: dict[str, int], q_idx: int) -> int | None:
     return val if isinstance(val, int) else None
 
 
+def _suggestion_label(suggestion: dict) -> str:
+    """Derive a human button label from a permission_suggestion dict.
+
+    Suggestions are shaped like:
+      {"type": "addRules",
+       "rules": [{"toolName": "Bash", "ruleContent": "npm test"}],
+       "behavior": "allow",
+       "destination": "localSettings"}
+
+    The label summarizes intent: "Approve & add Bash(npm test) to
+    localSettings". Falls back to a generic label if the shape is
+    unfamiliar so we never crash on a future schema variant.
+    """
+    behavior = suggestion.get("behavior", "allow")
+    destination = suggestion.get("destination", "settings")
+    rules = suggestion.get("rules") or []
+    if isinstance(rules, list) and rules and isinstance(rules[0], dict):
+        rule = rules[0]
+        tool = rule.get("toolName") or "tool"
+        content = rule.get("ruleContent") or ""
+        rule_summary = f"{tool}({content})" if content else tool
+        verb = "Approve & add" if behavior == "allow" else "Approve & deny"
+        return f"{verb} `{rule_summary}` to {destination}"
+    return f"Approve with {behavior}/{destination}"
+
+
+def _build_suggestion_buttons(approval_id: str, suggestions: list[dict]) -> dict:
+    """Block Kit actions block with one button per suggestion. action_id
+    pattern is `agent_notify_suggestion_<index>` so the daemon can look
+    up which suggestion was clicked.
+    """
+    elements: list[dict] = []
+    for i, suggestion in enumerate(suggestions):
+        elements.append({
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": _truncate_button_text(_suggestion_label(suggestion)),
+                "emoji": False,
+            },
+            "action_id": f"{SUGGESTION_ACTION_ID_PREFIX}{i}",
+            "value": approval_id,
+        })
+    if len(elements) > 25:
+        elements = elements[:25]
+    return {
+        "type": "actions",
+        "block_id": f"agent_notify::{approval_id}::sugg",
+        "elements": elements,
+    }
+
+
 def _build_approve_deny_block(approval_id: str, confirm_text: str) -> dict:
     return {
         "type": "actions",
@@ -550,6 +607,8 @@ def build_approval_message(
     questions = _ask_user_question_questions(event.tool_name, event.tool_input)
     if questions:
         # One actions block per question + a single trailing Deny.
+        # AskUserQuestion never gets suggestion buttons — the option
+        # buttons ARE the answer; suggestions would conflict.
         appended_blocks = _build_multi_question_blocks(
             approval_id, questions, selected_options=selected_options,
         )
@@ -566,6 +625,14 @@ def build_approval_message(
                 f"`{event.cwd.name or str(event.cwd)}`?"
             )
         appended_blocks = [_build_approve_deny_block(approval_id, confirm_text)]
+        # Append per-suggestion buttons after Approve/Deny. Tapping one
+        # equals "approve AND apply this rule edit" — the user gets the
+        # extra-allowlist outcome in a single tap. Suppressed in minimal
+        # verbosity (the rule content would leak the tool input).
+        if event.permission_suggestions and verbosity != "minimal":
+            appended_blocks.append(
+                _build_suggestion_buttons(approval_id, list(event.permission_suggestions))
+            )
 
     # Append to the first attachment so the color bar / fallback text stay
     # intact. Falls back to top-level blocks if the builder ever stops using
@@ -625,6 +692,7 @@ def build_resolved_message(
     verbosity: Verbosity = "terse",
     selected_label: str | None = None,
     selected_options: dict[str, int] | None = None,
+    selected_suggestion_label: str | None = None,
 ) -> dict:
     """Block Kit replacement for `chat.update` after approve/deny or timeout.
 
@@ -636,15 +704,19 @@ def build_resolved_message(
         "Selected `<label>` by @user".
       selected_options: multi-question AskUserQuestion — header reads
         "Answered" and a section block lists each Q→A pair.
+      selected_suggestion_label: a permission_suggestion was clicked —
+        header reads "Approved & applied: <label> by @user".
 
-    Decision is still "allow" for both; the selection both approves the
-    tool call AND chooses the answer(s).
+    Decision is still "allow" for these variants; the selection both
+    approves the tool call AND chooses the answer(s) / rule edit.
     """
     if decision == "allow":
         icon = ":white_check_mark:"
         verb = "Approved"
         color = "#2eb67d"
-        if selected_options:
+        if selected_suggestion_label:
+            verb = f"Approved & applied {selected_suggestion_label}"
+        elif selected_options:
             verb = "Answered"
         elif selected_label:
             verb = f"Selected `{selected_label}`"
