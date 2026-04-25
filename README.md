@@ -101,7 +101,7 @@ bot_token_keychain = "default:bot_token"
 # bot_token_env    = "SLACK_BOT_TOKEN"
 # bot_token        = "xoxb-…"
 
-# For interactive approvals (approve/deny buttons, blocking PreToolUse hook):
+# For interactive approvals (approve/deny buttons, blocking PermissionRequest hook):
 # app_token_keychain   = "default:app_token"
 # interactive          = true
 # actionable_approvals = true
@@ -205,7 +205,7 @@ If `bot_token_keychain` is configured but the account is missing or the Keychain
 
 `minimal` mode exists for environments where the *content* of an agent's pending tool call — a command, a snippet of code, the name of a repo — cannot transit a third-party service. You still get a ping that tells you to glance at the terminal; the terminal is authoritative for what's waiting. Approve/deny buttons still work (they carry only an opaque UUID), and the Slack confirm dialog is stripped of tool-specific text.
 
-**Fail-closed approvals.** The blocking `PreToolUse` hook (when `sinks.slack.actionable_approvals = true`) defaults to `deny` on any error path: Slack post failure, timeout, daemon crash, token absent. Rationale: a notifier that silently *approves* on failure is much worse than one that silently denies — the worst case is a one-line "denied" message and you re-run in the terminal.
+**Fail-closed approvals.** The blocking `PermissionRequest` hook (when `sinks.slack.actionable_approvals = true`) defaults to `deny` on any error path: Slack post failure, timeout, daemon crash, token absent. Rationale: a notifier that silently *approves* on failure is much worse than one that silently denies — the worst case is a one-line "denied" message and you re-run in the terminal. The hook only fires when Claude Code was about to prompt the user — auto-allowed tools (allowlist, sandbox) pass through untouched.
 
 **Safer example commands.** No destructive shell patterns (`rm -rf …`) appear in fixtures, examples, screenshots, or the `agent-notify test --dangerous` synthetic event — on the theory that a user who copies a command out of a notification into a terminal should not be harmed by it. Placeholder commands use `https://example.invalid/...` (a reserved TLD that never resolves) so `curl | bash`-style examples are cosmetically dangerous but cannot actually do anything.
 

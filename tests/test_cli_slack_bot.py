@@ -17,7 +17,7 @@ def test_install_slack_bot_subcommand(monkeypatch, capsys):
     def fake(*, install_plist=True, **kw):
         captured["install_plist"] = install_plist
         return {
-            "claude_hooks_added": ["PreToolUse"],
+            "claude_hooks_added": ["PermissionRequest"],
             "plist_path": Path("/tmp/fake.plist"),
             "plist_written": True,
         }
@@ -27,7 +27,7 @@ def test_install_slack_bot_subcommand(monkeypatch, capsys):
     assert rc == 0
     assert captured["install_plist"] is True
     out = capsys.readouterr()
-    assert "PreToolUse" in out.out
+    assert "PermissionRequest" in out.out
     assert "launchctl load" in out.out
     # Instructions for next steps go to stderr. Point users at the wizard
     # rather than the legacy env-var dance.
@@ -75,26 +75,68 @@ def test_daemon_subcommand_calls_run_daemon(monkeypatch):
     assert called["ran"] is True
 
 
-def test_cmd_hook_routes_pretooluse_to_approval_flow(monkeypatch, tmp_path):
+def _write_actionable_config(tmp_path):
+    """Write a config with a workspace that has actionable_approvals on, so
+    cmd_hook routes PermissionRequest to the blocking handler."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        "[slack.workspaces.default]\n"
+        "enabled = true\n"
+        "bot_token = \"xoxb-test\"\n"
+        "app_token = \"xapp-test\"\n"
+        "channel = \"C1\"\n"
+        "actionable_approvals = true\n"
+        "approver_user_ids = [\"U_OK\"]\n"
+    )
+    return cfg_path
+
+
+def test_cmd_hook_routes_permissionrequest_to_approval_flow(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg_path = _write_actionable_config(tmp_path)
     # Fake the heavy call — we just want to confirm the dispatch happens.
     called: dict = {}
 
-    def fake_pretooluse(payload, config, **kw):
+    def fake_permissionrequest(payload, config, **kw):
         called["payload"] = payload
         called["actionable"] = config.slack.actionable_approvals
         # Emit a valid deny JSON so cmd_hook sees a clean return.
         print(json.dumps({
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny"},
             }
         }))
         return 0
 
-    monkeypatch.setattr(cli, "cmd_pretooluse", fake_pretooluse)
+    monkeypatch.setattr(cli, "cmd_permissionrequest", fake_permissionrequest)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
-        "hook_event_name": "PreToolUse",
+        "hook_event_name": "PermissionRequest",
+        "session_id": "s1",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "cwd": str(tmp_path),
+    })))
+    rc = cli.main(["--config", str(cfg_path), "hook", "--source", "claude-code"])
+    assert rc == 0
+    assert called["payload"]["tool_name"] == "Bash"
+
+
+def test_cmd_hook_permissionrequest_falls_through_when_actionable_off(monkeypatch, tmp_path):
+    """When actionable_approvals is off, PermissionRequest events fall
+    through to the normal parse-and-send notification flow rather than
+    routing to cmd_permissionrequest. The user still gets a ping."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    sentinel = {"blocking_called": False}
+
+    def fake_permissionrequest(*a, **kw):
+        sentinel["blocking_called"] = True
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_permissionrequest", fake_permissionrequest)
+    # No config with actionable_approvals → dispatch should not call us.
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "hook_event_name": "PermissionRequest",
         "session_id": "s1",
         "tool_name": "Bash",
         "tool_input": {"command": "ls"},
@@ -102,23 +144,23 @@ def test_cmd_hook_routes_pretooluse_to_approval_flow(monkeypatch, tmp_path):
     })))
     rc = cli.main(["hook", "--source", "claude-code"])
     assert rc == 0
-    assert called["payload"]["tool_name"] == "Bash"
+    assert sentinel["blocking_called"] is False
 
 
-def test_cmd_hook_pretooluse_ignored_for_codex(monkeypatch, tmp_path):
-    """PreToolUse is a Claude Code concept — the codex source shouldn't
-    accidentally trigger the approval flow if codex ever emits a payload
-    with that hook name."""
+def test_cmd_hook_permissionrequest_ignored_for_codex(monkeypatch, tmp_path):
+    """PermissionRequest dispatches to the Claude Code approval flow only —
+    the codex source shouldn't accidentally trigger it if codex ever emits a
+    payload with that hook name."""
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     sentinel = {"called": False}
 
-    def fake_pretooluse(*a, **kw):
+    def fake_permissionrequest(*a, **kw):
         sentinel["called"] = True
         return 0
 
-    monkeypatch.setattr(cli, "cmd_pretooluse", fake_pretooluse)
+    monkeypatch.setattr(cli, "cmd_permissionrequest", fake_permissionrequest)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
-        "hook_event_name": "PreToolUse",
+        "hook_event_name": "PermissionRequest",
         "session_id": "s1",
     })))
     rc = cli.main(["hook", "--source", "codex"])

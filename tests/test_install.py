@@ -9,7 +9,11 @@ from coding_agent_notifier import install
 def test_claude_install_creates_settings(tmp_path: Path):
     settings = tmp_path / "settings.json"
     added = install.install_claude_code(settings)
-    assert set(added) == {"Notification", "PermissionRequest", "Stop", "UserPromptSubmit"}
+    # PermissionRequest is intentionally NOT here — it's added only by the
+    # Slack-bot install (with the long timeout for the blocking decision
+    # round-trip). Base notifications for permission events come via the
+    # Notification hook with matcher `permission_prompt`.
+    assert set(added) == {"Notification", "Stop", "UserPromptSubmit"}
     data = json.loads(settings.read_text())
     assert "hooks" in data
     assert any(

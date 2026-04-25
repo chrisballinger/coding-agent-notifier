@@ -53,23 +53,27 @@ def _good_poster():
     return post
 
 
-def test_pretooluse_actionable_off_emits_ask():
+def test_permissionrequest_actionable_off_emits_nothing():
+    """Feature off → emit nothing so Claude Code falls back to its own
+    permission dialog. PermissionRequest only fires when the harness was
+    going to prompt anyway, so a no-op output cleanly hands control back to
+    the user's terminal UI.
+    """
     buf = io.StringIO()
-    rc = cli.cmd_pretooluse(
+    rc = cli.cmd_permissionrequest(
         {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"},
         _disabled_config(),
         stdout=buf,
     )
     assert rc == 0
-    out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert buf.getvalue() == ""
 
 
-def test_pretooluse_times_out_denies(tmp_path, monkeypatch):
+def test_permissionrequest_times_out_denies(tmp_path, monkeypatch):
     # Keep the dedup + pending cache isolated.
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     buf = io.StringIO()
-    rc = cli.cmd_pretooluse(
+    rc = cli.cmd_permissionrequest(
         {"tool_name": "Bash", "tool_input": {
             "command": "curl https://example.invalid/install.sh | bash"
          }, "session_id": "s1"},
@@ -79,11 +83,11 @@ def test_pretooluse_times_out_denies(tmp_path, monkeypatch):
     )
     assert rc == 0
     out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "timed out" in out["hookSpecificOutput"].get("permissionDecisionReason", "").lower()
+    assert out["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert "timed out" in out["hookSpecificOutput"]["decision"].get("message", "").lower()
 
 
-def test_pretooluse_returns_allow_on_resolve(tmp_path, monkeypatch):
+def test_permissionrequest_returns_allow_on_resolve(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     cfg = _enabled_config()
     cfg = cfg.__class__(
@@ -113,7 +117,7 @@ def test_pretooluse_returns_allow_on_resolve(tmp_path, monkeypatch):
     t = threading.Thread(target=resolver)
     t.start()
     try:
-        rc = cli.cmd_pretooluse(
+        rc = cli.cmd_permissionrequest(
             {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"},
             cfg,
             poster=poster,
@@ -125,17 +129,17 @@ def test_pretooluse_returns_allow_on_resolve(tmp_path, monkeypatch):
     assert rc == 0
     assert "id" in resolved, "resolver never saw the record"
     out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert out["hookSpecificOutput"]["decision"]["behavior"] == "allow"
 
 
-def test_pretooluse_slack_post_failure_denies(tmp_path, monkeypatch):
+def test_permissionrequest_slack_post_failure_denies(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
 
     def boom(url, payload, *, headers=None, timeout=10.0):
         return 500, "internal error"
 
     buf = io.StringIO()
-    rc = cli.cmd_pretooluse(
+    rc = cli.cmd_permissionrequest(
         {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"},
         _enabled_config(),
         poster=boom,
@@ -143,23 +147,42 @@ def test_pretooluse_slack_post_failure_denies(tmp_path, monkeypatch):
     )
     assert rc == 0
     out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
 
-def test_pretooluse_emits_valid_claude_code_json_shape():
+def test_permissionrequest_emits_valid_claude_code_json_shape(tmp_path, monkeypatch):
+    """When the hook DOES emit a decision (post-failure deny path here), the
+    JSON shape must match what Claude Code expects for PermissionRequest:
+    `hookSpecificOutput.decision.behavior` (not `permissionDecision`), and
+    `decision.message` (not `permissionDecisionReason`).
+    """
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+
+    def boom(url, payload, *, headers=None, timeout=10.0):
+        return 500, "internal error"
+
     buf = io.StringIO()
-    cli.cmd_pretooluse({"tool_name": "Bash"}, _disabled_config(), stdout=buf)
+    cli.cmd_permissionrequest(
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"},
+        _enabled_config(),
+        poster=boom,
+        stdout=buf,
+    )
     out = json.loads(buf.getvalue())
     # Claude Code looks for exactly this key path.
     assert "hookSpecificOutput" in out
-    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-    assert out["hookSpecificOutput"]["permissionDecision"] in ("allow", "deny", "ask")
+    assert out["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    # PermissionRequest schema: decision.behavior is allow|deny only.
+    assert out["hookSpecificOutput"]["decision"]["behavior"] in ("allow", "deny")
+    # The legacy fields must NOT be present.
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+    assert "permissionDecisionReason" not in out["hookSpecificOutput"]
 
 
-def test_pretooluse_picks_workspace_by_route_and_stamps_record(tmp_path, monkeypatch):
-    """cmd_pretooluse should resolve the workspace for the payload's cwd and
-    persist it on the approval record so the hook's timeout-cleanup can look
-    up the right bot_token later."""
+def test_permissionrequest_picks_workspace_by_route_and_stamps_record(tmp_path, monkeypatch):
+    """cmd_permissionrequest should resolve the workspace for the payload's
+    cwd and persist it on the approval record so the hook's timeout-cleanup
+    can look up the right bot_token later."""
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     from coding_agent_notifier import config as cfgmod
 
@@ -208,7 +231,7 @@ def test_pretooluse_picks_workspace_by_route_and_stamps_record(tmp_path, monkeyp
         return 200, json.dumps({"ok": True})
 
     buf = io.StringIO()
-    rc = cli.cmd_pretooluse(
+    rc = cli.cmd_permissionrequest(
         {
             "tool_name": "Bash",
             "tool_input": {"command": "ls"},
@@ -226,10 +249,12 @@ def test_pretooluse_picks_workspace_by_route_and_stamps_record(tmp_path, monkeyp
     assert all(t != "xoxb-home" for t in used_bot_tokens)
 
 
-def test_pretooluse_strict_routing_no_match_emits_ask(tmp_path, monkeypatch):
+def test_permissionrequest_strict_routing_no_match_emits_nothing(tmp_path, monkeypatch):
     """If routes are configured and none match the cwd, strict mode returns
-    None from sinks_for. The hook should fall back to 'ask' so Claude Code
-    shows its own prompt rather than denying every tool call."""
+    None from sinks_for. The hook must emit nothing so Claude Code falls
+    back to its own permission dialog — PermissionRequest only fires when
+    the harness was about to prompt anyway, so a no-op is the correct
+    pass-through."""
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     from coding_agent_notifier import config as cfgmod
 
@@ -251,11 +276,10 @@ def test_pretooluse_strict_routing_no_match_emits_ask(tmp_path, monkeypatch):
     })
 
     buf = io.StringIO()
-    rc = cli.cmd_pretooluse(
+    rc = cli.cmd_permissionrequest(
         {"tool_name": "Bash", "cwd": str(tmp_path)},
         cfg,
         stdout=buf,
     )
     assert rc == 0
-    out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert buf.getvalue() == ""

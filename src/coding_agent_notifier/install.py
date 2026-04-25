@@ -13,37 +13,36 @@ from . import paths
 CLAUDE_HOOK_COMMAND = "agent-notify hook --source claude-code"
 CODEX_HOOK_COMMAND_PARTS = ["agent-notify", "hook", "--source", "codex"]
 
-# PreToolUse is a blocking decision hook — its timeout must be long enough to
-# survive a lock-screen approval round-trip. 10min matches Claude Code's
-# documented default; we make it explicit so a user with a shorter global
-# default doesn't fail-close prematurely.
-PRETOOLUSE_TIMEOUT_SECONDS = 600
+# PermissionRequest is a blocking decision hook — its timeout must be long
+# enough to survive a lock-screen approval round-trip. 10min matches Claude
+# Code's documented default; we make it explicit so a user with a shorter
+# global default doesn't fail-close prematurely.
+PERMISSIONREQUEST_TIMEOUT_SECONDS = 600
 
-CLAUDE_PRETOOLUSE_ENTRIES: dict[str, list[dict[str, Any]]] = {
-    "PreToolUse": [
+CLAUDE_PERMISSIONREQUEST_ENTRIES: dict[str, list[dict[str, Any]]] = {
+    "PermissionRequest": [
         {
             "matcher": "*",
             "hooks": [
                 {
                     "type": "command",
                     "command": CLAUDE_HOOK_COMMAND,
-                    "timeout": PRETOOLUSE_TIMEOUT_SECONDS,
+                    "timeout": PERMISSIONREQUEST_TIMEOUT_SECONDS,
                 }
             ],
         }
     ],
 }
 
+# Base notification hooks. PermissionRequest is intentionally NOT here — it
+# becomes a blocking decision hook only when the Slack bot install runs (see
+# CLAUDE_PERMISSIONREQUEST_ENTRIES). For non-actionable installs the
+# Notification hook with matcher "permission_prompt" already pings the user
+# for permission events.
 CLAUDE_HOOK_ENTRIES: dict[str, list[dict[str, Any]]] = {
     "Notification": [
         {
             "matcher": "permission_prompt|idle_prompt|elicitation_dialog",
-            "hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}],
-        }
-    ],
-    "PermissionRequest": [
-        {
-            "matcher": "*",
             "hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}],
         }
     ],
@@ -106,13 +105,16 @@ def _backup(path: Path) -> None:
             os.close(fd)
 
 
-def _has_our_hook(entries: list[dict[str, Any]]) -> bool:
-    for entry in entries:
-        for h in entry.get("hooks", []):
-            cmd = h.get("command", "")
-            if isinstance(cmd, str) and "agent-notify hook" in cmd:
-                return True
+def _entry_has_our_hook(entry: dict[str, Any]) -> bool:
+    for h in entry.get("hooks", []):
+        cmd = h.get("command", "")
+        if isinstance(cmd, str) and "agent-notify hook" in cmd:
+            return True
     return False
+
+
+def _has_our_hook(entries: list[dict[str, Any]]) -> bool:
+    return any(_entry_has_our_hook(entry) for entry in entries)
 
 
 def merge_claude_hooks(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -144,16 +146,46 @@ def install_claude_code(settings_path: Path | None = None) -> list[str]:
     return added
 
 
-def merge_claude_pretooluse(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Add the PreToolUse blocking hook. Idempotent."""
+def merge_claude_permissionrequest(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Add the PermissionRequest blocking hook. Idempotent.
+
+    Also migrates legacy installs:
+      - Removes any of our previous PreToolUse blocks (Phase 1 hook event).
+      - Replaces any of our older PermissionRequest entries (e.g. without the
+        timeout from when PermissionRequest was a notification-only hook)
+        with the canonical timeout-bearing entry.
+
+    "Our" entries are detected by command substring `agent-notify hook` —
+    the user's hand-edited entries are left alone.
+    """
     hooks = settings.setdefault("hooks", {})
     added: list[str] = []
-    for event, new_entries in CLAUDE_PRETOOLUSE_ENTRIES.items():
-        existing = hooks.setdefault(event, [])
-        if _has_our_hook(existing):
-            continue
-        existing.extend(new_entries)
-        added.append(event)
+
+    # Migration: drop our legacy PreToolUse entries. The Phase 1 design used
+    # PreToolUse with matcher "*" — that fired on every tool call (including
+    # auto-allowed reads/grep/task tools), creating noise and tripping
+    # Claude Code's "trust this hook for X tool" prompt. PermissionRequest
+    # subsumes the use case cleanly: it only fires when the user would have
+    # been prompted anyway.
+    pretooluse = hooks.get("PreToolUse")
+    if pretooluse:
+        cleaned = [e for e in pretooluse if not _entry_has_our_hook(e)]
+        if cleaned:
+            hooks["PreToolUse"] = cleaned
+        else:
+            del hooks["PreToolUse"]
+
+    desired_entries = CLAUDE_PERMISSIONREQUEST_ENTRIES["PermissionRequest"]
+    existing = hooks.get("PermissionRequest", [])
+    # Idempotency: if the canonical entry is already present, no-op.
+    if any(e == desired_entries[0] for e in existing):
+        return settings, added
+    # Drop any of our older PermissionRequest entries before appending the
+    # canonical one — keeps third-party entries (matching neither command
+    # substring nor shape) intact.
+    cleaned_existing = [e for e in existing if not _entry_has_our_hook(e)]
+    hooks["PermissionRequest"] = cleaned_existing + list(desired_entries)
+    added.append("PermissionRequest")
     return settings, added
 
 
@@ -167,8 +199,8 @@ def install_slack_bot(
     agent_notify_bin: str = "agent-notify",
     install_plist: bool = True,
 ) -> dict[str, Any]:
-    """Install the PreToolUse hook into Claude Code settings and (optionally)
-    a launchd plist that supervises `agent-notify daemon`.
+    """Install the PermissionRequest blocking hook into Claude Code settings
+    and (optionally) a launchd plist that supervises `agent-notify daemon`.
 
     Returns a summary dict with keys:
       - `claude_hooks_added`: list of Claude hook event names added.
@@ -186,7 +218,7 @@ def install_slack_bot(
     # Include the base hooks too — running install-slack-bot on a fresh
     # install shouldn't require a prior `install claude-code`.
     settings, base_added = merge_claude_hooks(settings)
-    settings, pre_added = merge_claude_pretooluse(settings)
+    settings, pre_added = merge_claude_permissionrequest(settings)
     paths.write_secure(settings_path, json.dumps(settings, indent=2) + "\n")
     claude_added = base_added + pre_added
 

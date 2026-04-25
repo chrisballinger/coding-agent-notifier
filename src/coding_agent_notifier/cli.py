@@ -211,15 +211,24 @@ def cmd_hook(args: argparse.Namespace) -> int:
             )
         return 0
 
-    # PreToolUse is a blocking decision hook: we post a Slack message with
-    # approve/deny buttons and wait for the user to click. The daemon
-    # (`agent-notify daemon`) resolves the matching PendingApproval, which
-    # unblocks our FIFO wait, and we emit Claude Code's `permissionDecision`
-    # JSON. Fails closed (deny) on any error so a misconfigured bot never
-    # silently approves. Only wired if actionable approvals are enabled.
-    if args.source == "claude-code" and payload.get("hook_event_name") == "PreToolUse":
+    # PermissionRequest fires when Claude Code is about to show a permission
+    # dialog — i.e. only for tool calls that aren't auto-allowed. When the
+    # resolved workspace has `actionable_approvals = true`, we post a Slack
+    # message with approve/deny buttons and block on the user's click via
+    # `cmd_permissionrequest` (the daemon resolves the FIFO; we emit Claude
+    # Code's `decision.behavior` JSON; fails closed on any error). When
+    # actionable approvals are off (or no route matches), we fall through
+    # to the normal parse-and-send notification path so the user still gets
+    # a ping.
+    if args.source == "claude-code" and payload.get("hook_event_name") == "PermissionRequest":
         config = load_config(args.config)
-        return cmd_pretooluse(payload, config)
+        cwd = Path(payload.get("cwd") or ".")
+        resolved = sinks_for(cwd, config)
+        if resolved is not None:
+            slack_cfg, _ = resolved
+            if slack_cfg.enabled and slack_cfg.actionable_approvals:
+                return cmd_permissionrequest(payload, config)
+        # else: fall through to the notification flow below.
 
     source_app = macos.term_program_to_app(os.environ.get("TERM_PROGRAM"))
     parse = src_claude.parse if args.source == "claude-code" else src_codex.parse
@@ -349,7 +358,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pretooluse(
+def cmd_permissionrequest(
     payload: dict,
     config: Config,
     *,
@@ -357,9 +366,9 @@ def cmd_pretooluse(
     clock=time.monotonic,
     stdout=None,
 ) -> int:
-    """Block on a Slack approve/deny round-trip for a PreToolUse hook.
+    """Block on a Slack approve/deny round-trip for a PermissionRequest hook.
 
-    Emits Claude Code's expected stdout JSON with `permissionDecision`, and
+    Emits Claude Code's expected stdout JSON with `decision.behavior`, and
     fails closed (deny) on any error path so a misconfigured bot never
     silently rubber-stamps a tool call. The blocking is just a FIFO read
     with timeout — the work happens in the daemon process that resolves
@@ -372,19 +381,17 @@ def cmd_pretooluse(
     cwd = Path(payload.get("cwd") or ".")
     resolved = sinks_for(cwd, config)
     if resolved is None:
-        # Strict routing: no route matches this cwd. Fall back to "ask" so
-        # Claude Code shows its own terminal prompt rather than denying or
-        # silently approving.
-        _emit_decision(out, "ask")
+        # No route matches this cwd. Emit nothing so Claude Code falls back
+        # to showing its own permission dialog. PermissionRequest only fires
+        # when the harness was about to prompt anyway, so a no-op output
+        # cleanly hands control back to the user's terminal UI.
         return 0
     slack_cfg, _ = resolved
     workspace_name = workspace_for(cwd, config)
 
     if not (slack_cfg.enabled and slack_cfg.actionable_approvals):
-        # Feature off — return "ask" so Claude Code falls back to its normal
-        # in-terminal permission flow. Safer than defaulting to "allow" or
-        # "deny" (which would block every tool call).
-        _emit_decision(out, "ask")
+        # Feature off for this route. Emit nothing — the harness will show
+        # its normal permission dialog, same as if our hook weren't here.
         return 0
 
     approval_id = str(uuid.uuid4())
@@ -407,7 +414,7 @@ def cmd_pretooluse(
     )
 
     _log_event(
-        f"PreToolUse approval_id={approval_id} tool={tool_name} sess={session_id} "
+        f"PermissionRequest approval_id={approval_id} tool={tool_name} sess={session_id} "
         f"workspace={workspace_name}"
     )
     pending_approvals.create(
@@ -429,9 +436,9 @@ def cmd_pretooluse(
             poster=poster,
         )
         pending_approvals.set_message_ref(approval_id, channel, message_ts)
-        _log_event(f"PreToolUse posted slack channel={channel} ts={message_ts}")
+        _log_event(f"PermissionRequest posted slack channel={channel} ts={message_ts}")
     except Exception as e:  # noqa: BLE001
-        _log_event(f"PreToolUse slack post failed: {e}")
+        _log_event(f"PermissionRequest slack post failed: {e}")
         pending_approvals.cleanup(approval_id)
         # Fail-closed: deny the tool call rather than leaving the agent hung.
         _emit_decision(out, "deny", reason=f"agent-notify: Slack post failed: {e}")
@@ -442,7 +449,7 @@ def cmd_pretooluse(
         timeout=slack_cfg.approval_timeout_seconds,
     )
     if decision is None:
-        _log_event(f"PreToolUse timed out approval_id={approval_id}")
+        _log_event(f"PermissionRequest timed out approval_id={approval_id}")
         # Try to mark the message as timed-out; best-effort.
         try:
             if slack_cfg.bot_token:
@@ -456,21 +463,26 @@ def cmd_pretooluse(
         _emit_decision(out, "deny", reason="agent-notify: approval timed out")
         return 0
 
-    _log_event(f"PreToolUse resolved approval_id={approval_id} decision={decision}")
+    _log_event(f"PermissionRequest resolved approval_id={approval_id} decision={decision}")
     pending_approvals.cleanup(approval_id)
     _emit_decision(out, decision)
     return 0
 
 
 def _emit_decision(out, decision: str, *, reason: str | None = None) -> None:
+    # PermissionRequest's decision schema only allows allow/deny — no "ask"
+    # or "defer" (those are PreToolUse-only). Reason is carried as
+    # decision.message and is only meaningful when denying.
+    assert decision in ("allow", "deny"), f"invalid decision: {decision!r}"
+    decision_obj: dict = {"behavior": decision}
+    if reason and decision == "deny":
+        decision_obj["message"] = reason
     payload = {
         "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": decision,
+            "hookEventName": "PermissionRequest",
+            "decision": decision_obj,
         }
     }
-    if reason:
-        payload["hookSpecificOutput"]["permissionDecisionReason"] = reason
     out.write(json.dumps(payload))
     out.write("\n")
     try:
