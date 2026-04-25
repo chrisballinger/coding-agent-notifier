@@ -24,7 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..event import Event, truncate
+from ..event import Event
 
 
 def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | None:
@@ -36,7 +36,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
         return Event(
             agent="codex",
             kind="turn_complete",
-            message=truncate(str(payload.get("message") or "")),
+            message=str(payload.get("message") or "").strip(),
             cwd=cwd,
             session_id=payload.get("session_id"),
             source_app=source_app,
@@ -62,7 +62,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
         return Event(
             agent="codex",
             kind="turn_complete",
-            message=truncate(str(msg)) if msg else "",
+            message=str(msg).strip() if msg else "",
             cwd=cwd,
             session_id=payload.get("turn-id") or payload.get("session_id"),
             source_app=source_app,

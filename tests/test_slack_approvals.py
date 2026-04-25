@@ -799,3 +799,139 @@ def test_single_question_resolved_header_uses_typed_text():
         selected_label="my custom answer here",
     )
     assert "Selected `my custom answer here`" in body["text"]
+
+
+# ---------------------------------------------------------------------
+# Show more / Show less toggle on actionable approvals
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def expandable_store(monkeypatch, tmp_path):
+    """Redirect expandable_messages persistence to a tmp dir."""
+    from coding_agent_notifier import expandable_messages
+    store = tmp_path / "expandable_messages"
+    monkeypatch.setattr(expandable_messages, "default_dir", lambda: store)
+    return store
+
+
+def _toggle_buttons_in_attachment(body: dict) -> list[dict]:
+    """Return the action elements in any actions block of the first attachment."""
+    actions: list[dict] = []
+    for blk in body.get("attachments", [{}])[0].get("blocks", []):
+        if blk.get("type") == "actions":
+            actions.extend(blk.get("elements", []))
+    return actions
+
+
+def _exit_plan_event(plan: str) -> Event:
+    """An ExitPlanMode permission event whose tool_input.plan is `plan`."""
+    return _event(tool_name="ExitPlanMode", tool_input={"plan": plan}, message="")
+
+
+def test_post_approval_long_plan_attaches_show_more_and_persists(expandable_store):
+    """Long plan body → preview body posted with Show more button + Approve;
+    full body persisted with Show less button + Approve."""
+    long_plan = "# A Plan\n\n" + ("Lorem ipsum dolor sit amet. " * 200)
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        _exit_plan_event(long_plan),
+        cfg,
+        "appr-long-plan",
+        message_preview_head_chars=100,
+        message_preview_tail_chars=100,
+        workspace="default",
+        poster=poster,
+    )
+    posted_payload = poster.calls[0]["payload"]
+    elements = _toggle_buttons_in_attachment(posted_payload)
+    action_ids = [el.get("action_id") for el in elements]
+    assert "agent_notify_expand" in action_ids
+    assert APPROVE_ACTION_ID in action_ids
+    assert DENY_ACTION_ID in action_ids
+
+    files = list(expandable_store.glob("*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["channel"] == "C123"
+    full_action_ids = [
+        el.get("action_id")
+        for el in _toggle_buttons_in_attachment(rec["full_body"])
+    ]
+    assert "agent_notify_collapse" in full_action_ids
+    assert APPROVE_ACTION_ID in full_action_ids
+
+
+def test_post_approval_short_tool_input_no_toggle(expandable_store):
+    """Short Bash command → no Show more, nothing persisted (regression)."""
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        _event(),  # default Bash with `echo hi`
+        cfg,
+        "appr-short",
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+        poster=poster,
+    )
+    elements = _toggle_buttons_in_attachment(poster.calls[0]["payload"])
+    action_ids = [el.get("action_id") for el in elements]
+    assert "agent_notify_expand" not in action_ids
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_post_approval_minimal_verbosity_skips_toggle(expandable_store):
+    """Minimal verbosity hides body entirely — no toggle even on long plans."""
+    long_plan = "# A Plan\n\n" + ("x" * 5000)
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        _exit_plan_event(long_plan),
+        cfg,
+        "appr-minimal",
+        verbosity="minimal",
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+        poster=poster,
+    )
+    action_ids = [el.get("action_id") for el in _toggle_buttons_in_attachment(poster.calls[0]["payload"])]
+    assert "agent_notify_expand" not in action_ids
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_post_approval_message_max_chars_skips_toggle(expandable_store):
+    """User-set hard cap on body → no toggle (cap is the intended final form)."""
+    long_plan = "# A Plan\n\n" + ("x" * 5000)
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        _exit_plan_event(long_plan),
+        cfg,
+        "appr-cap",
+        message_max_chars=400,
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+        poster=poster,
+    )
+    action_ids = [el.get("action_id") for el in _toggle_buttons_in_attachment(poster.calls[0]["payload"])]
+    assert "agent_notify_expand" not in action_ids
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_post_approval_zero_preview_budget_skips_toggle(expandable_store):
+    """Both head/tail = 0 → toggle disabled even on long plans."""
+    long_plan = "# A Plan\n\n" + ("x" * 5000)
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        _exit_plan_event(long_plan),
+        cfg,
+        "appr-zero",
+        message_preview_head_chars=0,
+        message_preview_tail_chars=0,
+        poster=poster,
+    )
+    action_ids = [el.get("action_id") for el in _toggle_buttons_in_attachment(poster.calls[0]["payload"])]
+    assert "agent_notify_expand" not in action_ids
+    assert list(expandable_store.glob("*.json")) == []

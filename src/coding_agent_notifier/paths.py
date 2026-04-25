@@ -86,6 +86,10 @@ def approvals_dir() -> Path:
     return state_dir() / "approvals"
 
 
+def expandable_messages_dir() -> Path:
+    return state_dir() / "expandable_messages"
+
+
 def logs_dir() -> Path:
     return root() / "logs"
 

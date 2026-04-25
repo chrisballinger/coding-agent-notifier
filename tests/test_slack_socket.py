@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from coding_agent_notifier import expandable_messages as em
 from coding_agent_notifier import pending_approvals as pa
 from coding_agent_notifier import slack_socket
 from coding_agent_notifier.config import SlackConfig
@@ -892,6 +893,87 @@ def test_view_submission_unknown_callback_not_handled(tmp_path: Path):
     )
     res = slack_socket.handle_view_submission(payload, _slack_config(), base_dir=tmp_path)
     assert res.handled is False
+
+
+# ---------------------------------------------------------------------
+# Show more / Show less toggle dispatch
+# ---------------------------------------------------------------------
+
+
+def _create_expandable(tmp_path: Path, msg_id: str = "msg-1") -> dict:
+    return em.create(
+        msg_id,
+        workspace="default",
+        channel="D0123",
+        message_ts="1700000000.000100",
+        preview_body={"text": "preview", "attachments": [{"color": "#fff", "blocks": []}]},
+        full_body={"text": "full", "attachments": [{"color": "#fff", "blocks": []}]},
+        base_dir=tmp_path,
+    ) and em.read(msg_id, base_dir=tmp_path)
+
+
+def test_expand_click_chat_updates_with_full_body(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(em, "default_dir", lambda: tmp_path)
+    _create_expandable(tmp_path)
+
+    updates: list[dict] = []
+    payload = _payload("agent_notify_expand", value="msg-1")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        update_fn=lambda token, ch, ts, body: updates.append({"ch": ch, "ts": ts, "body": body}),
+    )
+    assert res.handled is True
+    assert res.rejected_reason is None
+    assert len(updates) == 1
+    assert updates[0]["ch"] == "D0123"
+    assert updates[0]["ts"] == "1700000000.000100"
+    assert updates[0]["body"]["text"] == "full"
+
+
+def test_collapse_click_chat_updates_with_preview_body(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(em, "default_dir", lambda: tmp_path)
+    _create_expandable(tmp_path)
+
+    updates: list[dict] = []
+    payload = _payload("agent_notify_collapse", value="msg-1")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        update_fn=lambda token, ch, ts, body: updates.append({"body": body}),
+    )
+    assert res.handled is True
+    assert updates[0]["body"]["text"] == "preview"
+
+
+def test_toggle_click_with_unknown_message_id_returns_unknown_toggle(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(em, "default_dir", lambda: tmp_path)
+    updates: list[dict] = []
+    payload = _payload("agent_notify_expand", value="ghost-id")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        update_fn=lambda *a, **kw: updates.append(a),
+    )
+    assert res.handled is True
+    assert res.rejected_reason == "unknown_toggle"
+    assert updates == []
+
+
+def test_toggle_click_unauthorized_user_rejected_before_lookup(
+    tmp_path: Path, monkeypatch,
+):
+    """Auth runs before the toggle branch — record stays untouched."""
+    monkeypatch.setattr(em, "default_dir", lambda: tmp_path)
+    _create_expandable(tmp_path)
+    updates: list[dict] = []
+    payload = _payload("agent_notify_expand", value="msg-1", user_id="U_OUTSIDER")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),  # approver_user_ids=("U_OK",) — U_OUTSIDER not allowed
+        update_fn=lambda *a, **kw: updates.append(a),
+    )
+    assert res.handled is True
+    assert res.rejected_reason is not None  # auth rejection
+    assert updates == []
 
 
 def test_view_submission_empty_text_noop(tmp_path: Path):

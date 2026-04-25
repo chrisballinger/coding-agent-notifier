@@ -230,6 +230,36 @@ def test_slack_fallback_collapses_multiline_body():
     assert "line one" in text
 
 
+def test_slack_fallback_polishes_markdown_to_mrkdwn():
+    """Top-level `text` field must run through mrkdwn polish so Slack's
+    in-app preview line renders bold/italic/strike/links instead of
+    showing literal `**bold**`, `~~strike~~`, `[link](url)`."""
+    body = build_slack_message(
+        _event(
+            kind="turn_complete",
+            tool_name=None,
+            tool_input=None,
+            message=(
+                "## Heading\n\n"
+                "Body with **bold**, *italic*, ~~strike~~ and a "
+                "[link](https://example.com)."
+            ),
+        )
+    )
+    text = body["text"]
+    # Polished forms present.
+    assert "*Heading*" in text
+    assert "*bold*" in text
+    assert "_italic_" in text
+    assert "~strike~" in text
+    assert "<https://example.com|link>" in text
+    # Raw markdown markers gone.
+    assert "**bold**" not in text
+    assert "~~strike~~" not in text
+    assert "[link](" not in text
+    assert "## Heading" not in text
+
+
 # --- Slack terse mode ---
 
 
@@ -499,3 +529,316 @@ def test_http_post_json_urlerror_maps_to_sink_error(monkeypatch):
     monkeypatch.setattr(sink_base._urlreq, "urlopen", _raise)
     with pytest.raises(sink_base.SinkError):
         sink_base.http_post_json("https://example.test/x", {"a": 1})
+
+
+# ---------------------------------------------------------------------
+# Full message body — chunking + message_max_chars cap
+# ---------------------------------------------------------------------
+
+
+def _section_body_texts(body: dict) -> list[str]:
+    """Pull the message-body section blocks (skip header / footer / fields /
+    the tool-detail code-fence section)."""
+    blocks = body["attachments"][0]["blocks"]
+    return [
+        b["text"]["text"] for b in blocks
+        if b["type"] == "section"
+        and "text" in b
+        and "fields" not in b
+        and not b["text"]["text"].startswith("```")
+    ]
+
+
+def test_slack_short_message_passes_through_in_one_section_block():
+    msg = "x" * 500
+    body = build_slack_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    sections = _section_body_texts(body)
+    assert sections == [msg]
+
+
+def test_slack_long_message_splits_across_multiple_section_blocks():
+    msg = "y" * 6000  # > Slack's 3000-char section cap
+    body = build_slack_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    sections = _section_body_texts(body)
+    assert len(sections) >= 2
+    assert all(len(s) <= 3000 for s in sections)
+    assert "".join(sections) == msg
+    assert "…" not in sections[-1]  # full text, no truncation marker
+
+
+def test_slack_message_max_chars_caps_with_ellipsis():
+    msg = "z" * 5000
+    body = build_slack_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg),
+        message_max_chars=200,
+    )
+    sections = _section_body_texts(body)
+    assert len(sections) == 1
+    assert sections[0].endswith("…")
+    assert len(sections[0]) == 200
+
+
+def test_slack_minimal_verbosity_overrides_message_max_chars():
+    """Minimal mode hides body unconditionally — even with a full-text cap."""
+    body = build_slack_message(
+        _event(message="some sensitive payload"),
+        verbosity="minimal",
+        message_max_chars=0,
+    )
+    blob = json.dumps(body)
+    assert "sensitive payload" not in blob
+
+
+def test_slack_terse_tool_summary_inlined_with_long_message():
+    """Tool summary should ride along on the last chunk in terse mode."""
+    msg = "a" * 50  # short, fits in one chunk alongside summary
+    body = build_slack_message(
+        _event(message=msg, tool_name="Bash", tool_input={"command": "echo hi"}),
+        verbosity="terse",
+    )
+    sections = _section_body_texts(body)
+    last = sections[-1]
+    assert msg in last
+    assert "*Bash:*" in last  # terse-mode tool inline
+
+
+def test_discord_short_message_single_embed():
+    msg = "hello world"
+    body = build_discord_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    assert len(body["embeds"]) == 1
+    assert msg in body["embeds"][0]["description"]
+
+
+def test_discord_long_message_splits_across_multiple_embeds():
+    msg = "q" * 9000  # > Discord's 4096-char embed description cap
+    body = build_discord_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    embeds = body["embeds"]
+    assert len(embeds) >= 2
+    assert all(len(e["description"]) <= 4096 for e in embeds)
+    descriptions = [e["description"] for e in embeds]
+    assert "".join(descriptions) == msg
+    assert not descriptions[-1].endswith("…")  # full text, no truncation
+
+
+def test_discord_continuation_embeds_inherit_color_only():
+    msg = "r" * 9000
+    body = build_discord_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    first, *rest = body["embeds"]
+    assert "title" in first
+    for cont in rest:
+        assert "title" not in cont
+        assert "fields" not in cont
+        assert cont["color"] == first["color"]
+
+
+def test_discord_message_max_chars_caps_with_ellipsis():
+    msg = "s" * 9000
+    body = build_discord_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg),
+        message_max_chars=300,
+    )
+    embeds = body["embeds"]
+    assert len(embeds) == 1
+    desc = embeds[0]["description"]
+    assert desc.endswith("…")
+    assert len(desc) == 300
+
+
+# ---------------------------------------------------------------------
+# Show more / Show less toggle (bot_token + long body)
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def expandable_store(monkeypatch, tmp_path):
+    """Redirect expandable_messages persistence at a tmp dir."""
+    from coding_agent_notifier import expandable_messages
+    store = tmp_path / "expandable_messages"
+    monkeypatch.setattr(expandable_messages, "default_dir", lambda: store)
+    return store
+
+
+def test_parse_action_id_expand():
+    p = slack_mod.parse_action_id("agent_notify_expand")
+    assert p is not None
+    assert p.toggle_kind == "expand"
+    assert p.decision is None and p.modal_kind is None
+
+
+def test_parse_action_id_collapse():
+    p = slack_mod.parse_action_id("agent_notify_collapse")
+    assert p is not None
+    assert p.toggle_kind == "collapse"
+
+
+def test_build_preview_text_returns_none_for_short_input():
+    assert slack_mod._build_preview_text("hello world", head_chars=250, tail_chars=250) is None
+
+
+def test_build_preview_text_truncates_long_input():
+    long = "head bit. " + ("filler " * 200) + "tail bit."
+    out = slack_mod._build_preview_text(long, head_chars=20, tail_chars=20)
+    assert out is not None
+    assert "…" in out
+    assert "head bit" in out
+    assert "tail bit" in out
+
+
+def test_build_preview_text_disabled_when_both_zero():
+    long = "x" * 5000
+    assert slack_mod._build_preview_text(long, head_chars=0, tail_chars=0) is None
+
+
+def _toggle_buttons(body: dict) -> list[dict]:
+    """Return the actions blocks (Show more / Show less buttons) in a payload."""
+    buttons: list[dict] = []
+    for att in body.get("attachments", []):
+        for blk in att.get("blocks", []):
+            if blk.get("type") == "actions":
+                for el in blk.get("elements", []):
+                    if isinstance(el, dict) and el.get("type") == "button":
+                        buttons.append(el)
+    return buttons
+
+
+def test_slack_long_message_with_bot_token_posts_preview_with_show_more(
+    fake_post, expandable_store,
+):
+    poster = fake_post(slack_mod, [(200, json.dumps({"ok": True, "ts": "1.23", "channel": "C123"}))])
+    long_msg = ("Lorem ipsum dolor sit amet. " * 200).strip()
+    sink = SlackSink(
+        SlackConfig(enabled=True, bot_token="xoxb-abc", channel="C123"),
+        message_preview_head_chars=80,
+        message_preview_tail_chars=80,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message=long_msg))
+
+    assert len(poster.calls) == 1
+    posted_body = poster.calls[0][1]
+    buttons = _toggle_buttons(posted_body)
+    assert len(buttons) == 1
+    assert buttons[0]["action_id"] == "agent_notify_expand"
+    assert buttons[0]["text"]["text"] == "Show more"
+
+    # The preview body should NOT contain the full message text.
+    posted_blob = json.dumps(posted_body)
+    assert long_msg not in posted_blob
+    assert "Lorem ipsum" in posted_blob  # the head survived
+
+    # The expandable_messages record should now exist with both bodies.
+    files = list(expandable_store.glob("*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["channel"] == "C123"
+    assert rec["message_ts"] == "1.23"
+    # Concatenate the section-block chunks of the full body and verify it
+    # reconstructs the original message. (Chunks split mid-text so a
+    # `long_msg in json.dumps(...)` substring check would fail on the
+    # JSON delimiters between section blocks.)
+    full_blocks = rec["full_body"]["attachments"][0]["blocks"]
+    section_texts = [
+        b["text"]["text"] for b in full_blocks
+        if b["type"] == "section" and "text" in b and "fields" not in b
+    ]
+    assert "".join(section_texts) == long_msg
+    full_buttons = _toggle_buttons(rec["full_body"])
+    assert len(full_buttons) == 1
+    assert full_buttons[0]["action_id"] == "agent_notify_collapse"
+    assert full_buttons[0]["text"]["text"] == "Show less"
+    # Both buttons carry the same message_id as their value.
+    assert buttons[0]["value"] == full_buttons[0]["value"] == rec["message_id"]
+
+
+def test_slack_short_message_with_bot_token_no_toggle_no_persistence(
+    fake_post, expandable_store,
+):
+    poster = fake_post(slack_mod, [(200, json.dumps({"ok": True, "ts": "1.23", "channel": "C123"}))])
+    sink = SlackSink(
+        SlackConfig(enabled=True, bot_token="xoxb-abc", channel="C123"),
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message="just a short body"))
+
+    assert _toggle_buttons(poster.calls[0][1]) == []
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_slack_minimal_verbosity_skips_toggle_even_on_long_body(
+    fake_post, expandable_store,
+):
+    poster = fake_post(slack_mod, [(200, json.dumps({"ok": True, "ts": "1.23", "channel": "C123"}))])
+    long_msg = "x" * 5000
+    sink = SlackSink(
+        SlackConfig(enabled=True, bot_token="xoxb-abc", channel="C123"),
+        verbosity="minimal",
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message=long_msg))
+
+    assert _toggle_buttons(poster.calls[0][1]) == []
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_slack_message_max_chars_set_skips_toggle(fake_post, expandable_store):
+    poster = fake_post(slack_mod, [(200, json.dumps({"ok": True, "ts": "1.23", "channel": "C123"}))])
+    long_msg = "y" * 5000
+    sink = SlackSink(
+        SlackConfig(enabled=True, bot_token="xoxb-abc", channel="C123"),
+        message_max_chars=500,
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message=long_msg))
+
+    assert _toggle_buttons(poster.calls[0][1]) == []
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_slack_webhook_only_skips_toggle_even_on_long_body(fake_post, expandable_store):
+    poster = fake_post(slack_mod, [(200, "ok")])
+    long_msg = "z" * 5000
+    sink = SlackSink(
+        SlackConfig(enabled=True, webhook_url="https://hook.test/x"),
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message=long_msg))
+
+    assert _toggle_buttons(poster.calls[0][1]) == []
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_slack_toggle_disabled_when_both_preview_chars_zero(fake_post, expandable_store):
+    poster = fake_post(slack_mod, [(200, json.dumps({"ok": True, "ts": "1.23", "channel": "C123"}))])
+    long_msg = "q" * 5000
+    sink = SlackSink(
+        SlackConfig(enabled=True, bot_token="xoxb-abc", channel="C123"),
+        message_preview_head_chars=0,
+        message_preview_tail_chars=0,
+    )
+    sink.send(_event(kind="turn_complete", tool_name=None, tool_input=None, message=long_msg))
+
+    assert _toggle_buttons(poster.calls[0][1]) == []
+    assert list(expandable_store.glob("*.json")) == []
+
+
+def test_discord_caps_at_ten_embeds_for_pathological_input():
+    msg = "t" * (4000 * 12)  # would need 12 chunks; cap at 10
+    body = build_discord_message(
+        _event(kind="turn_complete", tool_name=None, tool_input=None, message=msg)
+    )
+    embeds = body["embeds"]
+    assert len(embeds) == 10
+    assert embeds[-1]["description"].endswith("…")

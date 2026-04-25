@@ -140,3 +140,30 @@ def test_codex_permission_non_dict_tool_input_discarded():
     ev = codex.parse(payload)
     assert ev is not None
     assert ev.tool_input is None
+
+
+def test_claude_notification_long_message_passes_through_untruncated():
+    """Source layer no longer caps message length — the sink chunks it."""
+    long_msg = "x" * 5000
+    payload = {
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "cwd": "/tmp",
+        "message": long_msg,
+    }
+    ev = claude_code.parse(payload)
+    assert ev is not None
+    assert ev.message == long_msg
+    assert len(ev.message) == 5000
+
+
+def test_codex_long_assistant_message_passes_through_untruncated():
+    long_msg = "y" * 8000
+    payload = {
+        "type": "agent-turn-complete",
+        "last-assistant-message": long_msg,
+        "turn-id": "t-1",
+    }
+    ev = codex.parse(payload)
+    assert ev is not None
+    assert ev.message == long_msg

@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..config import DiscordConfig, Verbosity
-from ..event import Event, EventKind
+from ..event import Event, EventKind, chunk_text
 from ..tool_formatters import DEFAULT_MAX_CHARS, render
 from .base import SinkError, http_post_json
+
+# Discord embed `description` hard cap is 4096 chars (leave headroom for joins).
+_EMBED_DESC_CHUNK_SIZE = 4000
+# Discord allows up to 10 embeds per message.
+_EMBED_MAX_PER_MESSAGE = 10
 
 # Discord embed colors are decimal ints, not hex strings.
 _KIND_COLORS: dict[EventKind, int] = {
@@ -23,6 +28,7 @@ class DiscordSink:
     name: str = "discord"
     tool_input_max_chars: int = DEFAULT_MAX_CHARS
     verbosity: Verbosity = "normal"
+    message_max_chars: int = 0
 
     def send(self, event: Event) -> None:
         if not self.config.enabled:
@@ -33,6 +39,7 @@ class DiscordSink:
             event,
             max_chars=self.tool_input_max_chars,
             verbosity=self.verbosity,
+            message_max_chars=self.message_max_chars,
         )
         status, text = http_post_json(self.config.webhook_url, body)
         if status >= 300:
@@ -44,6 +51,7 @@ def build_discord_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "normal",
+    message_max_chars: int = 0,
 ) -> dict:
     if verbosity == "minimal":
         # Payload-free ping: no tool render, no danger emoji (would itself
@@ -61,27 +69,29 @@ def build_discord_message(
     danger_prefix = "🚨 " if tool.dangerous else ""
     title = f"{danger_prefix}{event.title}"
 
-    description_parts: list[str] = []
-    if event.message:
-        description_parts.append(event.message)
     summary = tool.summary
     if verbosity == "terse" and event.tool_name and summary:
         summary = f"**{event.tool_name}:** {summary}"
     elif verbosity == "terse" and event.tool_name and not event.message and not summary:
         summary = f"**{event.tool_name}**"
+
+    tail_parts: list[str] = []
     if summary:
-        description_parts.append(summary)
+        tail_parts.append(summary)
     if tool.detail:
         if tool.code_block:
             lang = tool.code_block_lang
             fence = f"```{lang}\n" if lang else "```\n"
-            description_parts.append(f"{fence}{tool.detail}\n```")
+            tail_parts.append(f"{fence}{tool.detail}\n```")
         else:
-            description_parts.append(tool.detail)
+            tail_parts.append(tool.detail)
+    tail_text = "\n\n".join(tail_parts)
 
-    embed: dict = {
+    descriptions = _build_descriptions(event.message, tail_text, message_max_chars)
+
+    first_embed: dict = {
         "title": title,
-        "description": "\n\n".join(description_parts)[:4000],
+        "description": descriptions[0] if descriptions else "",
         "color": color,
     }
 
@@ -95,13 +105,45 @@ def build_discord_message(
             fields.append({"name": "Tool", "value": event.tool_name, "inline": True})
         if event.source_app:
             fields.append({"name": "App", "value": event.source_app, "inline": True})
-        embed["fields"] = fields
+        first_embed["fields"] = fields
     else:
         footer = _terse_footer(event)
         if footer:
-            embed["footer"] = {"text": footer}
+            first_embed["footer"] = {"text": footer}
 
-    return {"embeds": [embed]}
+    embeds: list[dict] = [first_embed]
+    for cont in descriptions[1:]:
+        embeds.append({"description": cont, "color": color})
+    return {"embeds": embeds}
+
+
+def _build_descriptions(message: str, tail_text: str, message_max_chars: int) -> list[str]:
+    """Compose embed descriptions: chunked event.message followed by the tail.
+
+    The tail (tool summary + tool detail) joins onto the last message chunk if
+    it fits, else into a new continuation embed. Result is capped at 10
+    embeds; pathological overflow gets a trailing "…" on the last chunk.
+    """
+    body_chunks = chunk_text(
+        message, chunk_size=_EMBED_DESC_CHUNK_SIZE, max_chars=message_max_chars,
+    ) if message else []
+
+    descriptions: list[str] = list(body_chunks)
+    if tail_text:
+        if descriptions:
+            joined = descriptions[-1] + "\n\n" + tail_text
+            if len(joined) <= _EMBED_DESC_CHUNK_SIZE:
+                descriptions[-1] = joined
+            else:
+                descriptions.append(tail_text[:_EMBED_DESC_CHUNK_SIZE])
+        else:
+            descriptions.append(tail_text[:_EMBED_DESC_CHUNK_SIZE])
+
+    if len(descriptions) > _EMBED_MAX_PER_MESSAGE:
+        descriptions = descriptions[:_EMBED_MAX_PER_MESSAGE]
+        last = descriptions[-1]
+        descriptions[-1] = last[: _EMBED_DESC_CHUNK_SIZE - 1].rstrip() + "…"
+    return descriptions
 
 
 def _terse_footer(event: Event) -> str:

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import pending_approvals
+from . import expandable_messages, pending_approvals
 from .config import Config, SlackConfig
 from .event import Event
 from .sinks.slack import (
@@ -99,6 +99,7 @@ def handle_block_actions(
         return ButtonClickResult(False, None, None, None, None)
     decision = parsed.decision
     modal_kind = parsed.modal_kind
+    toggle_kind = parsed.toggle_kind
     modal_question_index = parsed.modal_question_index
     selected_option = parsed.selected_option
     selected_question = parsed.selected_question
@@ -122,6 +123,34 @@ def handle_block_actions(
             except Exception:
                 logger.exception("failed to send ephemeral rejection to %s", user_id)
         return ButtonClickResult(True, None, reject_reason, approval_id, user_id)
+
+    # Show more / Show less toggle: look up the persisted (preview, full)
+    # payloads and chat.update the original message in place. The button's
+    # `value` carries the message_id; `approval_id` is reused as the carrier
+    # field name but it's actually a message_id here. No resolution / no
+    # state change beyond the chat.update itself.
+    if toggle_kind is not None:
+        msg_id = action.get("value") or ""
+        rec = expandable_messages.read(msg_id)
+        if rec is None:
+            logger.info(
+                "workspace=%s payload=block_actions toggle=%s msg_id=%s rejected=unknown_toggle",
+                workspace, toggle_kind, msg_id,
+            )
+            return ButtonClickResult(True, None, "unknown_toggle", msg_id, user_id)
+        body = rec["full_body"] if toggle_kind == "expand" else rec["preview_body"]
+        rec_channel = rec.get("channel") or channel_id
+        rec_ts = rec.get("message_ts")
+        if rec_channel and rec_ts and slack_config.bot_token:
+            try:
+                update_fn(slack_config.bot_token, rec_channel, rec_ts, body)
+            except Exception:
+                logger.exception("toggle chat.update failed for msg=%s", msg_id)
+        logger.info(
+            "workspace=%s payload=block_actions toggle=%s msg_id=%s user=%s",
+            workspace, toggle_kind, msg_id, user_id,
+        )
+        return ButtonClickResult(True, None, None, msg_id, user_id)
 
     # Modal-trigger clicks: open the modal and return — the actual resolve
     # happens later when `view_submission` arrives. The `trigger_id` is
@@ -583,6 +612,16 @@ def run_daemon(config: Config, *, stop_event: threading.Event | None = None) -> 
             "Slack daemon requires at least one workspace with actionable_approvals=true "
             "plus bot_token (xoxb-*) and app_token (xapp-*)."
         )
+
+    # Opportunistic GC of stale expandable-message records on startup. Cheap
+    # (handful of file stats), and the daemon restart cadence is the natural
+    # place to reap — no separate cron / launchd needed.
+    try:
+        removed = expandable_messages.gc_stale()
+        if removed:
+            logger.info("expandable_messages gc removed %d stale record(s)", removed)
+    except Exception:
+        logger.exception("expandable_messages gc_stale failed on daemon startup")
 
     stop = stop_event or threading.Event()
     clients: list[Any] = []

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import dataclasses
 import json
-import re
+import uuid
 from dataclasses import dataclass
 
+from .. import expandable_messages, transcript
 from ..config import SlackConfig, Verbosity
-from ..event import AGENT_LABELS, Event, EventKind
+from ..event import AGENT_LABELS, Event, EventKind, chunk_text
 from ..tool_formatters import DEFAULT_MAX_CHARS, ToolRender, render
+from . import mrkdwn as _mrkdwn
 from .base import SinkError, http_post_json
+
+# Slack section-block mrkdwn hard cap is 3000 chars; leave headroom for the
+# `_mrkdwn_polish` URL/path wrappers that lengthen text slightly.
+_SECTION_CHUNK_SIZE = 2900
 
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 SLACK_AUTH_TEST_URL = "https://slack.com/api/auth.test"
@@ -32,6 +39,11 @@ CUSTOM_ANSWER_ACTION_ID_PREFIX = "agent_notify_custom_answer_"
 # modal with a single text input; the typed string becomes
 # `decision.message` on the deny path.
 DENY_REASON_ACTION_ID = "agent_notify_deny_reason"
+# In-place expand/collapse toggle on long-body messages. The button's `value`
+# carries the `message_id` that keys the `expandable_messages` record holding
+# the (preview, full) Slack payloads to swap between via chat.update.
+EXPAND_ACTION_ID = "agent_notify_expand"
+COLLAPSE_ACTION_ID = "agent_notify_collapse"
 # Modal callback_ids — daemon's view_submission handler dispatches on these.
 MODAL_CALLBACK_CUSTOM_ANSWER = "agent_notify_modal_custom_answer"
 MODAL_CALLBACK_DENY_REASON = "agent_notify_modal_deny_reason"
@@ -44,14 +56,17 @@ MODAL_INPUT_ACTION_ID = "agent_notify_modal_input_value"
 class ParsedActionId:
     """Decoded `action_id` from a Slack interactive payload.
 
-    At most one of `decision` / `modal_kind` is set; the rest of the
-    fields carry whatever index information the matched pattern encodes.
-    Daemon code in `slack_socket` consumes the result and threads the
-    fields straight into the `pending_approvals.resolve(...)` call.
+    At most one of `decision` / `modal_kind` / `toggle_kind` is set; the
+    rest of the fields carry whatever index information the matched
+    pattern encodes. Daemon code in `slack_socket` consumes the result
+    and either threads the fields into `pending_approvals.resolve(...)`
+    (decision/modal paths) or drives `expandable_messages` lookup +
+    `chat.update` (toggle path).
     """
     raw: str
     decision: str | None = None  # "allow" | "deny"
     modal_kind: str | None = None  # "custom_answer" | "deny_reason"
+    toggle_kind: str | None = None  # "expand" | "collapse"
     selected_question: int | None = None
     selected_option: int | None = None
     selected_suggestion: int | None = None
@@ -73,6 +88,8 @@ def parse_action_id(action_id: str) -> ParsedActionId | None:
       - `agent_notify_suggestion_<i>`    → allow + apply suggestion <i>
       - `agent_notify_option_<o>`        → allow + select option <o> on Q0 (legacy)
       - `agent_notify_option_<q>_<o>`    → allow + select option <o> on Q<q>
+      - `agent_notify_expand`            → swap message to full body (msg_id in `value`)
+      - `agent_notify_collapse`          → swap message to preview body (msg_id in `value`)
     """
     if action_id == APPROVE_ACTION_ID:
         return ParsedActionId(raw=action_id, decision="allow")
@@ -80,6 +97,10 @@ def parse_action_id(action_id: str) -> ParsedActionId | None:
         return ParsedActionId(raw=action_id, decision="deny")
     if action_id == DENY_REASON_ACTION_ID:
         return ParsedActionId(raw=action_id, modal_kind="deny_reason")
+    if action_id == EXPAND_ACTION_ID:
+        return ParsedActionId(raw=action_id, toggle_kind="expand")
+    if action_id == COLLAPSE_ACTION_ID:
+        return ParsedActionId(raw=action_id, toggle_kind="collapse")
     if action_id.startswith(CUSTOM_ANSWER_ACTION_ID_PREFIX):
         try:
             q_idx = int(action_id[len(CUSTOM_ANSWER_ACTION_ID_PREFIX):])
@@ -149,37 +170,97 @@ class SlackSink:
     name: str = "slack"
     tool_input_max_chars: int = DEFAULT_MAX_CHARS
     verbosity: Verbosity = "normal"
+    message_max_chars: int = 0
+    message_preview_head_chars: int = 0
+    message_preview_tail_chars: int = 0
+    workspace: str = "default"
 
     def send(self, event: Event) -> None:
         if not self.config.enabled:
             return
-        body = build_slack_message(
+        full_body = build_slack_message(
             event,
             max_chars=self.tool_input_max_chars,
             verbosity=self.verbosity,
+            message_max_chars=self.message_max_chars,
         )
         if self.config.webhook_url:
-            status, text = http_post_json(self.config.webhook_url, body)
+            # Webhooks can't chat.update, so the toggle is unavailable — post
+            # the full body and rely on Slack's auto-collapse (such as it is).
+            status, text = http_post_json(self.config.webhook_url, full_body)
             if status >= 300 or text.strip() not in ("ok", ""):
                 raise SinkError(f"Slack webhook returned {status}: {text!r}")
             return
-        if self.config.bot_token:
-            channel = self.config.channel or "@me"
-            if channel == "@me":
-                channel = _dm_target(self.config)
-            payload = {"channel": channel, **body}
-            status, text = http_post_json(
-                SLACK_POST_MESSAGE_URL,
-                payload,
-                headers={"Authorization": f"Bearer {self.config.bot_token}"},
+        if not self.config.bot_token:
+            raise SinkError("Slack sink has neither webhook_url nor bot_token configured")
+
+        # Decide whether to wrap in a Show more / Show less toggle. Skip when:
+        #   - minimal verbosity hides the body anyway,
+        #   - user set a hard cap (message_max_chars > 0) so the truncated
+        #     output is the intended final form,
+        #   - both preview budgets are 0 (toggle disabled),
+        #   - the preview snippet equals the full message (it fit, no truncation).
+        preview_text: str | None = None
+        if (
+            self.verbosity != "minimal"
+            and self.message_max_chars == 0
+            and event.message
+            and (self.message_preview_head_chars > 0 or self.message_preview_tail_chars > 0)
+        ):
+            preview_text = _build_preview_text(
+                event.message,
+                head_chars=self.message_preview_head_chars,
+                tail_chars=self.message_preview_tail_chars,
             )
-            if status >= 300:
-                raise SinkError(f"Slack API {status}: {text!r}")
-            parsed = _safe_json(text)
-            if not parsed.get("ok"):
-                raise SinkError(f"Slack API error: {parsed.get('error', text)!r}")
-            return
-        raise SinkError("Slack sink has neither webhook_url nor bot_token configured")
+
+        message_id = uuid.uuid4().hex if preview_text is not None else None
+        if message_id is not None and preview_text is not None:
+            preview_event = dataclasses.replace(event, message=preview_text)
+            preview_body = build_slack_message(
+                preview_event,
+                max_chars=self.tool_input_max_chars,
+                verbosity=self.verbosity,
+                message_max_chars=self.message_max_chars,
+            )
+            _append_block_to_first_attachment(
+                preview_body,
+                _toggle_actions_block(EXPAND_ACTION_ID, "Show more", message_id),
+            )
+            _append_block_to_first_attachment(
+                full_body,
+                _toggle_actions_block(COLLAPSE_ACTION_ID, "Show less", message_id),
+            )
+            body_to_post = preview_body
+        else:
+            body_to_post = full_body
+
+        channel = self.config.channel or "@me"
+        if channel == "@me":
+            channel = _dm_target(self.config)
+        payload = {"channel": channel, **body_to_post}
+        status, text = http_post_json(
+            SLACK_POST_MESSAGE_URL,
+            payload,
+            headers={"Authorization": f"Bearer {self.config.bot_token}"},
+        )
+        if status >= 300:
+            raise SinkError(f"Slack API {status}: {text!r}")
+        parsed = _safe_json(text)
+        if not parsed.get("ok"):
+            raise SinkError(f"Slack API error: {parsed.get('error', text)!r}")
+
+        if message_id is not None:
+            ts = parsed.get("ts")
+            posted_channel = parsed.get("channel") or channel
+            if isinstance(ts, str) and ts:
+                expandable_messages.create(
+                    message_id,
+                    workspace=self.workspace,
+                    channel=posted_channel,
+                    message_ts=ts,
+                    preview_body=body_to_post,
+                    full_body=full_body,
+                )
 
 
 def resolve_self_channel(bot_token: str, *, poster: "callable | None" = None) -> str:
@@ -222,6 +303,7 @@ def build_slack_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "normal",
+    message_max_chars: int = 0,
 ) -> dict:
     # In minimal mode we never touch `tool_input` or the tool summary, so skip
     # the render call entirely — even an in-memory DANGEROUS_BASH_PATTERNS
@@ -262,20 +344,40 @@ def build_slack_message(
             fields.append({"type": "mrkdwn", "text": f"*App:*\n{event.source_app}"})
         blocks.append({"type": "section", "fields": fields})
 
-    body = _compose_body(event, tool, verbosity)
-    if body:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": body}})
+    body_chunks = _compose_body(event, tool, verbosity, message_max_chars=message_max_chars)
+    for i, chunk in enumerate(body_chunks):
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": chunk},
+            # Tag for `_try_build_preview_body`. Slack requires unique block_ids
+            # per message, so suffix with the chunk index.
+            "block_id": f"agent_notify_body_msg_{i}",
+        })
     if tool.detail:
         if tool.code_block:
             lang = tool.code_block_lang
             fence = f"```{lang}\n" if lang else "```\n"
-            detail_text = f"{fence}{tool.detail}\n```"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"{fence}{tool.detail}\n```"},
+                "block_id": "agent_notify_body_detail_0",
+            })
         else:
-            detail_text = tool.detail
-        blocks.append(
-            {"type": "section",
-             "text": {"type": "mrkdwn", "text": detail_text}}
-        )
+            # Non-fence detail (ExitPlanMode plan, prose) — convert markdown
+            # to Slack mrkdwn and chunk across multiple section blocks if
+            # over the platform cap. Without this, a 5000-char plan would
+            # exceed Slack's 3000-char section-block limit and fail to post.
+            polished = _mrkdwn_polish(tool.detail)
+            for i, chunk in enumerate(chunk_text(
+                polished,
+                chunk_size=_SECTION_CHUNK_SIZE,
+                max_chars=message_max_chars,
+            )):
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": chunk},
+                    "block_id": f"agent_notify_body_detail_{i}",
+                })
 
     if verbosity == "terse":
         footer = _terse_footer(event)
@@ -321,20 +423,79 @@ def _build_minimal_message(event: Event) -> dict:
     }
 
 
-def _compose_body(event: Event, tool: ToolRender, verbosity: Verbosity) -> str:
-    parts = []
-    if event.message:
-        parts.append(_mrkdwn_polish(event.message))
+def _compose_body(
+    event: Event,
+    tool: ToolRender,
+    verbosity: Verbosity,
+    *,
+    message_max_chars: int = 0,
+) -> list[str]:
+    """Return the section-block body texts.
+
+    `event.message` is split across multiple chunks when over Slack's 3000-char
+    section cap (or `message_max_chars` if positive). The tool summary is
+    appended to the LAST message chunk so terse-mode `*Bash:* echo hi` styling
+    stays adjacent to the body.
+    """
     summary = tool.summary
-    # In terse mode the field block is gone, so fold the tool name into the body
-    # (`*Bash:* echo hi`) instead of relying on a separate Tool: field.
     if verbosity == "terse" and event.tool_name and summary:
         summary = f"*{event.tool_name}:* {summary}"
     elif verbosity == "terse" and event.tool_name and not event.message and not summary:
         summary = f"*{event.tool_name}*"
+
+    chunks: list[str] = []
+    if event.message:
+        chunks = chunk_text(
+            _mrkdwn_polish(event.message),
+            chunk_size=_SECTION_CHUNK_SIZE,
+            max_chars=message_max_chars,
+        )
     if summary:
-        parts.append(summary)
-    return "\n".join(parts)
+        if chunks:
+            joined = chunks[-1] + "\n" + summary
+            if len(joined) <= _SECTION_CHUNK_SIZE:
+                chunks[-1] = joined
+            else:
+                chunks.append(summary)
+        else:
+            chunks.append(summary)
+    return chunks
+
+
+def _build_preview_text(text: str, *, head_chars: int, tail_chars: int) -> str | None:
+    """Return a head…tail preview of `text`, or None if no truncation is needed.
+
+    Returns None when the message body fits within the preview budget — that's
+    the signal to `SlackSink.send` that no Show more button should be added.
+    """
+    if head_chars <= 0 and tail_chars <= 0:
+        return None
+    snippet = transcript.head_tail_snippet(text, head=head_chars, tail=tail_chars)
+    if snippet == text.strip():
+        return None
+    return snippet
+
+
+def _toggle_actions_block(action_id: str, label: str, message_id: str) -> dict:
+    """Build a single-button actions block for the Show more / Show less toggle."""
+    return {
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "action_id": action_id,
+            "text": {"type": "plain_text", "text": label, "emoji": True},
+            "value": message_id,
+        }],
+    }
+
+
+def _append_block_to_first_attachment(body: dict, block: dict) -> None:
+    """Append a block to the first attachment so the color bar stays intact."""
+    attachments = body.get("attachments") or []
+    if attachments:
+        attachments[0].setdefault("blocks", []).append(block)
+    else:
+        body.setdefault("blocks", []).append(block)
 
 
 def _terse_footer(event: Event) -> str:
@@ -349,22 +510,13 @@ def _terse_footer(event: Event) -> str:
     return " · ".join(bits)
 
 
-# Path regex excludes URL-like contexts: `/` preceded by `:`, letter, digit, or
-# backtick shouldn't become inline code. So `https://...`, `a/b` (path fragments
-# in identifiers), and already-quoted paths all pass through untouched.
-_PATH_RE = re.compile(r"(?<![`:/A-Za-z0-9])(/[^\s`<>]+)")
-_URL_RE = re.compile(r"(?<![<`])\bhttps?://\S+")
-
-
 def _mrkdwn_polish(text: str) -> str:
-    """Lightly format paths as inline code and URLs as Slack links."""
-    def _link(m: re.Match[str]) -> str:
-        url = m.group(0).rstrip(".,)")
-        host = re.sub(r"^https?://", "", url).split("/", 1)[0]
-        return f"<{url}|{host}>"
-    text = _URL_RE.sub(_link, text)
-    text = _PATH_RE.sub(lambda m: f"`{m.group(1).rstrip('.,)')}`", text)
-    return text
+    """Convert standard markdown to Slack mrkdwn (bold, italic, headings,
+    links, lists, strike) and inline-code-format any /paths/. Delegates to
+    `sinks.mrkdwn.to_slack_mrkdwn` for the markdown rules; the path rule
+    runs as part of that pipeline. Code fences and inline backticks are
+    protected so markdown syntax inside code stays literal."""
+    return _mrkdwn.to_slack_mrkdwn(text)
 
 
 _IOS_PREVIEW_MAX = 140
@@ -379,6 +531,11 @@ def _fallback_text(event: Event, tool: ToolRender, dangerous: bool, *,
     140 chars; the rich content still lives in the attachment blocks. In
     `minimal` verbosity the preview is just the event title — no command,
     no code.
+
+    The summary runs through `_mrkdwn_polish` BEFORE single-line collapse so
+    `## heading` / `**bold**` / `[link](url)` render correctly in Slack's
+    in-app preview line. Push notifications strip the markers, leaving
+    plain text on the lock screen.
     """
     if verbosity == "minimal":
         return event.title
@@ -388,7 +545,8 @@ def _fallback_text(event: Event, tool: ToolRender, dangerous: bool, *,
     bits.append(event.title)
     summary = tool.summary or event.message
     if summary:
-        bits.append(_single_line(summary, _IOS_PREVIEW_MAX))
+        polished = _mrkdwn_polish(summary)
+        bits.append(_single_line(polished, _IOS_PREVIEW_MAX))
     return " — ".join(b for b in bits if b)
 
 
@@ -853,6 +1011,7 @@ def build_approval_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
+    message_max_chars: int = 0,
     selected_options: dict[str, int] | None = None,
     freeform_answers: dict[str, str] | None = None,
 ) -> dict:
@@ -870,7 +1029,12 @@ def build_approval_message(
     Falls back to Approve/Deny if the tool isn't AskUserQuestion or the
     payload is malformed.
     """
-    body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
+    body = build_slack_message(
+        event,
+        max_chars=max_chars,
+        verbosity=verbosity,
+        message_max_chars=message_max_chars,
+    )
 
     questions = _ask_user_question_questions(event.tool_name, event.tool_input)
     if questions:
@@ -921,20 +1085,67 @@ def post_approval_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
+    message_max_chars: int = 0,
+    message_preview_head_chars: int = 0,
+    message_preview_tail_chars: int = 0,
+    workspace: str = "default",
     poster: "callable | None" = None,
 ) -> tuple[str, str]:
     """Post an approval message, return (channel_id, message_ts).
+
+    When `message_preview_head_chars + message_preview_tail_chars > 0` AND
+    the rendered body has a section block longer than that budget (e.g. an
+    ExitPlanMode plan), the toggle pair is persisted via
+    `expandable_messages.create` so the daemon can swap views on Show more /
+    Show less click. The Approve / Deny / suggestion buttons stay live in
+    both states.
 
     `poster` is injectable for tests (matches existing `_FakePoster` pattern in
     test_sinks.py). Production passes the default `http_post_json`.
     """
     if not slack_config.bot_token:
         raise SinkError("approval messages require bot_token (webhook cannot carry interactivity)")
-    body = build_approval_message(event, approval_id, max_chars=max_chars, verbosity=verbosity)
+    full_body = build_approval_message(
+        event,
+        approval_id,
+        max_chars=max_chars,
+        verbosity=verbosity,
+        message_max_chars=message_max_chars,
+    )
+
+    # Build (preview, full) pair when the body has a long section block AND
+    # the toggle isn't disabled by minimal/hard-cap/zero-budget. The toggle
+    # never activates for AskUserQuestion (its bodies are short); it's
+    # primarily for ExitPlanMode plans.
+    preview_body = None
+    message_id = None
+    if (
+        verbosity != "minimal"
+        and message_max_chars == 0
+        and (message_preview_head_chars > 0 or message_preview_tail_chars > 0)
+    ):
+        preview_candidate = _try_build_preview_body(
+            full_body,
+            head_chars=message_preview_head_chars,
+            tail_chars=message_preview_tail_chars,
+        )
+        if preview_candidate is not None:
+            message_id = uuid.uuid4().hex
+            _append_block_to_first_attachment(
+                preview_candidate,
+                _toggle_actions_block(EXPAND_ACTION_ID, "Show more", message_id),
+            )
+            _append_block_to_first_attachment(
+                full_body,
+                _toggle_actions_block(COLLAPSE_ACTION_ID, "Show less", message_id),
+            )
+            preview_body = preview_candidate
+
+    body_to_post = preview_body if preview_body is not None else full_body
     channel = slack_config.channel or "@me"
     if channel == "@me":
         channel = _dm_target(slack_config, poster=poster)
-    payload = {"channel": channel, **body}
+    payload = {"channel": channel, **body_to_post}
     _post = poster or http_post_json
     status, text = _post(
         SLACK_POST_MESSAGE_URL,
@@ -950,7 +1161,72 @@ def post_approval_message(
     posted_channel = parsed.get("channel") or channel
     if not isinstance(ts, str) or not ts:
         raise SinkError(f"Slack did not return a message ts: {text!r}")
+
+    if message_id is not None and preview_body is not None:
+        expandable_messages.create(
+            message_id,
+            workspace=workspace,
+            channel=posted_channel,
+            message_ts=ts,
+            preview_body=preview_body,
+            full_body=full_body,
+        )
     return posted_channel, ts
+
+
+def _try_build_preview_body(full_body: dict, *, head_chars: int, tail_chars: int) -> dict | None:
+    """Return a deep-copy of `full_body` with body section blocks collapsed
+    to a single head…tail snippet, when the combined body exceeds budget.
+
+    "Body" here means: the first run of consecutive section blocks tagged
+    `block_id="agent_notify_body"`, which `build_slack_message` uses for
+    both event.message chunks and non-fence tool.detail chunks. Multi-chunk
+    bodies (e.g. an 8000-char plan split across 3 section blocks) are
+    treated as one logical body and replaced by ONE elided block — not
+    "elided chunk 1 + full chunks 2 and 3", which would defeat the toggle.
+
+    Returns None when no body block exceeds budget (toggle not needed).
+    """
+    import copy as _copy
+    attachments = full_body.get("attachments") or []
+    if not attachments:
+        return None
+    blocks = attachments[0].get("blocks") or []
+
+    # Find the first run of body blocks.
+    start = -1
+    end = -1
+    for idx, blk in enumerate(blocks):
+        is_body = (
+            blk.get("type") == "section"
+            and isinstance(blk.get("block_id"), str)
+            and blk["block_id"].startswith("agent_notify_body_")
+            and "text" in blk
+        )
+        if is_body and start < 0:
+            start = idx
+            end = idx
+        elif is_body:
+            end = idx
+        elif start >= 0:
+            break  # run ended
+
+    if start < 0:
+        return None
+
+    combined = "\n\n".join(
+        blocks[i]["text"].get("text", "") for i in range(start, end + 1)
+    )
+    snippet = transcript.head_tail_snippet(combined, head=head_chars, tail=tail_chars)
+    if snippet == combined.strip():
+        return None  # body fits within budget — no toggle needed
+
+    preview = _copy.deepcopy(full_body)
+    preview_blocks = preview["attachments"][0]["blocks"]
+    # Replace the first body block with the elided snippet, drop the rest.
+    preview_blocks[start]["text"]["text"] = snippet
+    del preview_blocks[start + 1 : end + 1]
+    return preview
 
 
 def build_resolved_message(

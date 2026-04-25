@@ -25,7 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..event import Event, EventKind, truncate
+from ..event import Event, EventKind
 
 # Claude Code hook event names (as they appear in `hook_event_name`)
 _NOTIFICATION = "Notification"
@@ -57,7 +57,7 @@ def parse(payload: dict[str, Any], *, source_app: str | None = None) -> Event | 
         return Event(
             agent="claude-code",
             kind=kind,
-            message=truncate(str(msg)) if msg else "",
+            message=str(msg).strip() if msg else "",
             cwd=cwd,
             session_id=session_id,
             source_app=source_app,

@@ -452,6 +452,10 @@ def cmd_permissionrequest(
             approval_id,
             max_chars=config.tool_input_max_chars,
             verbosity=config.display.verbosity,
+            message_max_chars=config.display.message_max_chars,
+            message_preview_head_chars=config.display.message_preview_head_chars,
+            message_preview_tail_chars=config.display.message_preview_tail_chars,
+            workspace=workspace_name,
             poster=poster,
         )
         pending_approvals.set_message_ref(approval_id, channel, message_ts)
@@ -463,10 +467,14 @@ def cmd_permissionrequest(
         _emit_decision(out, "deny", reason=f"agent-notify: Slack post failed: {e}")
         return 0
 
-    record = pending_approvals.wait(
-        approval_id,
-        timeout=slack_cfg.approval_timeout_seconds,
+    # approval_timeout_seconds == 0 means "wait forever" — leave the
+    # approval pending until the user resolves it from Slack on any device,
+    # rather than auto-denying. The Slack message stays clickable.
+    wait_timeout: float | None = (
+        None if slack_cfg.approval_timeout_seconds == 0
+        else slack_cfg.approval_timeout_seconds
     )
+    record = pending_approvals.wait(approval_id, timeout=wait_timeout)
     if record is None:
         _log_event(f"PermissionRequest timed out approval_id={approval_id}")
         # Try to mark the message as timed-out; best-effort.
@@ -1142,12 +1150,17 @@ def _dispatch(event: Event, config: Config) -> None:
             slack_cfg,
             tool_input_max_chars=config.tool_input_max_chars,
             verbosity=config.display.verbosity,
+            message_max_chars=config.display.message_max_chars,
+            message_preview_head_chars=config.display.message_preview_head_chars,
+            message_preview_tail_chars=config.display.message_preview_tail_chars,
+            workspace=workspace_for(event.cwd, config),
         ))
     if discord_cfg.enabled:
         sinks.append(DiscordSink(
             discord_cfg,
             tool_input_max_chars=config.tool_input_max_chars,
             verbosity=config.display.verbosity,
+            message_max_chars=config.display.message_max_chars,
         ))
     for sink in sinks:
         try:

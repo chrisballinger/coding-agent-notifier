@@ -108,9 +108,59 @@ def test_defaults_display_and_summary():
     c = cfgmod.parse_config({})
     assert c.display.verbosity == "terse"
     assert c.display.coalesce_window_seconds == 2.5
+    assert c.display.message_max_chars == 0
     assert c.summary.enabled is True
-    assert c.summary.head_chars == 250
-    assert c.summary.tail_chars == 250
+    assert c.summary.head_chars == 2000
+    assert c.summary.tail_chars == 2000
+
+
+def test_display_message_max_chars_override():
+    c = cfgmod.parse_config({"display": {"message_max_chars": 500}})
+    assert c.display.message_max_chars == 500
+
+
+def test_display_message_max_chars_zero_accepted():
+    c = cfgmod.parse_config({"display": {"message_max_chars": 0}})
+    assert c.display.message_max_chars == 0
+
+
+def test_display_negative_message_max_chars_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": {"message_max_chars": -1}})
+
+
+def test_display_default_preview_chars():
+    c = cfgmod.parse_config({})
+    assert c.display.message_preview_head_chars == 250
+    assert c.display.message_preview_tail_chars == 250
+
+
+def test_display_preview_chars_overrides():
+    c = cfgmod.parse_config({"display": {
+        "message_preview_head_chars": 100,
+        "message_preview_tail_chars": 50,
+    }})
+    assert c.display.message_preview_head_chars == 100
+    assert c.display.message_preview_tail_chars == 50
+
+
+def test_display_preview_chars_zero_accepted():
+    c = cfgmod.parse_config({"display": {
+        "message_preview_head_chars": 0,
+        "message_preview_tail_chars": 0,
+    }})
+    assert c.display.message_preview_head_chars == 0
+    assert c.display.message_preview_tail_chars == 0
+
+
+def test_display_negative_preview_head_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": {"message_preview_head_chars": -1}})
+
+
+def test_display_negative_preview_tail_rejected():
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.parse_config({"display": {"message_preview_tail_chars": -1}})
 
 
 def test_display_overrides():

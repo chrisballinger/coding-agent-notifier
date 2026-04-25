@@ -59,3 +59,29 @@ def truncate(text: str, limit: int = 200) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def chunk_text(text: str, *, chunk_size: int, max_chars: int = 0) -> list[str]:
+    """Split `text` into chunks of <= `chunk_size` chars.
+
+    `chunk_size` is the platform hard limit (Slack section block: 3000,
+    Discord embed description: 4096). `max_chars` is the user-set total-length
+    cap from config — 0 means "no user cap, only the platform limit applies".
+    The cap is inclusive of the trailing "…", matching `truncate()`, so e.g.
+    `max_chars=200` produces output whose chunks sum to at most 200 chars.
+
+    Returns `[]` for empty/whitespace-only input.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    truncated = max_chars > 0 and len(text) > max_chars
+    keep = text[: max_chars - 1] if truncated else text
+    chunks = [keep[i : i + chunk_size] for i in range(0, len(keep), chunk_size)]
+    if truncated:
+        last = chunks[-1]
+        if len(last) >= chunk_size:
+            chunks[-1] = last[:-1] + "…"
+        else:
+            chunks[-1] = last + "…"
+    return chunks

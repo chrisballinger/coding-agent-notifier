@@ -64,6 +64,15 @@ def test_exit_plan_mode_extracts_title():
     assert r.dangerous is False
 
 
+def test_exit_plan_mode_does_not_use_code_block():
+    """Plan body is prose markdown, not code — must NOT be wrapped in a
+    fence. The downstream markdown→mrkdwn converter formats bold/headings/
+    links inside the rendered section block."""
+    plan = "# Plan\n\nSome **bold** in the body."
+    r = render("ExitPlanMode", {"plan": plan})
+    assert r.code_block is False
+
+
 def test_exit_plan_mode_without_heading_uses_first_line():
     plan = "No heading here.\nSecond paragraph."
     r = render("ExitPlanMode", {"plan": plan})

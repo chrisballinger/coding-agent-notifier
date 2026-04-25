@@ -55,12 +55,23 @@ def test_actionable_approvals_requires_app_token():
         ))
 
 
-def test_approval_timeout_must_be_positive():
+def test_approval_timeout_zero_means_wait_forever():
+    """0 is the explicit "no timeout — leave the approval pending forever"
+    sentinel. Only negative values are rejected."""
+    cfg = parse_config(_ws(
+        enabled=True,
+        bot_token="xoxb",
+        approval_timeout_seconds=0,
+    ))
+    assert cfg.slack.approval_timeout_seconds == 0.0
+
+
+def test_approval_timeout_must_not_be_negative():
     with pytest.raises(ConfigError, match="approval_timeout_seconds"):
         parse_config(_ws(
             enabled=True,
             bot_token="xoxb",
-            approval_timeout_seconds=0,
+            approval_timeout_seconds=-1,
         ))
 
 

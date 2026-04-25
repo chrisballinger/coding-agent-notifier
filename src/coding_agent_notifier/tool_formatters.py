@@ -90,8 +90,14 @@ def _render_exit_plan_mode(tool_input: dict[str, Any], max_chars: int) -> ToolRe
     if body.startswith("#"):
         # drop the first line (heading) from the detail teaser
         body = body.split("\n", 1)[1] if "\n" in body else ""
-    detail = truncate(body.strip(), max_chars) if body.strip() else None
-    return ToolRender(summary=summary, detail=detail)
+    # Plan body is prose markdown — pass it through full-length so the
+    # downstream Show more / Show less toggle (in `post_approval_message`)
+    # can elide it on its own terms, not pre-truncated to `max_chars`
+    # (which is sized for Bash/Edit commands and would defeat the toggle).
+    # `build_slack_message` chunks long non-fence details across multiple
+    # section blocks, so very long plans are still posted in one piece.
+    detail = body.strip() or None
+    return ToolRender(summary=summary, detail=detail, code_block=False)
 
 
 def _render_file_edit(tool_input: dict[str, Any], max_chars: int) -> ToolRender:
@@ -241,7 +247,10 @@ def _one_line(text: str, max_chars: int) -> str:
     return truncate(first, max_chars)
 
 
-_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+# Match any markdown heading level (# through ######) so a plan starting
+# with "## Summary" still produces the title "Summary" rather than falling
+# through to `_one_line` (which keeps the literal `## ` prefix in the title).
+_H1_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
 
 def _first_heading(markdown: str) -> str | None:

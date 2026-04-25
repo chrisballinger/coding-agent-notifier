@@ -71,13 +71,32 @@ class DisplayConfig:
     # Seconds to hold a `turn_complete` ping before dispatching so that a
     # follow-up `idle_prompt` can cancel it. 0 disables coalescing.
     coalesce_window_seconds: float = 2.5
+    # Optional hard cap (chars) on the agent's message body in Slack/Discord
+    # output. 0 = full text — only platform limits (Slack section: 3000,
+    # Discord embed description: 4096) apply, and we split across multiple
+    # blocks/embeds so the Slack client's auto-collapse handles long bodies.
+    message_max_chars: int = 0
+    # Head + tail chars to keep when a long message is collapsed behind a
+    # Slack "Show more" button. The button only appears when the full body
+    # exceeds `head + tail + 5` chars (matching `transcript.head_tail_snippet`'s
+    # "no-op if short" threshold). Set either to 0 to disable that side; set
+    # both to 0 to disable the toggle entirely (always post the full body).
+    # Only applies to Slack with a bot_token — webhooks can't chat.update.
+    message_preview_head_chars: int = 250
+    message_preview_tail_chars: int = 250
 
 
 @dataclass(frozen=True)
 class SummaryConfig:
     enabled: bool = True
-    head_chars: int = 250
-    tail_chars: int = 250
+    # Soft cap on the transcript snippet that becomes `event.message` for
+    # turn_complete / idle_prompt events. Sized larger than the default
+    # `display.message_preview_*` budgets so the Show more / Show less
+    # toggle has headroom to elide and expand. Set both to small values to
+    # restore aggressive pre-truncation; set both to very large values to
+    # effectively disable summary truncation (toggle then handles all UX).
+    head_chars: int = 2000
+    tail_chars: int = 2000
 
 
 _SLACK_FIELD_KEYS = frozenset({
@@ -351,8 +370,12 @@ def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> S
                     "can click Approve. An empty allowlist is only allowed "
                     "when channel is '@me' (DM with the bot)."
                 )
-    if cfg.approval_timeout_seconds <= 0:
-        raise ConfigError(f"{context}.approval_timeout_seconds must be > 0")
+    if cfg.approval_timeout_seconds < 0:
+        raise ConfigError(
+            f"{context}.approval_timeout_seconds must be >= 0 "
+            f"(0 = wait forever — leave the approval open until resolved from "
+            f"Slack on any device)"
+        )
     return cfg
 
 
@@ -487,16 +510,34 @@ def parse_config(raw: dict[str, Any]) -> Config:
     coalesce_window = float(display_raw.get("coalesce_window_seconds", 2.5))
     if coalesce_window < 0:
         raise ConfigError(f"display.coalesce_window_seconds must be >= 0, got {coalesce_window}")
+    message_max_chars = int(display_raw.get("message_max_chars", 0))
+    if message_max_chars < 0:
+        raise ConfigError(
+            f"display.message_max_chars must be >= 0 (0 = full), got {message_max_chars}"
+        )
+    preview_head = int(display_raw.get("message_preview_head_chars", 250))
+    if preview_head < 0:
+        raise ConfigError(
+            f"display.message_preview_head_chars must be >= 0, got {preview_head}"
+        )
+    preview_tail = int(display_raw.get("message_preview_tail_chars", 250))
+    if preview_tail < 0:
+        raise ConfigError(
+            f"display.message_preview_tail_chars must be >= 0, got {preview_tail}"
+        )
     display = DisplayConfig(
         verbosity=verbosity,  # type: ignore[arg-type]
         coalesce_window_seconds=coalesce_window,
+        message_max_chars=message_max_chars,
+        message_preview_head_chars=preview_head,
+        message_preview_tail_chars=preview_tail,
     )
 
     summary_raw = raw.get("summary", {}) or {}
     if not isinstance(summary_raw, dict):
         raise ConfigError("summary must be a table")
-    head_chars = int(summary_raw.get("head_chars", 250))
-    tail_chars = int(summary_raw.get("tail_chars", 250))
+    head_chars = int(summary_raw.get("head_chars", 2000))
+    tail_chars = int(summary_raw.get("tail_chars", 2000))
     if head_chars < 0 or tail_chars < 0:
         raise ConfigError("summary.head_chars and summary.tail_chars must be >= 0")
     summary = SummaryConfig(
@@ -631,11 +672,21 @@ verbosity = "terse"           # terse | normal | minimal
                                #             Slack/Discord. Use this in compliance-sensitive
                                #             or shared-channel environments.
 coalesce_window_seconds = 2.5  # hold turn_complete this long so a follow-up idle_prompt can cancel it. 0 disables.
+message_max_chars = 0          # 0 = full text. Slack/Discord clients auto-collapse long messages;
+                               # we split across blocks/embeds when over platform limits (Slack 3000,
+                               # Discord 4096). Set a positive int to hard-cap the message body.
+message_preview_head_chars = 250  # Slack only (bot_token, not webhook). When the body is longer than
+message_preview_tail_chars = 250  # head+tail+5, post a head…tail preview + a "Show more" button that
+                                  # rewrites the message in place to the full body. Set both to 0 to
+                                  # disable; ignored when verbosity="minimal" or message_max_chars>0.
 
 [summary]
 enabled = true                 # include a head/tail snippet of the agent's last message on turn_complete
-head_chars = 250
-tail_chars = 250
+head_chars = 2000              # Soft cap on the snippet that becomes event.message. Sized larger than
+tail_chars = 2000              # display.message_preview_*chars so the Slack Show more / Show less toggle
+                                # has room to elide and expand. Set both small (e.g. 250/250) to restore
+                                # aggressive pre-truncation; set both very large to defer all UX
+                                # truncation to the toggle.
 
 # --- Slack workspaces ----------------------------------------------------
 #
@@ -658,7 +709,12 @@ tail_chars = 250
 # actionable_approvals = true                   # block PermissionRequest, inject decision
 # approver_user_ids = ["U0YOURID"]              # wizard fills this in automatically
 # approver_user_groups = ["S01OPSTEAM"]         # optional: allow a Slack usergroup
-# approval_timeout_seconds = 300                # hook fails closed (deny) after timeout
+# approval_timeout_seconds = 300                # hook fails closed (deny) after timeout.
+#                                                 # Set to 0 to wait forever — the approval
+#                                                 # stays pending until resolved from Slack on
+#                                                 # any device (no auto-deny). Note: Claude
+#                                                 # Code's own hook timeout (in settings.json)
+#                                                 # also caps how long the subprocess can wait.
 #
 # Empty allowlist (no approver_user_ids, no approver_user_groups) is only
 # accepted when `channel = "@me"` — the daemon double-checks at click time

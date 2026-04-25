@@ -299,20 +299,27 @@ def read(approval_id: str, *, base_dir: Path | None = None) -> dict | None:
 def wait(
     approval_id: str,
     *,
-    timeout: float,
+    timeout: float | None,
     base_dir: Path | None = None,
     poll_interval: float = 1.0,
 ) -> dict | None:
-    """Block up to `timeout` seconds for a decision. Returns the resolved
-    record dict (caller reads `decision`, `selected_option_index`, `actor`,
-    etc.) or None on timeout. Polls the record file in addition to
-    select'ing on the FIFO so we recover if the daemon wrote the decision
-    before the FIFO open (race) or if the FIFO write was dropped (ENXIO)."""
+    """Block until a decision arrives, returning the resolved record dict.
+
+    `timeout` is the wait budget in seconds; pass `None` to wait forever
+    (no deadline — useful when the user wants the approval to remain
+    pending until manually resolved from any device, rather than failing
+    closed). Returns `None` only when a finite timeout elapses without a
+    decision.
+
+    Polls the record file in addition to select'ing on the FIFO so we
+    recover if the daemon wrote the decision before the FIFO open (race)
+    or if the FIFO write was dropped (ENXIO).
+    """
     fifo = _fifo_path(approval_id, base_dir)
     if not fifo.exists():
         fifo.parent.mkdir(parents=True, exist_ok=True)
         os.mkfifo(fifo, 0o600)
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     fd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
     try:
         while True:
@@ -320,10 +327,14 @@ def wait(
             rec = read(approval_id, base_dir=base_dir)
             if rec and rec.get("decision") in ("allow", "deny"):
                 return rec
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            ready, _, _ = select.select([fd], [], [], min(remaining, poll_interval))
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                select_timeout = min(remaining, poll_interval)
+            else:
+                select_timeout = poll_interval
+            ready, _, _ = select.select([fd], [], [], select_timeout)
             if ready:
                 try:
                     os.read(fd, 64)
