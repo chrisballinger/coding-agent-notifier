@@ -47,6 +47,14 @@ features:
   bot_user:
     display_name: agent-notify
     always_online: true
+  app_home:
+    # Enable the Messages tab so the no-approver fallback DM (bot DMing
+    # itself) is at least visible in the bot's "Messages" pane. Without
+    # this, chat.postMessage to the bot's own user_id returns ok:true but
+    # the message is functionally dropped — invisible to the user.
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
 
 oauth_config:
   scopes:

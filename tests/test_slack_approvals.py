@@ -98,24 +98,65 @@ def test_post_approval_message_returns_channel_and_ts():
     assert poster.calls[0]["headers"]["Authorization"] == "Bearer xoxb-test"
 
 
-def test_post_approval_message_resolves_self_when_channel_is_me():
-    cfg = SlackConfig(enabled=True, bot_token="xoxb-test", channel="@me", interactive=True)
-    # Two HTTP calls: auth.test then chat.postMessage.
+def test_post_approval_message_dms_installing_user_when_channel_is_me():
+    """`@me` resolves to approver_user_ids[0] (the installing user) — NOT the
+    bot's own user_id from auth.test. Posting to the installing user's id
+    opens a real DM thread; posting to the bot's id lands in App Home and is
+    invisible without the messages_tab manifest flag.
+
+    auth.test must NOT be called when approvers are configured.
+    """
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-test",
+        channel="@me",
+        interactive=True,
+        approver_user_ids=("U_USER",),
+    )
+
+    class _SeqPoster:
+        def __init__(self):
+            self.calls: list[dict] = []
+        def __call__(self, url, payload, *, headers=None, timeout=10.0):
+            self.calls.append({"url": url, "payload": payload})
+            return 200, json.dumps({"ok": True, "ts": "2.0", "channel": "U_USER"})
+
+    poster = _SeqPoster()
+    channel, ts = post_approval_message(_event(), cfg, "appr-1", poster=poster)
+    assert channel == "U_USER"
+    # Single call to chat.postMessage — auth.test is bypassed.
+    assert len(poster.calls) == 1
+    assert poster.calls[0]["url"].endswith("/chat.postMessage")
+    assert poster.calls[0]["payload"]["channel"] == "U_USER"
+
+
+def test_post_approval_message_falls_back_to_self_when_no_approvers():
+    """With approvers empty (degraded "DM-only-no-allowlist" mode), `@me`
+    falls back to the bot's own user_id via auth.test. This lands in App
+    Home Messages tab — visible only with the manifest flag enabled.
+    """
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-test",
+        channel="@me",
+        interactive=True,
+        approver_user_ids=(),  # empty — fallback path
+    )
+
     class _SeqPoster:
         def __init__(self):
             self.calls: list[dict] = []
         def __call__(self, url, payload, *, headers=None, timeout=10.0):
             self.calls.append({"url": url, "payload": payload})
             if url.endswith("/auth.test"):
-                return 200, json.dumps({"ok": True, "user_id": "U_SELF"})
-            return 200, json.dumps({"ok": True, "ts": "2.0", "channel": "U_SELF"})
+                return 200, json.dumps({"ok": True, "user_id": "U_BOT"})
+            return 200, json.dumps({"ok": True, "ts": "2.0", "channel": "U_BOT"})
+
     poster = _SeqPoster()
     channel, ts = post_approval_message(_event(), cfg, "appr-1", poster=poster)
-    assert channel == "U_SELF"
-    # First call resolved the self channel.
+    assert channel == "U_BOT"
     assert poster.calls[0]["url"].endswith("/auth.test")
-    # Second call targeted the resolved user id.
-    assert poster.calls[1]["payload"]["channel"] == "U_SELF"
+    assert poster.calls[1]["payload"]["channel"] == "U_BOT"
 
 
 def test_post_approval_message_requires_bot_token():

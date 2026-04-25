@@ -115,6 +115,8 @@ enabled = false
 
 The interactive setup wizard (`agent-notify slack add`) writes this block for you, stores tokens in macOS Keychain, and verifies via Slack's `auth.test`. Run it once per workspace — multi-workspace is supported by naming each block `[slack.workspaces.<name>]` and referencing names from `[[routes]]`. Legacy `[sinks.slack]` still parses as the implicit `default` workspace for backwards compatibility.
 
+> **Migration note (existing Slack App installs):** the bundled manifest (`docs/slack-app-manifest.yaml`) now declares an `app_home` block with `messages_tab_enabled: true` so the no-approver fallback DM is visible. If your Slack App was created from an earlier version of the manifest, either re-create it from the updated YAML *or* enable the toggle manually: in your Slack App's admin, **App Home** → switch **Messages Tab** on. Without this, posts to the bot's own user_id (the fallback when `approver_user_ids` is empty) return `ok: true` but are functionally invisible.
+
 ### Phone-first defaults
 
 On iOS the push preview is tight, so the default layout is optimized for a glance:

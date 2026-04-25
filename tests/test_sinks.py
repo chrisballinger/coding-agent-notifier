@@ -20,6 +20,7 @@ from coding_agent_notifier.sinks.slack import (
     SlackSink,
     _KIND_COLORS as SLACK_COLORS,
     _DANGER_COLOR as SLACK_DANGER,
+    _dm_target,
     build_slack_message,
     resolve_self_channel,
 )
@@ -303,6 +304,52 @@ def test_resolve_self_channel_http_error(fake_post):
     fake_post(slack_mod, [(500, "nope")])
     with pytest.raises(sink_base.SinkError):
         resolve_self_channel("xoxb-abc")
+
+
+def test_dm_target_prefers_first_approver():
+    """`@me` should DM the installing user (first approver), not the bot."""
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-abc",
+        approver_user_ids=("U_USER", "U_OTHER"),
+    )
+    # No poster needed — auth.test must NOT be called when approvers exist.
+    def forbidden(*args, **kwargs):
+        raise AssertionError("auth.test should not be called when approvers are set")
+    assert _dm_target(cfg, poster=forbidden) == "U_USER"
+
+
+def test_dm_target_falls_back_to_auth_test_when_no_approvers():
+    """Empty approvers → resolve via auth.test (degraded App Home mode)."""
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-abc",
+        approver_user_ids=(),
+    )
+    calls: list[dict] = []
+
+    def poster(url, payload, *, headers=None, timeout=10.0):
+        calls.append({"url": url})
+        return 200, json.dumps({"ok": True, "user_id": "U_BOT"})
+
+    assert _dm_target(cfg, poster=poster) == "U_BOT"
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/auth.test")
+
+
+def test_dm_target_propagates_resolve_self_channel_errors():
+    """A failing auth.test in the fallback path must surface as SinkError."""
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-abc",
+        approver_user_ids=(),
+    )
+
+    def poster(url, payload, *, headers=None, timeout=10.0):
+        return 500, "boom"
+
+    with pytest.raises(sink_base.SinkError):
+        _dm_target(cfg, poster=poster)
 
 
 # --- Discord sink ---

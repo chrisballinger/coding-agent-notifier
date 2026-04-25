@@ -49,7 +49,7 @@ class SlackSink:
         if self.config.bot_token:
             channel = self.config.channel or "@me"
             if channel == "@me":
-                channel = resolve_self_channel(self.config.bot_token)
+                channel = _dm_target(self.config)
             payload = {"channel": channel, **body}
             status, text = http_post_json(
                 SLACK_POST_MESSAGE_URL,
@@ -79,6 +79,25 @@ def resolve_self_channel(bot_token: str, *, poster: "callable | None" = None) ->
     if not parsed.get("ok") or not parsed.get("user_id"):
         raise SinkError(f"Slack auth.test error: {parsed.get('error', text)!r}")
     return parsed["user_id"]
+
+
+def _dm_target(slack_config: SlackConfig, *, poster: "callable | None" = None) -> str:
+    """Resolve `channel = "@me"` to a user_id for chat.postMessage.
+
+    Prefer ``approver_user_ids[0]`` — the installing user, populated by the
+    wizard. Posting to a user_id opens a 1:1 DM with that user (Slack
+    auto-creates the IM channel) so the message arrives as a normal DM
+    ping.
+
+    Fall back to the bot's own user_id via ``auth.test`` only when no
+    approvers are configured. That lands in the bot's App Home Messages
+    tab (visible only with the ``messages_tab_enabled`` manifest flag) —
+    a degraded mode for users who deliberately use the
+    DM-only-no-allowlist setup.
+    """
+    if slack_config.approver_user_ids:
+        return slack_config.approver_user_ids[0]
+    return resolve_self_channel(slack_config.bot_token, poster=poster)
 
 
 def build_slack_message(
@@ -335,7 +354,7 @@ def post_approval_message(
     body = build_approval_message(event, approval_id, max_chars=max_chars, verbosity=verbosity)
     channel = slack_config.channel or "@me"
     if channel == "@me":
-        channel = resolve_self_channel(slack_config.bot_token, poster=poster)
+        channel = _dm_target(slack_config, poster=poster)
     payload = {"channel": channel, **body}
     _post = poster or http_post_json
     status, text = _post(

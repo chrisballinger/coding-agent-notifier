@@ -293,11 +293,11 @@ def test_workspace(
         return False, f"workspace {name!r} has no resolved bot_token"
     channel = ws.channel or "@me"
     if channel == "@me":
-        from .sinks.slack import resolve_self_channel, SinkError
+        from .sinks.slack import _dm_target, SinkError
         try:
-            channel = resolve_self_channel(ws.bot_token, poster=poster)
+            channel = _dm_target(ws, poster=poster)
         except SinkError as e:
-            return False, f"resolve_self_channel failed: {e}"
+            return False, f"_dm_target failed: {e}"
     payload = {
         "channel": channel,
         "text": f":wave: agent-notify smoke test — workspace={name}",
