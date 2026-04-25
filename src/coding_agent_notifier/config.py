@@ -56,7 +56,7 @@ class SlackConfig:
     # shared channel. For a private DM with the bot, set your own user ID.
     approver_user_ids: tuple[str, ...] = ()
     approver_user_groups: tuple[str, ...] = ()
-    approval_timeout_seconds: float = 600.0
+    approval_timeout_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -293,10 +293,9 @@ def _looks_like_inline_secret(text: str, key: str) -> bool:
 
 
 def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> SlackConfig:
-    """Parse a single Slack workspace block (either legacy `[sinks.slack]` or
-    a `[slack.workspaces.<name>]` entry). Validates feature prerequisites so
-    an enabled-but-unconfigured workspace fails at parse time, not at first
-    dispatch."""
+    """Parse a single `[slack.workspaces.<name>]` entry. Validates feature
+    prerequisites so an enabled-but-unconfigured workspace fails at parse
+    time, not at first dispatch."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{context} must be a table")
     cfg = SlackConfig(
@@ -315,7 +314,7 @@ def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> S
             raw.get("approver_user_groups", []),
             field=f"{context}.approver_user_groups",
         ),
-        approval_timeout_seconds=float(raw.get("approval_timeout_seconds", 600.0)),
+        approval_timeout_seconds=float(raw.get("approval_timeout_seconds", 300.0)),
     )
     if cfg.enabled and not (cfg.webhook_url or cfg.bot_token):
         raise ConfigError(f"{context} is enabled but has no webhook_url or bot_token")
@@ -358,19 +357,22 @@ def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> S
 
 
 def _parse_slack_workspaces(raw: dict[str, Any]) -> dict[str, SlackConfig]:
-    """Parse Slack workspaces from both legacy `[sinks.slack]` (→ "default")
-    AND new `[slack.workspaces.<name>]` blocks.
+    """Parse Slack workspaces from `[slack.workspaces.<name>]` blocks.
 
-    Defining BOTH `[sinks.slack]` and `[slack.workspaces.default]` is an
-    error — the legacy block implicitly names the default, so having both
-    is ambiguous. Pick one.
+    The pre-v0.1 alias `[sinks.slack]` is no longer accepted — if it's
+    present, raise a ConfigError that points at the new shape.
     """
     sinks = raw.get("sinks", {}) or {}
     if not isinstance(sinks, dict):
         raise ConfigError("sinks must be a table")
-    legacy_raw = sinks.get("slack", {}) or {}
-    if not isinstance(legacy_raw, dict):
-        raise ConfigError("sinks.slack must be a table")
+    legacy_raw = sinks.get("slack")
+    if legacy_raw:
+        raise ConfigError(
+            "[sinks.slack] is no longer supported. Rename it to "
+            "[slack.workspaces.default] (top-level `slack.workspaces.<name>` "
+            "block). The wizard `agent-notify slack add` writes the new shape "
+            "for you. See README §Slack."
+        )
 
     slack_top = raw.get("slack", {}) or {}
     if not isinstance(slack_top, dict):
@@ -379,23 +381,12 @@ def _parse_slack_workspaces(raw: dict[str, Any]) -> dict[str, SlackConfig]:
     if not isinstance(workspaces_raw, dict):
         raise ConfigError("slack.workspaces must be a table")
 
-    has_legacy = bool(legacy_raw)
-    has_new_default = "default" in workspaces_raw
-    if has_legacy and has_new_default:
-        raise ConfigError(
-            "both [sinks.slack] and [slack.workspaces.default] are defined. "
-            "Pick one — [sinks.slack] is implicitly the default workspace, so "
-            "defining both is ambiguous. Drop [sinks.slack] or rename one."
-        )
-
     workspaces: dict[str, SlackConfig] = {}
-    if has_legacy:
-        workspaces["default"] = _parse_slack_workspace(
-            "default", legacy_raw, context="sinks.slack"
-        )
     for name, ws_raw in workspaces_raw.items():
         if not isinstance(name, str) or not name:
             raise ConfigError("slack.workspaces keys must be non-empty strings")
+        if not isinstance(ws_raw, dict):
+            raise ConfigError(f"slack.workspaces.{name} must be a table")
         workspaces[name] = _parse_slack_workspace(
             name, ws_raw, context=f"slack.workspaces.{name}"
         )
@@ -667,7 +658,7 @@ tail_chars = 250
 # actionable_approvals = true                   # block PermissionRequest, inject decision
 # approver_user_ids = ["U0YOURID"]              # wizard fills this in automatically
 # approver_user_groups = ["S01OPSTEAM"]         # optional: allow a Slack usergroup
-# approval_timeout_seconds = 600                # hook fails closed (deny) after timeout
+# approval_timeout_seconds = 300                # hook fails closed (deny) after timeout
 #
 # Empty allowlist (no approver_user_ids, no approver_user_groups) is only
 # accepted when `channel = "@me"` — the daemon double-checks at click time
@@ -675,9 +666,9 @@ tail_chars = 250
 # shared channels can never rubber-stamp tool calls. Any shared/public
 # channel requires an explicit allowlist.
 #
-# For webhook-only pings (no buttons, no approvals), the simpler shape still
-# works:
-# [sinks.slack]                                  # == [slack.workspaces.default]
+# For webhook-only pings (no buttons, no approvals), the same block works
+# with just a webhook URL:
+# [slack.workspaces.default]
 # enabled = true
 # webhook_url = "https://hooks.slack.com/services/…"
 

@@ -6,16 +6,47 @@ build-backend = "hatchling.build"
 name = "coding-agent-notifier"
 version = "0.1.0"
 description = "Slack (and more) pings when a coding agent needs your attention and you're away from the keyboard."
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Chris Ballinger" }]
+keywords = [
+    "claude-code",
+    "codex",
+    "slack",
+    "discord",
+    "notifications",
+    "macos",
+    "agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Communications :: Chat",
+]
 dependencies = [
     "tomlkit>=0.12",
 ]
 
+[project.urls]
+Homepage = "https://github.com/chrisballinger/coding-agent-notifier"
+Repository = "https://github.com/chrisballinger/coding-agent-notifier"
+Issues = "https://github.com/chrisballinger/coding-agent-notifier/issues"
+Changelog = "https://github.com/chrisballinger/coding-agent-notifier/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 # Interactive Slack bot (chat.postMessage + Socket Mode). Only needed when
-# [sinks.slack] has interactive=true or actionable_approvals=true.
+# any [slack.workspaces.<name>] block has interactive=true or
+# actionable_approvals=true.
 slack-bot = ["slack-sdk>=3.27"]
 
 [project.scripts]

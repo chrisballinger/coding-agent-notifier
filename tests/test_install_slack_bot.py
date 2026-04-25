@@ -146,6 +146,9 @@ def test_install_slack_bot_writes_launchd_plist(tmp_path: Path):
     # Supervised: restarts on crash, starts on login.
     assert "<key>KeepAlive</key>" in content
     assert "<key>RunAtLoad</key>" in content
+    # Throttle restart rate so a fast-failing daemon can't fork-bomb.
+    assert "<key>ThrottleInterval</key>" in content
+    assert "<integer>10</integer>" in content
 
 
 def test_install_slack_bot_resolves_absolute_binary_path(tmp_path: Path, monkeypatch):

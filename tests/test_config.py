@@ -39,7 +39,7 @@ gating = "always"
 [events.turn_complete]
 enabled = false
 
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hooks.slack.com/services/X/Y/Z"
 
@@ -81,7 +81,9 @@ def test_invalid_event_gating_rejected():
 
 def test_slack_enabled_without_credentials_rejected():
     with pytest.raises(cfgmod.ConfigError):
-        cfgmod.parse_config({"sinks": {"slack": {"enabled": True}}})
+        cfgmod.parse_config(
+            {"slack": {"workspaces": {"default": {"enabled": True}}}}
+        )
 
 
 def test_default_config_path_uses_dot_dir(monkeypatch, tmp_path: Path):

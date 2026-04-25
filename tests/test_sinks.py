@@ -22,8 +22,78 @@ from coding_agent_notifier.sinks.slack import (
     _DANGER_COLOR as SLACK_DANGER,
     _dm_target,
     build_slack_message,
+    parse_action_id,
     resolve_self_channel,
 )
+
+
+# ---------------------------------------------------------------------
+# parse_action_id — wire schema is back-compat critical, lock it in
+# ---------------------------------------------------------------------
+
+
+def test_parse_action_id_approve():
+    p = parse_action_id("agent_notify_approve")
+    assert p is not None and p.decision == "allow"
+    assert p.modal_kind is None and p.selected_suggestion is None
+
+
+def test_parse_action_id_deny():
+    p = parse_action_id("agent_notify_deny")
+    assert p is not None and p.decision == "deny"
+
+
+def test_parse_action_id_deny_reason_modal():
+    p = parse_action_id("agent_notify_deny_reason")
+    assert p is not None
+    assert p.decision is None
+    assert p.modal_kind == "deny_reason"
+
+
+def test_parse_action_id_custom_answer_modal_carries_question_index():
+    p = parse_action_id("agent_notify_custom_answer_2")
+    assert p is not None
+    assert p.modal_kind == "custom_answer"
+    assert p.modal_question_index == 2
+
+
+def test_parse_action_id_suggestion_carries_index():
+    p = parse_action_id("agent_notify_suggestion_3")
+    assert p is not None
+    assert p.decision == "allow"
+    assert p.selected_suggestion == 3
+
+
+def test_parse_action_id_option_legacy_single_question():
+    # Legacy single-Q encoding: agent_notify_option_<o> → Q0, option <o>.
+    p = parse_action_id("agent_notify_option_4")
+    assert p is not None
+    assert p.decision == "allow"
+    assert p.selected_question == 0
+    assert p.selected_option == 4
+
+
+def test_parse_action_id_option_multi_question():
+    p = parse_action_id("agent_notify_option_2_5")
+    assert p is not None
+    assert p.decision == "allow"
+    assert p.selected_question == 2
+    assert p.selected_option == 5
+
+
+def test_parse_action_id_returns_none_for_unknown_pattern():
+    assert parse_action_id("not_ours") is None
+    assert parse_action_id("") is None
+    assert parse_action_id("agent_notify_unknown") is None
+
+
+def test_parse_action_id_returns_none_for_malformed_suffix():
+    # Non-integer suffix on suggestion / custom_answer / option → drop.
+    assert parse_action_id("agent_notify_suggestion_abc") is None
+    assert parse_action_id("agent_notify_custom_answer_xy") is None
+    assert parse_action_id("agent_notify_option_a_b") is None
+    # Three-part option suffix is over-shape → drop.
+    assert parse_action_id("agent_notify_option_1_2_3") is None
 
 
 def _event(**kw) -> Event:

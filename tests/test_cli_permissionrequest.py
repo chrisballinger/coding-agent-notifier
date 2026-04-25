@@ -483,6 +483,51 @@ def test_permissionrequest_emits_updated_permissions_for_suggestion(tmp_path, mo
     assert "updatedInput" not in decision
 
 
+def test_validate_permission_suggestions_accepts_well_formed_entry():
+    valid = [{
+        "type": "addRules",
+        "behavior": "allow",
+        "destination": "localSettings",
+        "rules": [{"toolName": "Bash", "ruleContent": "npm test"}],
+    }]
+    out = cli._validate_permission_suggestions(valid)
+    assert out == tuple(valid)
+
+
+def test_validate_permission_suggestions_drops_malformed_entries():
+    raw = [
+        {"type": "addRules", "behavior": "allow"},          # keep — minimal valid
+        {"type": "addRules", "behavior": "evil"},           # drop — bogus behavior
+        {"behavior": "allow"},                              # drop — missing type
+        {"type": "", "behavior": "allow"},                  # drop — empty type
+        {"type": "addRules"},                               # drop — missing behavior
+        "not a dict",                                       # drop — not a dict
+        None,                                               # drop — not a dict
+    ]
+    out = cli._validate_permission_suggestions(raw)
+    assert out == ({"type": "addRules", "behavior": "allow"},)
+
+
+def test_validate_permission_suggestions_returns_none_when_empty():
+    assert cli._validate_permission_suggestions(None) is None
+    assert cli._validate_permission_suggestions([]) is None
+    assert cli._validate_permission_suggestions("not a list") is None
+    # All entries malformed → nothing survives → None.
+    assert cli._validate_permission_suggestions([{"behavior": "evil"}]) is None
+
+
+def test_validate_permission_suggestions_accepts_all_three_behaviors():
+    raw = [
+        {"type": "addRules", "behavior": "allow"},
+        {"type": "addRules", "behavior": "deny"},
+        {"type": "addRules", "behavior": "ask"},
+    ]
+    out = cli._validate_permission_suggestions(raw)
+    assert out is not None
+    assert len(out) == 3
+    assert {s["behavior"] for s in out} == {"allow", "deny", "ask"}
+
+
 def test_emit_decision_drops_updated_input_when_decision_is_deny():
     """`updatedInput` is allow-only per the PermissionRequest schema —
     silently dropped on deny so we never leak hook intent into a deny path."""

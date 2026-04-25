@@ -495,18 +495,21 @@ def test_interactive_workspaces_picks_only_actionable():
     assert names == ["work"]
 
 
-def test_interactive_workspaces_back_compat_legacy_default():
+def test_interactive_workspaces_picks_up_default_workspace():
     from coding_agent_notifier import config as cfgmod
 
-    # Legacy [sinks.slack] actionable setup — still picked up.
+    # The "default" name has no special meaning at parse time — it's
+    # selected by the daemon the same way any other named workspace is.
     cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-l",
-                "app_token": "xapp-l",
-                "actionable_approvals": True,
-                "approver_user_ids": ["U01"],
+        "slack": {
+            "workspaces": {
+                "default": {
+                    "enabled": True,
+                    "bot_token": "xoxb-d",
+                    "app_token": "xapp-d",
+                    "actionable_approvals": True,
+                    "approver_user_ids": ["U01"],
+                },
             },
         },
     })

@@ -263,10 +263,11 @@ def install_slack_bot(
 def _launchd_plist_contents(agent_notify_bin: str) -> str:
     """Minimal launchd plist that keeps `agent-notify daemon` alive.
 
-    RunAtLoad + KeepAlive restarts on crash; we log stderr to defer.log's
-    sibling so the user has a single place to check. Not using
-    ProcessType=Background because the daemon needs network + may spawn
-    child processes for outgoing HTTPS.
+    RunAtLoad + KeepAlive restarts on crash; ThrottleInterval (the launchd-
+    documented minimum is 10s) caps respawn rate so a daemon that fails to
+    bootstrap doesn't fork-bomb itself when KeepAlive immediately retries.
+    Not using ProcessType=Background because the daemon needs network + may
+    spawn child processes for outgoing HTTPS.
     """
     log_path = str(paths.daemon_log())
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -284,6 +285,8 @@ def _launchd_plist_contents(agent_notify_bin: str) -> str:
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>{log_path}</string>
     <key>StandardErrorPath</key>

@@ -38,6 +38,84 @@ MODAL_CALLBACK_DENY_REASON = "agent_notify_modal_deny_reason"
 # Block / action IDs used inside the modals to locate the text input value.
 MODAL_INPUT_BLOCK_ID = "agent_notify_modal_input"
 MODAL_INPUT_ACTION_ID = "agent_notify_modal_input_value"
+
+
+@dataclass(frozen=True)
+class ParsedActionId:
+    """Decoded `action_id` from a Slack interactive payload.
+
+    At most one of `decision` / `modal_kind` is set; the rest of the
+    fields carry whatever index information the matched pattern encodes.
+    Daemon code in `slack_socket` consumes the result and threads the
+    fields straight into the `pending_approvals.resolve(...)` call.
+    """
+    raw: str
+    decision: str | None = None  # "allow" | "deny"
+    modal_kind: str | None = None  # "custom_answer" | "deny_reason"
+    selected_question: int | None = None
+    selected_option: int | None = None
+    selected_suggestion: int | None = None
+    modal_question_index: int | None = None
+
+
+def parse_action_id(action_id: str) -> ParsedActionId | None:
+    """Decode an `agent_notify_*` action_id string from a Slack click.
+
+    Returns None if the string doesn't match any of our patterns
+    (including malformed numeric suffixes — the wire schema is small,
+    so anything off-pattern is treated as not-ours and dropped).
+
+    Wire schema (must stay byte-stable for back-compat):
+      - `agent_notify_approve`           → allow
+      - `agent_notify_deny`              → deny
+      - `agent_notify_deny_reason`       → opens deny-with-reason modal
+      - `agent_notify_custom_answer_<q>` → opens custom-answer modal for Q<q>
+      - `agent_notify_suggestion_<i>`    → allow + apply suggestion <i>
+      - `agent_notify_option_<o>`        → allow + select option <o> on Q0 (legacy)
+      - `agent_notify_option_<q>_<o>`    → allow + select option <o> on Q<q>
+    """
+    if action_id == APPROVE_ACTION_ID:
+        return ParsedActionId(raw=action_id, decision="allow")
+    if action_id == DENY_ACTION_ID:
+        return ParsedActionId(raw=action_id, decision="deny")
+    if action_id == DENY_REASON_ACTION_ID:
+        return ParsedActionId(raw=action_id, modal_kind="deny_reason")
+    if action_id.startswith(CUSTOM_ANSWER_ACTION_ID_PREFIX):
+        try:
+            q_idx = int(action_id[len(CUSTOM_ANSWER_ACTION_ID_PREFIX):])
+        except ValueError:
+            return None
+        return ParsedActionId(
+            raw=action_id, modal_kind="custom_answer", modal_question_index=q_idx
+        )
+    if action_id.startswith(SUGGESTION_ACTION_ID_PREFIX):
+        try:
+            s_idx = int(action_id[len(SUGGESTION_ACTION_ID_PREFIX):])
+        except ValueError:
+            return None
+        return ParsedActionId(
+            raw=action_id, decision="allow", selected_suggestion=s_idx
+        )
+    if action_id.startswith(OPTION_ACTION_ID_PREFIX):
+        suffix = action_id[len(OPTION_ACTION_ID_PREFIX):]
+        parts = suffix.split("_")
+        try:
+            if len(parts) == 1:
+                # Legacy single-question encoding — treat as question 0.
+                return ParsedActionId(
+                    raw=action_id, decision="allow",
+                    selected_question=0, selected_option=int(parts[0]),
+                )
+            if len(parts) == 2:
+                return ParsedActionId(
+                    raw=action_id, decision="allow",
+                    selected_question=int(parts[0]),
+                    selected_option=int(parts[1]),
+                )
+        except ValueError:
+            return None
+        return None
+    return None
 # Slack button text limit; truncate option labels to fit.
 _BUTTON_TEXT_MAX = 75
 # Slack modal title hard cap (24 chars per Block Kit spec).

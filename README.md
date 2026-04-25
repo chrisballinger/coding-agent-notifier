@@ -13,7 +13,7 @@ Duplicate-ping protection is built in: both agents fire two hooks for the same l
 | Event                               | Claude Code                                       | Codex                                   |
 | ----------------------------------- | ------------------------------------------------- | --------------------------------------- |
 | Tool-approval prompt                | `PermissionRequest`, `Notification:permission_prompt` | `PermissionRequest` hook              |
-| Agent waiting for your answer       | `Notification:idle_prompt`                        | *(pending upstream)*                    |
+| Agent waiting for your answer       | `Notification:idle_prompt`                        | not emitted by Codex today              |
 | MCP server asking for input         | `Notification:elicitation_dialog`                 | —                                       |
 | Turn complete                       | `Stop`                                            | `notify` (`agent-turn-complete`), `Stop` |
 
@@ -29,30 +29,35 @@ Other modes: `idle_only`, `background_only`, `always`. Configurable per event �
 
 Gating degrades gracefully on non-macOS hosts and on failures: if we can't read idle time or the frontmost app, we fail open and send the ping.
 
-## Install
+## Quick start
 
 Requires Python 3.11+ and [`uv`](https://github.com/astral-sh/uv) (or pipx / pip).
+**macOS** is the supported platform for the interactive daemon and Keychain
+integration; **Linux / WSL** users get the webhook flows but must use
+`secrets.toml` or env vars (no Keychain) and don't get the `actionable_approvals`
+daemon (no launchd).
+
+For **webhook-only** notifications (one-way pings, no buttons):
 
 ```bash
-uv tool install --from . coding-agent-notifier
-# or with the actionable-Slack daemon (Socket Mode listener + buttons):
-uv tool install --from . 'coding-agent-notifier[slack-bot]'
-# or for development
-uv sync
-```
-
-Write a starter config and drop in a Slack webhook:
-
-```bash
+uv tool install 'coding-agent-notifier'
 agent-notify config init
-$EDITOR "$(agent-notify config path)"
+$EDITOR "$(agent-notify config path)"      # add a [slack.workspaces.default] block with webhook_url
+agent-notify install claude-code           # merges hooks into ~/.claude/settings.json
+agent-notify install codex                 # writes ~/.codex/config.toml + hooks.json
+agent-notify test --force                  # synthetic ping to confirm the round-trip
 ```
 
-Wire up the agents:
+For **phone-tap approvals** (Approve/Deny buttons, blocking `PermissionRequest`):
 
 ```bash
-agent-notify install claude-code   # merges into ~/.claude/settings.json
-agent-notify install codex         # writes ~/.codex/config.toml + hooks.json
+uv tool install 'coding-agent-notifier[slack-bot]'
+agent-notify config init
+agent-notify slack add                     # interactive wizard: tokens → Keychain, [slack.workspaces.default] block
+agent-notify install slack-bot             # writes Claude Code hook + launchd plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist
+agent-notify slack test default            # smoke message DM'd to you
+agent-notify doctor                        # confirms config, daemon, route match
 ```
 
 Both installers are idempotent and back up the target file before writing.
@@ -117,7 +122,7 @@ enabled = false
 # webhook_url = "https://discord.com/api/webhooks/…"
 ```
 
-The interactive setup wizard (`agent-notify slack add`) writes this block for you, stores tokens in macOS Keychain, and verifies via Slack's `auth.test`. Run it once per workspace — multi-workspace is supported by naming each block `[slack.workspaces.<name>]` and referencing names from `[[routes]]`. Legacy `[sinks.slack]` still parses as the implicit `default` workspace for backwards compatibility.
+The interactive setup wizard (`agent-notify slack add`) writes this block for you, stores tokens in macOS Keychain, and verifies via Slack's `auth.test`. Run it once per workspace — multi-workspace is supported by naming each block `[slack.workspaces.<name>]` and referencing names from `[[routes]]`.
 
 > **Migration note (existing Slack App installs):** the bundled manifest (`docs/slack-app-manifest.yaml`) now declares an `app_home` block with `messages_tab_enabled: true` so the no-approver fallback DM is visible. If your Slack App was created from an earlier version of the manifest, either re-create it from the updated YAML *or* enable the toggle manually: in your Slack App's admin, **App Home** → switch **Messages Tab** on. Without this, posts to the bot's own user_id (the fallback when `approver_user_ids` is empty) return `ok: true` but are functionally invisible.
 
@@ -203,13 +208,13 @@ cwd = "~/personal/*"
 slack.enabled = false
 ```
 
-`slack.workspace = "<name>"` picks the base config; any other `slack.*` key patches a single field on top. Without `slack.workspace`, the route uses the `default` workspace (or the legacy `[sinks.slack]` block if you haven't migrated yet).
+`slack.workspace = "<name>"` picks the base config; any other `slack.*` key patches a single field on top. Without `slack.workspace`, the route uses the `default` workspace.
 
 Patterns use `fnmatch`-style globs (`*`, `?`, `[abc]`) with `~` expansion. Use `agent-notify doctor` from inside a repo to confirm which route (if any) matches your current `cwd`.
 
 ### Strict routing — no cross-project leakage
 
-**As soon as any `[[routes]]` entry exists, routing becomes strict**: if the hook's `cwd` doesn't match *any* route, the notification is silently skipped (with a one-line stderr note) instead of falling back to `[sinks.slack]`. This prevents the hazard where you clone a new repo you forgot to route, and its events accidentally ping the channel of a different project.
+**As soon as any `[[routes]]` entry exists, routing becomes strict**: if the hook's `cwd` doesn't match *any* route, the notification is silently skipped (with a one-line stderr note) instead of falling back to the default workspace. This prevents the hazard where you clone a new repo you forgot to route, and its events accidentally ping the channel of a different project.
 
 If you *want* a catch-all, add one explicitly at the end — it's just a route:
 
@@ -257,7 +262,7 @@ If `bot_token_keychain` is configured but the account is missing or the Keychain
 
 `minimal` mode exists for environments where the *content* of an agent's pending tool call — a command, a snippet of code, the name of a repo — cannot transit a third-party service. You still get a ping that tells you to glance at the terminal; the terminal is authoritative for what's waiting. Approve/deny buttons still work (they carry only an opaque UUID), and the Slack confirm dialog is stripped of tool-specific text.
 
-**Fail-closed approvals.** The blocking `PermissionRequest` hook (when `sinks.slack.actionable_approvals = true`) defaults to `deny` on any error path: Slack post failure, timeout, daemon crash, token absent. Rationale: a notifier that silently *approves* on failure is much worse than one that silently denies — the worst case is a one-line "denied" message and you re-run in the terminal. The hook only fires when Claude Code was about to prompt the user — auto-allowed tools (allowlist, sandbox) pass through untouched.
+**Fail-closed approvals.** The blocking `PermissionRequest` hook (when `slack.workspaces.<name>.actionable_approvals = true`) defaults to `deny` on any error path: Slack post failure, timeout (default 5 min, set via `approval_timeout_seconds`), daemon crash, token absent. Rationale: a notifier that silently *approves* on failure is much worse than one that silently denies — the worst case is a one-line "denied" message and you re-run in the terminal. The hook only fires when Claude Code was about to prompt the user — auto-allowed tools (allowlist, sandbox) pass through untouched.
 
 **Safer example commands.** No destructive shell patterns (`rm -rf …`) appear in fixtures, examples, screenshots, or the `agent-notify test --dangerous` synthetic event — on the theory that a user who copies a command out of a notification into a terminal should not be harmed by it. Placeholder commands use `https://example.invalid/...` (a reserved TLD that never resolves) so `curl | bash`-style examples are cosmetically dangerous but cannot actually do anything.
 
@@ -286,13 +291,18 @@ If `bot_token_keychain` is configured but the account is missing or the Keychain
 
 | Command                                | What it does                                                   |
 | -------------------------------------- | -------------------------------------------------------------- |
+| `agent-notify --version`                         | Print the package version.                            |
+| `agent-notify --debug ...`                       | Lower the stderr log level to DEBUG (default WARNING). Combine with any subcommand. |
 | `agent-notify hook --source {claude-code,codex}` | Reads a hook payload on stdin; invoked by the agents. |
 | `agent-notify test [--force] [--kind ...]`       | Sends a synthetic event end-to-end.                   |
 | `agent-notify config init \| path`               | Write / locate the config file.                       |
 | `agent-notify install {claude-code,codex,slack-bot}` | Install hooks into the target agent (slack-bot also writes the launchd plist for the daemon). |
-| `agent-notify slack {add,list,remove,test}`           | Manage Slack workspaces — the `add` wizard stores tokens in Keychain and writes the config block. |
+| `agent-notify slack add`                              | Interactive wizard — store tokens in Keychain + write the workspace block. |
+| `agent-notify slack list`                             | List configured Slack workspaces.                                          |
+| `agent-notify slack remove <name>`                    | Delete a workspace's config block + Keychain entries.                      |
+| `agent-notify slack test <name>`                      | Post a synthetic smoke-test message to a workspace.                        |
 | `agent-notify daemon`                                 | Run the Slack Socket Mode listener (required when `actionable_approvals` is on).              |
-| `agent-notify doctor`                            | Summarize config, system state, install state.        |
+| `agent-notify doctor`                            | Summarize config, list workspaces with live `auth.test` results, check daemon + route match. |
 
 ## Development
 

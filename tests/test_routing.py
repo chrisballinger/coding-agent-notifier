@@ -21,7 +21,11 @@ from coding_agent_notifier.config import (
 
 def test_parses_routes_array():
     raw = {
-        "sinks": {"slack": {"enabled": True, "webhook_url": "https://base.test/x"}},
+        "slack": {
+            "workspaces": {
+                "default": {"enabled": True, "webhook_url": "https://base.test/x"},
+            },
+        },
         "routes": [
             {"cwd": "~/work/*", "slack": {"webhook_url": "https://work.test/y"}},
             {"cwd": "~/personal/*", "slack": {"channel": "#me"}},

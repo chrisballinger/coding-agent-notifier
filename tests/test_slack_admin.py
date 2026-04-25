@@ -120,6 +120,66 @@ def test_add_wizard_stores_approvers_when_provided(tmp_path, fake_keychain):
     assert block["channel"] == "#agents"
 
 
+def test_add_wizard_warns_when_bot_token_format_looks_wrong(tmp_path, fake_keychain):
+    """A common typo is swapping the bot/app tokens. The wizard soft-warns
+    when bot_token doesn't start with xoxb- so the user notices before the
+    daemon's first connection attempt fails opaquely later."""
+    config_path = tmp_path / "config.toml"
+    stderr = io.StringIO()
+    slack_admin.run_add_wizard(
+        name="work",
+        bot_token="xapp-mistyped",  # wrong prefix
+        app_token="xapp-real",
+        channel="@me",
+        approvers="",
+        config_path=config_path,
+        stdin=io.StringIO(""),
+        stdout=io.StringIO(),
+        stderr=stderr,
+        poster=_poster_ok_auth(),
+        no_verify=True,  # skip auth.test so we test the prefix warning, not the API
+    )
+    assert "doesn't start with 'xoxb-'" in stderr.getvalue()
+
+
+def test_add_wizard_warns_when_app_token_format_looks_wrong(tmp_path, fake_keychain):
+    config_path = tmp_path / "config.toml"
+    stderr = io.StringIO()
+    slack_admin.run_add_wizard(
+        name="work",
+        bot_token="xoxb-real",
+        app_token="xoxb-also-wrong",  # wrong prefix for app token
+        channel="@me",
+        approvers="",
+        config_path=config_path,
+        stdin=io.StringIO(""),
+        stdout=io.StringIO(),
+        stderr=stderr,
+        poster=_poster_ok_auth(),
+        no_verify=True,
+    )
+    assert "doesn't start with 'xapp-'" in stderr.getvalue()
+
+
+def test_add_wizard_no_warning_for_valid_token_prefixes(tmp_path, fake_keychain):
+    config_path = tmp_path / "config.toml"
+    stderr = io.StringIO()
+    slack_admin.run_add_wizard(
+        name="work",
+        bot_token="xoxb-real",
+        app_token="xapp-real",
+        channel="@me",
+        approvers="",
+        config_path=config_path,
+        stdin=io.StringIO(""),
+        stdout=io.StringIO(),
+        stderr=stderr,
+        poster=_poster_ok_auth(),
+        no_verify=True,
+    )
+    assert "doesn't start with" not in stderr.getvalue()
+
+
 def test_add_wizard_warns_on_shared_channel_without_approvers(
     tmp_path, fake_keychain
 ):

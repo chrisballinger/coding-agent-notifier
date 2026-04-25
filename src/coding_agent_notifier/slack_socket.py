@@ -27,14 +27,8 @@ from . import pending_approvals
 from .config import Config, SlackConfig
 from .event import Event
 from .sinks.slack import (
-    APPROVE_ACTION_ID,
-    CUSTOM_ANSWER_ACTION_ID_PREFIX,
-    DENY_ACTION_ID,
-    DENY_REASON_ACTION_ID,
     MODAL_CALLBACK_CUSTOM_ANSWER,
     MODAL_CALLBACK_DENY_REASON,
-    OPTION_ACTION_ID_PREFIX,
-    SUGGESTION_ACTION_ID_PREFIX,
     _ask_user_question_questions,
     _selected_label_from_record,
     _suggestion_label,
@@ -43,6 +37,7 @@ from .sinks.slack import (
     build_deny_reason_modal,
     build_resolved_message,
     extract_modal_text,
+    parse_action_id,
     update_message,
 )
 
@@ -99,55 +94,15 @@ def handle_block_actions(
     if not actions:
         return ButtonClickResult(False, None, None, None, None)
     action = actions[0]
-    action_id = action.get("action_id", "")
-    # Single-question (legacy) click: agent_notify_option_<o>
-    # Multi-question click: agent_notify_option_<q>_<o>
-    # Suggestion click:    agent_notify_suggestion_<i>
-    # Modal-trigger clicks (resolved via view_submission, not here):
-    #   custom-answer:     agent_notify_custom_answer_<q>
-    #   deny-with-reason:  agent_notify_deny_reason
-    selected_option: int | None = None
-    selected_question: int | None = None
-    selected_suggestion: int | None = None
-    modal_kind: str | None = None
-    modal_question_index: int | None = None
-    decision: str | None = None
-    if action_id == APPROVE_ACTION_ID:
-        decision = "allow"
-    elif action_id == DENY_ACTION_ID:
-        decision = "deny"
-    elif action_id == DENY_REASON_ACTION_ID:
-        modal_kind = "deny_reason"
-    elif action_id.startswith(CUSTOM_ANSWER_ACTION_ID_PREFIX):
-        try:
-            modal_question_index = int(action_id[len(CUSTOM_ANSWER_ACTION_ID_PREFIX):])
-        except ValueError:
-            return ButtonClickResult(False, None, None, None, None)
-        modal_kind = "custom_answer"
-    elif action_id.startswith(SUGGESTION_ACTION_ID_PREFIX):
-        try:
-            selected_suggestion = int(action_id[len(SUGGESTION_ACTION_ID_PREFIX):])
-        except ValueError:
-            return ButtonClickResult(False, None, None, None, None)
-        decision = "allow"
-    elif action_id.startswith(OPTION_ACTION_ID_PREFIX):
-        suffix = action_id[len(OPTION_ACTION_ID_PREFIX):]
-        parts = suffix.split("_")
-        try:
-            if len(parts) == 1:
-                # Legacy single-question encoding — treat as question 0.
-                selected_question = 0
-                selected_option = int(parts[0])
-            elif len(parts) == 2:
-                selected_question = int(parts[0])
-                selected_option = int(parts[1])
-            else:
-                return ButtonClickResult(False, None, None, None, None)
-        except ValueError:
-            return ButtonClickResult(False, None, None, None, None)
-        decision = "allow"
-    else:
+    parsed = parse_action_id(action.get("action_id", ""))
+    if parsed is None:
         return ButtonClickResult(False, None, None, None, None)
+    decision = parsed.decision
+    modal_kind = parsed.modal_kind
+    modal_question_index = parsed.modal_question_index
+    selected_option = parsed.selected_option
+    selected_question = parsed.selected_question
+    selected_suggestion = parsed.selected_suggestion
 
     approval_id = action.get("value") or ""
     user_id = (payload.get("user") or {}).get("id", "") or ""
@@ -178,7 +133,7 @@ def handle_block_actions(
             # the one-tap buttons instead.
             logger.warning(
                 "modal-trigger click but no trigger_id / views_open_fn (action=%s)",
-                action_id,
+                parsed.raw,
             )
             return ButtonClickResult(True, None, "no_trigger", approval_id, user_id)
         try:
@@ -186,7 +141,7 @@ def handle_block_actions(
                 modal_kind, approval_id, modal_question_index, base_dir,
             )
         except Exception:
-            logger.exception("failed to build modal for action=%s", action_id)
+            logger.exception("failed to build modal for action=%s", parsed.raw)
             return ButtonClickResult(True, None, "modal_build_failed", approval_id, user_id)
         if view is None:
             # Approval missing — same UX as a stale option click.
@@ -203,7 +158,7 @@ def handle_block_actions(
         try:
             views_open_fn(trigger_id, view)
         except Exception:
-            logger.exception("views_open failed for action=%s", action_id)
+            logger.exception("views_open failed for action=%s", parsed.raw)
             return ButtonClickResult(True, None, "views_open_failed", approval_id, user_id)
         return ButtonClickResult(True, None, None, approval_id, user_id)
 

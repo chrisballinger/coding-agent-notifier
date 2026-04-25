@@ -1,3 +1,25 @@
+"""Parse Claude Code hook stdin payloads into normalised `Event`s.
+
+Claude Code invokes its hook commands with a JSON object on stdin that
+always carries `hook_event_name`, `cwd`, and `session_id`. The interesting
+shapes for our purposes:
+
+  * `{"hook_event_name": "Notification", "notification_type":
+     "permission_prompt"|"idle_prompt"|"elicitation_dialog", "message": …}`
+  * `{"hook_event_name": "PermissionRequest", "tool_name": …,
+     "tool_input": {...}, "permission_suggestions": [...]}` (handled
+     specially by `cli.cmd_permissionrequest`; this parser produces the
+     non-blocking notification fallback)
+  * `{"hook_event_name": "Stop", …}` — the turn just ended
+  * `{"hook_event_name": "UserPromptSubmit", …}` — a new user message
+     started a new turn (consumed in `cli.cmd_hook` for dedup reset, not
+     parsed here)
+
+`parse()` returns `Event | None`; `None` means "this is a known hook
+event we intentionally don't route" (e.g. `Notification` with an
+unrecognised `notification_type`). The caller treats `None` as a silent
+no-op — we never raise from a hook.
+"""
 from __future__ import annotations
 
 from pathlib import Path

@@ -52,32 +52,28 @@ def test_multiple_workspaces_parse_independently():
     assert cfg.slack_workspaces["work"].channel == "#acme"
 
 
-def test_legacy_sinks_slack_parses_as_default():
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-legacy",
-            },
-        },
-    })
-    # Back-compat: legacy block populates the "default" workspace…
-    assert "default" in cfg.slack_workspaces
-    assert cfg.slack_workspaces["default"].bot_token == "xoxb-legacy"
-    # …and config.slack still points at it.
-    assert cfg.slack.bot_token == "xoxb-legacy"
-
-
-def test_both_legacy_and_new_default_is_error():
-    with pytest.raises(cfgmod.ConfigError, match="both \\[sinks.slack\\] and \\[slack.workspaces.default\\]"):
+def test_legacy_sinks_slack_raises_migration_error():
+    # The pre-v0.1 [sinks.slack] alias is no longer supported. Loading a
+    # config that still uses it should fail loudly with a pointer at the
+    # new shape.
+    with pytest.raises(cfgmod.ConfigError, match=r"\[sinks\.slack\] is no longer supported"):
         cfgmod.parse_config({
-            "sinks": {"slack": {"enabled": True, "bot_token": "xoxb-a"}},
-            "slack": {
-                "workspaces": {
-                    "default": {"enabled": True, "bot_token": "xoxb-b"},
+            "sinks": {
+                "slack": {
+                    "enabled": True,
+                    "bot_token": "xoxb-legacy",
                 },
             },
         })
+
+
+def test_empty_sinks_slack_block_is_ignored():
+    # An empty [sinks.slack] table (or [sinks] with no slack) shouldn't trip
+    # the migration error — we only object when there's actual content.
+    cfg = cfgmod.parse_config({"sinks": {}})
+    assert cfg.slack.enabled is False
+    cfg = cfgmod.parse_config({"sinks": {"slack": {}}})
+    assert cfg.slack.enabled is False
 
 
 def test_new_default_and_named_workspaces_coexist():
@@ -431,38 +427,39 @@ def test_secrets_toml_not_loaded_when_config_toml_absent(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------
 
 
+def _default_ws(**fields) -> dict:
+    """Build a parse_config input with a single [slack.workspaces.default] block.
+
+    Test convenience for the common single-workspace shape — every key passed
+    in lands inside `slack.workspaces.default`.
+    """
+    return {"slack": {"workspaces": {"default": fields}}}
+
+
 def test_actionable_approvals_requires_allowlist_for_non_dm_channel():
     # Empty allowlist is a footgun for any shared channel → reject.
     with pytest.raises(cfgmod.ConfigError, match="requires a non-empty"):
-        cfgmod.parse_config({
-            "sinks": {
-                "slack": {
-                    "enabled": True,
-                    "bot_token": "xoxb-x",
-                    "app_token": "xapp-x",
-                    "actionable_approvals": True,
-                    "channel": "#acme",
-                    # no approver_user_ids, no approver_user_groups
-                },
-            },
-        })
+        cfgmod.parse_config(_default_ws(
+            enabled=True,
+            bot_token="xoxb-x",
+            app_token="xapp-x",
+            actionable_approvals=True,
+            channel="#acme",
+            # no approver_user_ids, no approver_user_groups
+        ))
 
 
 def test_actionable_approvals_allows_empty_allowlist_when_channel_is_dm():
     # @me = DM with the bot. Only the installing user can see the message,
     # so an explicit allowlist is redundant. Runtime enforces this by
     # double-checking the channel_id at click time.
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-x",
-                "app_token": "xapp-x",
-                "actionable_approvals": True,
-                "channel": "@me",
-            },
-        },
-    })
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        actionable_approvals=True,
+        channel="@me",
+    ))
     assert cfg.slack.channel == "@me"
     assert cfg.slack.approver_user_ids == ()
 
@@ -470,16 +467,12 @@ def test_actionable_approvals_allows_empty_allowlist_when_channel_is_dm():
 def test_actionable_approvals_default_channel_is_dm_friendly():
     # No channel explicitly set → defaults to @me at validation time, so
     # empty allowlist is allowed (zero-config easy setup).
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-x",
-                "app_token": "xapp-x",
-                "actionable_approvals": True,
-            },
-        },
-    })
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        actionable_approvals=True,
+    ))
     # channel attribute stays None (the `@me` treatment is applied by
     # downstream senders); what matters is parse-time acceptance.
     assert cfg.slack.channel is None
@@ -488,64 +481,48 @@ def test_actionable_approvals_default_channel_is_dm_friendly():
 def test_actionable_approvals_accepts_user_groups_alone():
     # Having only usergroups (no individual IDs) is allowed — common for
     # "anyone in @oncall subteam can approve" setups.
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-x",
-                "app_token": "xapp-x",
-                "actionable_approvals": True,
-                "approver_user_groups": ["S01ABCDEF"],
-            },
-        },
-    })
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        actionable_approvals=True,
+        approver_user_groups=["S01ABCDEF"],
+    ))
     assert cfg.slack.approver_user_groups == ("S01ABCDEF",)
     assert cfg.slack.approver_user_ids == ()
 
 
 def test_actionable_approvals_accepts_user_ids_alone():
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-x",
-                "app_token": "xapp-x",
-                "actionable_approvals": True,
-                "approver_user_ids": ["U01"],
-            },
-        },
-    })
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        actionable_approvals=True,
+        approver_user_ids=["U01"],
+    ))
     assert cfg.slack.approver_user_ids == ("U01",)
 
 
 def test_actionable_approvals_accepts_both_lists():
-    cfg = cfgmod.parse_config({
-        "sinks": {
-            "slack": {
-                "enabled": True,
-                "bot_token": "xoxb-x",
-                "app_token": "xapp-x",
-                "actionable_approvals": True,
-                "approver_user_ids": ["U01"],
-                "approver_user_groups": ["S01"],
-            },
-        },
-    })
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb-x",
+        app_token="xapp-x",
+        actionable_approvals=True,
+        approver_user_ids=["U01"],
+        approver_user_groups=["S01"],
+    ))
     assert cfg.slack.approver_user_ids == ("U01",)
     assert cfg.slack.approver_user_groups == ("S01",)
 
 
 def test_approver_user_groups_must_be_list_of_strings():
     with pytest.raises(cfgmod.ConfigError, match="approver_user_groups"):
-        cfgmod.parse_config({
-            "sinks": {
-                "slack": {
-                    "enabled": True,
-                    "bot_token": "xoxb",
-                    "approver_user_groups": [123],
-                },
-            },
-        })
+        cfgmod.parse_config(_default_ws(
+            enabled=True,
+            bot_token="xoxb",
+            approver_user_groups=[123],
+        ))
 
 
 def test_approver_user_groups_is_valid_route_override(tmp_path):

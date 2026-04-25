@@ -10,6 +10,7 @@ import traceback
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from . import __version__, dedup, install, macos, paths, pending, pending_approvals, transcript
 from .config import (
@@ -62,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--config", type=Path, help="Override config file path.")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose DEBUG logging to stderr (default: WARNING).",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     hook = sub.add_parser("hook", help="Process an agent hook payload on stdin.")
@@ -152,6 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Configure logging early so subcommand setup logs land somewhere.
+    # The daemon installs its own rotating-file handler later (see
+    # cmd_daemon); other commands only ever log to stderr.
+    from . import logging_setup
+    logging_setup.configure(debug=args.debug)
 
     # One-time: migrate legacy XDG state into ~/.agent-notify/ if present.
     # Runs before any path-using code so all subsequent calls see the new
@@ -343,16 +355,18 @@ def cmd_slack(args: argparse.Namespace) -> int:
 def cmd_daemon(args: argparse.Namespace) -> int:
     """Run the Slack Socket Mode listener forever (required for actionable approvals).
 
-    Logs to stderr — launchd plist / user-supervisor redirects that to a log
-    file. Fails loudly if Slack bot / app tokens aren't configured.
+    Re-configures logging with a rotating file handler at
+    `paths.daemon_log()` in addition to stderr — launchd captures stderr,
+    but the rotating file gives the user a single bounded place to look
+    for forensic context.
     """
-    from . import slack_socket
+    from . import logging_setup, slack_socket
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    logging_setup.configure(debug=args.debug, daemon=True)
+    # The daemon is verbose enough that INFO is the right "normal" level —
+    # raise the floor above the WARNING default unless --debug is set.
+    if not args.debug:
+        logging.getLogger().setLevel(logging.INFO)
     config = load_config(args.config)
     slack_socket.run_daemon(config)
     return 0
@@ -400,11 +414,8 @@ def cmd_permissionrequest(
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else None
     transcript_raw = payload.get("transcript_path")
     transcript_path = Path(transcript_raw) if isinstance(transcript_raw, str) and transcript_raw else None
-    raw_suggestions = payload.get("permission_suggestions")
-    permission_suggestions = (
-        tuple(s for s in raw_suggestions if isinstance(s, dict))
-        if isinstance(raw_suggestions, list) and raw_suggestions
-        else None
+    permission_suggestions = _validate_permission_suggestions(
+        payload.get("permission_suggestions")
     )
 
     event = Event(
@@ -518,6 +529,50 @@ def cmd_permissionrequest(
         updated_permissions=updated_permissions,
     )
     return 0
+
+
+# Recognised values for `permission_suggestion.behavior`. Claude Code's hook
+# schema documents these three; anything else is dropped at parse time so a
+# tampered hook payload can't smuggle an unknown verb into
+# `decision.updatedPermissions`.
+_VALID_SUGGESTION_BEHAVIORS = frozenset({"allow", "deny", "ask"})
+
+
+def _validate_permission_suggestions(raw: Any) -> tuple[dict, ...] | None:
+    """Validate the PermissionRequest hook's `permission_suggestions` payload.
+
+    Drops any entry that doesn't match the documented shape; returns None if
+    nothing survives. We accept only suggestions that:
+      - are dicts,
+      - carry a `behavior` string in {allow, deny, ask},
+      - carry a non-empty `type` string (Claude Code dispatches on this).
+
+    The Slack daemon writes whichever surviving suggestion the user clicks
+    straight into `decision.updatedPermissions` — silently dropping malformed
+    entries here is the trust boundary for that path.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    cleaned: list[dict] = []
+    dropped = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        behavior = item.get("behavior")
+        if behavior not in _VALID_SUGGESTION_BEHAVIORS:
+            dropped += 1
+            continue
+        type_field = item.get("type")
+        if not isinstance(type_field, str) or not type_field:
+            dropped += 1
+            continue
+        cleaned.append(item)
+    if dropped:
+        _log_event(
+            f"PermissionRequest dropped {dropped}/{len(raw)} malformed permission_suggestions"
+        )
+    return tuple(cleaned) if cleaned else None
 
 
 def _suggestion_to_updated_permissions(record: dict, idx: int) -> list | None:
@@ -941,10 +996,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  ! failed to load: {e}")
         return 1
     print(f"  gating: {config.gating}  idle_threshold: {config.idle_threshold_seconds}s")
-    print(f"  slack:   enabled={config.slack.enabled} webhook={bool(config.slack.webhook_url)} bot={bool(config.slack.bot_token)}")
-    print(f"  discord: enabled={config.discord.enabled} webhook={bool(config.discord.webhook_url)}")
+
+    # Slack workspaces (per-workspace status — multi-instance).
+    if config.slack_workspaces:
+        print("Slack workspaces:")
+        for name, ws in config.slack_workspaces.items():
+            badges = []
+            badges.append("enabled" if ws.enabled else "disabled")
+            if ws.bot_token:
+                badges.append("bot")
+            if ws.app_token:
+                badges.append("app")
+            if ws.webhook_url:
+                badges.append("webhook")
+            if ws.actionable_approvals:
+                badges.append("actionable")
+            print(f"  {name}: {', '.join(badges)}  channel={ws.channel or '(unset)'}")
+            if ws.enabled and ws.bot_token:
+                ok, msg = _doctor_probe_slack_auth(ws.bot_token)
+                marker = "✓" if ok else "✗"
+                print(f"    {marker} auth.test: {msg}")
+    else:
+        print("Slack workspaces: (none configured)")
+    print(f"Discord: enabled={config.discord.enabled} webhook={bool(config.discord.webhook_url)}")
+
     if config.routes:
-        print(f"  routes:  {len(config.routes)} configured (strict: unmatched paths skipped)")
+        print(f"Routes:  {len(config.routes)} configured (strict: unmatched paths skipped)")
         matched = match_route(Path.cwd(), config)
         if matched is not None:
             print(f"    cwd={Path.cwd()} → matches {matched.cwd!r}")
@@ -955,6 +1032,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"catch-all if you want coverage here."
             )
 
+    # Daemon required when any workspace turns on actionable approvals.
+    actionable_workspaces = [
+        n for n, ws in config.slack_workspaces.items() if ws.actionable_approvals
+    ]
+    if actionable_workspaces:
+        print(f"Daemon: required by actionable_approvals=true on {actionable_workspaces}")
+        _doctor_check_daemon()
+    else:
+        print("Daemon: not required (no actionable_approvals workspaces)")
+
     state = _snapshot_state()
     print(f"System: idle={state.idle_seconds}s frontmost={state.frontmost_app!r}")
 
@@ -963,6 +1050,69 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     codex_config = Path.home() / ".codex" / "config.toml"
     print(f"Codex config:    {codex_config}  {'(exists)' if codex_config.exists() else '(missing)'}")
     return 0
+
+
+def _doctor_probe_slack_auth(bot_token: str) -> tuple[bool, str]:
+    """Call Slack auth.test with a short timeout. Returns (ok, message)."""
+    from .sinks.base import http_post_json
+    try:
+        status, body = http_post_json(
+            "https://slack.com/api/auth.test",
+            {},
+            headers={"Authorization": f"Bearer {bot_token}"},
+            timeout=3.0,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"network error: {e}"
+    if status >= 300:
+        return False, f"HTTP {status}"
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False, "non-JSON response"
+    if not parsed.get("ok"):
+        return False, f"Slack API error: {parsed.get('error', 'unknown')}"
+    team = parsed.get("team") or "?"
+    user = parsed.get("user") or "?"
+    return True, f"team={team} user={user}"
+
+
+def _doctor_check_daemon() -> None:
+    """Print launchd + log status for the daemon. Best-effort — failures
+    surface as advisory text, never raise."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{install.LAUNCHD_LABEL}.plist"
+    if plist_path.exists():
+        print(f"  ✓ plist:  {plist_path}")
+    else:
+        print(
+            f"  ✗ plist:  {plist_path} MISSING — run `agent-notify install slack-bot`"
+        )
+        return
+    launchctl = _shutil.which("launchctl")
+    if launchctl:
+        try:
+            res = _subprocess.run(
+                [launchctl, "list", install.LAUNCHD_LABEL],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (OSError, _subprocess.SubprocessError) as e:
+            print(f"  ? launchctl: could not query daemon status: {e}")
+        else:
+            if res.returncode == 0:
+                print(f"  ✓ launchctl: {install.LAUNCHD_LABEL} is loaded")
+            else:
+                print(
+                    f"  ✗ launchctl: {install.LAUNCHD_LABEL} not loaded — "
+                    f"start it with `launchctl bootstrap gui/$UID {plist_path}`"
+                )
+    log_path = paths.daemon_log()
+    if log_path.exists() and log_path.stat().st_size > 0:
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log_path.stat().st_mtime))
+        print(f"  ✓ log:    {log_path}  (last activity: {mtime})")
+    else:
+        print(f"  ? log:    {log_path}  (no activity yet — daemon may never have started)")
 
 
 # ---- helpers ----

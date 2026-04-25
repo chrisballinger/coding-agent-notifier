@@ -61,7 +61,7 @@ def test_hook_dispatches_through_sink(monkeypatch, tmp_path: Path):
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -94,7 +94,7 @@ def test_hook_suppressed_by_gating(monkeypatch, tmp_path: Path):
         """
 gating = "idle_only"
 idle_threshold_seconds = 9999
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -146,7 +146,7 @@ def test_test_subcommand_with_force(monkeypatch, tmp_path: Path):
     cfg = _write_config(
         tmp_path,
         """
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -171,7 +171,7 @@ def test_test_subcommand_suppressed(monkeypatch, tmp_path: Path, capsys):
         """
 gating = "idle_only"
 idle_threshold_seconds = 9999
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -192,7 +192,7 @@ def test_hook_skips_dispatch_when_no_route_matches(monkeypatch, tmp_path: Path, 
         tmp_path,
         f"""
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://default.test/hook"
 
@@ -224,7 +224,7 @@ def test_hook_routes_to_per_repo_webhook(monkeypatch, tmp_path: Path):
         tmp_path,
         f"""
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://default.test/hook"
 
@@ -278,8 +278,100 @@ slack.channel = "#matched"
     monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
     cli.main(["--config", str(cfg), "doctor"])
     out = capsys.readouterr().out
-    assert "routes:  1 configured" in out
+    assert "Routes:  1 configured" in out
     assert "→ matches" in out
+
+
+def test_doctor_warns_when_actionable_workspace_has_no_daemon_plist(monkeypatch, tmp_path: Path, capsys):
+    """If any workspace has actionable_approvals=true, the doctor should
+    flag a missing launchd plist as an actionable problem."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+bot_token = "xoxb-test"
+app_token = "xapp-test"
+actionable_approvals = true
+approver_user_ids = ["U01"]
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    # Skip the network round-trip for auth.test.
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.base.http_post_json",
+        lambda *a, **k: (200, '{"ok": true, "team": "T", "user": "B"}'),
+    )
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "Daemon: required by actionable_approvals=true" in out
+    assert "MISSING" in out
+
+
+def test_doctor_skips_daemon_check_when_not_actionable(monkeypatch, tmp_path: Path, capsys):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+webhook_url = "https://hook.test/x"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "Daemon: not required" in out
+    # Webhook-only workspace has no bot_token, so auth.test must not fire.
+    assert "auth.test" not in out
+
+
+def test_doctor_probes_slack_auth_test(monkeypatch, tmp_path: Path, capsys):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+bot_token = "xoxb-test"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.base.http_post_json",
+        lambda url, body, headers=None, timeout=10.0: (
+            200, '{"ok": true, "team": "MyTeam", "user": "MyBot"}'
+        ),
+    )
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "✓ auth.test: team=MyTeam user=MyBot" in out
+
+
+def test_doctor_reports_slack_auth_failure(monkeypatch, tmp_path: Path, capsys):
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+bot_token = "xoxb-bad"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.base.http_post_json",
+        lambda *a, **k: (200, '{"ok": false, "error": "invalid_auth"}'),
+    )
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "✗ auth.test: Slack API error: invalid_auth" in out
 
 
 def test_doctor_reports_no_route_match(monkeypatch, tmp_path: Path, capsys):
@@ -318,7 +410,7 @@ def test_hook_deduplicates_delayed_permission_notification(monkeypatch, tmp_path
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -367,7 +459,7 @@ def test_hook_deduplicates_permission_twin_fire(monkeypatch, tmp_path: Path):
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -415,7 +507,7 @@ def test_hook_deduplicates_codex_turn_complete_twin_fire(monkeypatch, tmp_path: 
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -461,7 +553,7 @@ def test_hook_coalesces_repeated_idle_prompts(monkeypatch, tmp_path: Path):
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -497,7 +589,7 @@ def test_hook_force_bypasses_dedup(monkeypatch, tmp_path: Path):
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -535,7 +627,7 @@ def test_dispatch_swallows_sink_errors(monkeypatch, tmp_path: Path, capsys):
         tmp_path,
         """
 gating = "always"
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),

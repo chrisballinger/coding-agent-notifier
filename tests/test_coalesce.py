@@ -39,7 +39,7 @@ verbosity = "terse"
 coalesce_window_seconds = 2.5
 [summary]
 enabled = false
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -162,7 +162,7 @@ coalesce_window_seconds = 0.01
 enabled = true
 head_chars = 50
 tail_chars = 50
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -214,7 +214,7 @@ coalesce_window_seconds = 2.5
 enabled = true
 head_chars = 250
 tail_chars = 250
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -303,7 +303,7 @@ gating = "always"
 coalesce_window_seconds = 0
 [summary]
 enabled = false
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -338,7 +338,7 @@ gating = "idle_only"
 idle_threshold_seconds = 9999
 [display]
 coalesce_window_seconds = 2.5
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -374,7 +374,7 @@ def test_idle_prompt_suppresses_after_turn_complete_dispatched(monkeypatch, tmp_
 gating = "always"
 [display]
 coalesce_window_seconds = 0
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -418,7 +418,7 @@ def test_idle_prompt_then_turn_complete_also_suppresses(monkeypatch, tmp_path: P
 gating = "always"
 [display]
 coalesce_window_seconds = 0.01
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -470,7 +470,7 @@ def test_user_prompt_submit_resets_marker(monkeypatch, tmp_path: Path):
 gating = "always"
 [display]
 coalesce_window_seconds = 0
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
@@ -523,7 +523,7 @@ def test_ttl_safety_net_releases_stuck_marker(monkeypatch, tmp_path: Path):
 gating = "always"
 [display]
 coalesce_window_seconds = 0
-[sinks.slack]
+[slack.workspaces.default]
 enabled = true
 webhook_url = "https://hook.test/x"
 """.strip(),
