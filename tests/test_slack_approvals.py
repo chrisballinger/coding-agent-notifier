@@ -298,6 +298,81 @@ def test_non_ask_user_question_still_renders_approve_deny():
     assert labels == ["Approve", "Deny"]
 
 
+def test_recommended_option_gets_primary_style():
+    """An option label containing "(Recommended)" gets style:primary so
+    Slack renders it as a filled green CTA — visual hint for the user's
+    suggested pick."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [{
+            "question": "Q?",
+            "options": [
+                {"label": "Global config only (Recommended)", "description": "..."},
+                {"label": "Per-repo files", "description": "..."},
+            ],
+        }]
+    })
+    body = build_approval_message(ev, "appr-rec-1")
+    actions = _find_block(body, "actions")
+    # First option is recommended → primary style.
+    assert actions["elements"][0].get("style") == "primary"
+    # Second option has no special style.
+    assert "style" not in actions["elements"][1]
+
+
+def test_only_first_recommended_option_gets_primary():
+    """If multiple options are tagged Recommended (uncommon but possible),
+    only the first gets primary — Slack discourages multiple primary
+    buttons in one actions block."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [{
+            "question": "Q?",
+            "options": [
+                {"label": "First (Recommended)"},
+                {"label": "Second (Recommended)"},
+            ],
+        }]
+    })
+    body = build_approval_message(ev, "appr-rec-2")
+    actions = _find_block(body, "actions")
+    assert actions["elements"][0].get("style") == "primary"
+    assert "style" not in actions["elements"][1]
+
+
+def test_no_primary_when_no_recommendation():
+    """When no option is tagged Recommended, no option button gets primary
+    style — they all render as outlined buttons."""
+    body = build_approval_message(_ask_user_question_event(), "appr-no-rec")
+    actions = _find_block(body, "actions")
+    for el in actions["elements"][:-1]:  # all but the trailing Deny
+        assert "style" not in el
+
+
+def test_ask_user_question_uses_green_sidebar_and_thinking_emoji():
+    """AskUserQuestion is a question, not a permission warning. Override
+    the kind's yellow with green and the :pray: emoji with :thinking_face:
+    so the visual reads as "question to answer" not "approve this risky
+    thing"."""
+    body = build_approval_message(_ask_user_question_event(), "appr-aq-vis")
+    # Color overridden to green.
+    assert body["attachments"][0]["color"] == "#2eb67d"
+    # Header uses thinking emoji + "is asking" (not "needs approval").
+    blocks = body["attachments"][0]["blocks"]
+    header_text = blocks[0]["text"]["text"]
+    assert ":thinking_face:" in header_text
+    assert "is asking" in header_text
+    assert "needs approval" not in header_text
+
+
+def test_non_ask_user_question_keeps_kind_styling():
+    """Bash and other tools still get the kind-based color (yellow for
+    permission) and emoji (:pray: now)."""
+    body = build_approval_message(_event(), "appr-bash-vis")  # Bash, kind=permission
+    assert body["attachments"][0]["color"] == "#ecb22e"  # yellow
+    header_text = body["attachments"][0]["blocks"][0]["text"]["text"]
+    assert ":pray:" in header_text
+    assert "needs approval" in header_text
+
+
 def test_build_resolved_message_uses_selected_label_when_provided():
     body = build_resolved_message(
         _ask_user_question_event(),

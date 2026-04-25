@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 
 from ..config import SlackConfig, Verbosity
-from ..event import Event, EventKind
+from ..event import AGENT_LABELS, Event, EventKind
 from ..tool_formatters import DEFAULT_MAX_CHARS, ToolRender, render
 from .base import SinkError, http_post_json
 
@@ -22,12 +22,19 @@ OPTION_ACTION_ID_PREFIX = "agent_notify_option_"
 # Slack button text limit; truncate option labels to fit.
 _BUTTON_TEXT_MAX = 75
 
-# Slack attachment color bar per event kind (hex without #).
+# Slack attachment color bar per event kind. Tier semantics:
+#   green  = informational / done           (turn_complete, idle_prompt, elicitation)
+#   yellow = action required / approval     (permission)
+#   red    = danger override (set when      (DANGEROUS_BASH_PATTERNS hit on tool_input)
+#            the rendered tool call hits
+#            DANGEROUS_BASH_PATTERNS)
+_GREEN = "#2eb67d"
+_YELLOW = "#ecb22e"
 _KIND_COLORS: dict[EventKind, str] = {
-    "permission": "#e01e5a",
-    "idle_prompt": "#ecb22e",
-    "elicitation": "#ecb22e",
-    "turn_complete": "#2eb67d",
+    "permission": _YELLOW,
+    "idle_prompt": _GREEN,
+    "elicitation": _GREEN,
+    "turn_complete": _GREEN,
 }
 _DANGER_COLOR = "#a30f18"
 
@@ -124,7 +131,16 @@ def build_slack_message(
     tool = render(event.tool_name, event.tool_input, max_chars=max_chars)
     dangerous = tool.dangerous
 
-    header = f"{':rotating_light: ' if dangerous else ''}{event.emoji} {event.title}"
+    # AskUserQuestion is a question, not a permission warning — render with
+    # green/thinking-face styling so it doesn't read as a destructive-action
+    # alert. Other tools keep their kind's emoji + title.
+    if event.tool_name == "AskUserQuestion":
+        emoji = ":thinking_face:"
+        title = f"{AGENT_LABELS[event.agent]} is asking"
+    else:
+        emoji = event.emoji
+        title = event.title
+    header = f"{':rotating_light: ' if dangerous else ''}{emoji} {title}"
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": header, "emoji": True}},
     ]
@@ -165,8 +181,16 @@ def build_slack_message(
                  "elements": [{"type": "mrkdwn", "text": footer}]}
             )
 
+    if dangerous:
+        color = _DANGER_COLOR
+    elif event.tool_name == "AskUserQuestion":
+        # Override the kind's yellow to green — this is a question, not an
+        # approval. Matches the green header above.
+        color = _GREEN
+    else:
+        color = _KIND_COLORS.get(event.kind, "")
     attachment = {
-        "color": _DANGER_COLOR if dangerous else _KIND_COLORS.get(event.kind, ""),
+        "color": color,
         "blocks": blocks,
     }
     return {
@@ -330,15 +354,26 @@ def _truncate_button_text(text: str) -> str:
 
 
 def _build_option_buttons(approval_id: str, labels: list[str]) -> dict:
-    """Block Kit actions block: one button per option label + a Deny button."""
+    """Block Kit actions block: one button per option label + a Deny button.
+
+    The first option whose label contains "(Recommended)" (the convention
+    AskUserQuestion uses to flag a default choice) gets `style: "primary"`
+    — Slack renders that as a filled green CTA, signaling the suggested
+    pick. Only one primary per actions block per Slack's recommendation.
+    """
+    primary_assigned = False
     elements: list[dict] = []
     for i, label in enumerate(labels):
-        elements.append({
+        button: dict = {
             "type": "button",
             "text": {"type": "plain_text", "text": _truncate_button_text(label), "emoji": False},
             "action_id": f"{OPTION_ACTION_ID_PREFIX}{i}",
             "value": approval_id,
-        })
+        }
+        if not primary_assigned and "(Recommended)" in label:
+            button["style"] = "primary"
+            primary_assigned = True
+        elements.append(button)
     elements.append({
         "type": "button",
         "text": {"type": "plain_text", "text": "Deny", "emoji": False},

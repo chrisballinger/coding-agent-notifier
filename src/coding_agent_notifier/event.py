@@ -15,7 +15,7 @@ KIND_TITLES: dict[EventKind, str] = {
 }
 
 KIND_EMOJI: dict[EventKind, str] = {
-    "permission": ":warning:",
+    "permission": ":pray:",
     "idle_prompt": ":hourglass_flowing_sand:",
     "turn_complete": ":white_check_mark:",
     "elicitation": ":incoming_envelope:",
