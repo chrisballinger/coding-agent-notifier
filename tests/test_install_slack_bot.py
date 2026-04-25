@@ -148,6 +148,42 @@ def test_install_slack_bot_writes_launchd_plist(tmp_path: Path):
     assert "<key>RunAtLoad</key>" in content
 
 
+def test_install_slack_bot_resolves_absolute_binary_path(tmp_path: Path, monkeypatch):
+    """Default `agent_notify_bin="agent-notify"` is resolved to an absolute
+    path via shutil.which. launchd's PATH doesn't include ~/.local/bin (the
+    default uv-tool install location), so a bare program name caused
+    EX_CONFIG and the daemon never started. The resolved absolute path
+    keeps the plist robust to install location.
+    """
+    settings = tmp_path / "settings.json"
+    la_dir = tmp_path / "LaunchAgents"
+    fake_bin = tmp_path / "fake-bin" / "agent-notify"
+    fake_bin.parent.mkdir()
+    fake_bin.write_text("#!/bin/sh\nexec true\n")
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr("shutil.which", lambda name: str(fake_bin) if name == "agent-notify" else None)
+
+    install.install_slack_bot(settings, launch_agents_dir=la_dir)
+
+    plist_text = (la_dir / f"{install.LAUNCHD_LABEL}.plist").read_text()
+    # The absolute resolved path is in the ProgramArguments, not bare name.
+    assert f"<string>{fake_bin}</string>" in plist_text
+
+
+def test_install_slack_bot_keeps_explicit_bin_path_unresolved(tmp_path: Path):
+    """When the caller passes an explicit `agent_notify_bin` (e.g. tests,
+    bundled installs), don't shadow it with a `shutil.which` lookup."""
+    settings = tmp_path / "settings.json"
+    la_dir = tmp_path / "LaunchAgents"
+    install.install_slack_bot(
+        settings,
+        launch_agents_dir=la_dir,
+        agent_notify_bin="/some/explicit/agent-notify",
+    )
+    plist_text = (la_dir / f"{install.LAUNCHD_LABEL}.plist").read_text()
+    assert "<string>/some/explicit/agent-notify</string>" in plist_text
+
+
 def test_install_slack_bot_is_idempotent(tmp_path: Path):
     settings = tmp_path / "settings.json"
     la_dir = tmp_path / "LaunchAgents"

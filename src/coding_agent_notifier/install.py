@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -232,6 +233,16 @@ def install_slack_bot(
         la_dir = launch_agents_dir or (Path.home() / "Library" / "LaunchAgents")
         la_dir.mkdir(parents=True, exist_ok=True)
         plist_path = la_dir / f"{LAUNCHD_LABEL}.plist"
+        # Resolve to an absolute path. launchd's PATH (set on the plist's
+        # EnvironmentVariables) is /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
+        # — `uv tool install` puts the binary in ~/.local/bin/, which isn't
+        # on that PATH, so a bare "agent-notify" causes EX_CONFIG and the
+        # daemon never starts. Default-resolving here keeps the plist
+        # robust to the install location without baking in any one path.
+        if agent_notify_bin == "agent-notify":
+            resolved = shutil.which(agent_notify_bin)
+            if resolved:
+                agent_notify_bin = resolved
         desired = _launchd_plist_contents(agent_notify_bin)
         write = True
         if plist_path.exists():
