@@ -1,0 +1,39 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "session_id": "abc123",
+  "transcript_path": "/Users/me/.claude/projects/myproj/00893aaf.jsonl",
+  "cwd": "/Users/me/myproj",
+  "permission_mode": "default",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "How should per-repo routing be configured?",
+        "header": "Routing shape",
+        "multiSelect": false,
+        "options": [
+          {
+            "label": "Global config only",
+            "description": "Routes live in the global config.toml; one source of truth."
+          },
+          {
+            "label": "Per-repo files",
+            "description": "Each repo has its own .agent-notify.toml override."
+          },
+          {
+            "label": "Hybrid",
+            "description": "Per-repo files patch the global routes."
+          }
+        ]
+      }
+    ]
+  },
+  "permission_suggestions": [
+    {
+      "type": "addRules",
+      "rules": [{"toolName": "AskUserQuestion", "ruleContent": "*"}],
+      "behavior": "allow",
+      "destination": "localSettings"
+    }
+  ]
+}

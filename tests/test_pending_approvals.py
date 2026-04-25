@@ -92,11 +92,14 @@ def test_resolve_invalid_decision_raises(tmp_path: Path):
         pa.resolve("abc", "maybe", base_dir=tmp_path)  # type: ignore[arg-type]
 
 
-def test_wait_returns_decision_written_before_wait(tmp_path: Path):
+def test_wait_returns_record_written_before_wait(tmp_path: Path):
     pa.create("abc", agent="claude-code", session_id=None, tool_name=None, base_dir=tmp_path)
     pa.resolve("abc", "deny", base_dir=tmp_path)
-    # Already resolved before we even start waiting — wait returns immediately.
-    assert pa.wait("abc", timeout=0.5, base_dir=tmp_path) == "deny"
+    # Already resolved before we even start waiting — wait returns the
+    # full record immediately.
+    rec = pa.wait("abc", timeout=0.5, base_dir=tmp_path)
+    assert rec is not None
+    assert rec["decision"] == "deny"
 
 
 def test_wait_times_out_without_resolve(tmp_path: Path):
@@ -121,8 +124,39 @@ def test_wait_wakes_on_concurrent_resolve(tmp_path: Path):
     finally:
         t.join()
 
-    assert got == "allow"
+    assert got is not None
+    assert got["decision"] == "allow"
+    assert got["actor"] == "U9"
     assert elapsed < 2.0, f"wait took too long: {elapsed:.2f}s — FIFO wake did not fire"
+
+
+def test_resolve_with_selected_option_stores_index(tmp_path: Path):
+    """When the user clicks an AskUserQuestion option button, the resolved
+    record carries the index back so the waiting hook can pre-fill the
+    answer via PermissionRequest's updatedInput."""
+    pa.create(
+        "abc",
+        agent="claude-code",
+        session_id=None,
+        tool_name="AskUserQuestion",
+        tool_input={"questions": [{"question": "Q?", "options": [{"label": "A"}, {"label": "B"}]}]},
+        base_dir=tmp_path,
+    )
+    rec = pa.resolve("abc", "allow", actor="U1", selected_option=1, base_dir=tmp_path)
+    assert rec is not None
+    assert rec["decision"] == "allow"
+    assert rec["selected_option_index"] == 1
+    # Re-read via wait to confirm persistence.
+    got = pa.wait("abc", timeout=0.5, base_dir=tmp_path)
+    assert got is not None
+    assert got["selected_option_index"] == 1
+
+
+def test_resolve_without_selected_option_leaves_index_none(tmp_path: Path):
+    pa.create("abc", agent="claude-code", session_id=None, tool_name="Bash", base_dir=tmp_path)
+    rec = pa.resolve("abc", "allow", actor="U1", base_dir=tmp_path)
+    assert rec is not None
+    assert rec["selected_option_index"] is None
 
 
 def test_cleanup_removes_files(tmp_path: Path):

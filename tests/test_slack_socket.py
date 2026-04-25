@@ -46,6 +46,62 @@ def test_unknown_action_id_not_handled():
     assert res.handled is False
 
 
+def test_option_click_resolves_with_selected_index(tmp_path: Path):
+    """An AskUserQuestion option-button click resolves with allow + the
+    selected option index, and the chat.update body uses 'Selected `<label>`'
+    wording."""
+    pa.create(
+        "appr-aq",
+        agent="claude-code",
+        session_id="s",
+        tool_name="AskUserQuestion",
+        tool_input={
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": "First"},
+                        {"label": "Second"},
+                        {"label": "Third"},
+                    ],
+                }
+            ]
+        },
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-aq", "C1", "1.0", base_dir=tmp_path)
+
+    updates: list[dict] = []
+
+    def _update(bot_token, channel, ts, body):
+        updates.append({"channel": channel, "ts": ts, "body": body})
+
+    payload = _payload("agent_notify_option_2", value="appr-aq")
+    res = slack_socket.handle_block_actions(
+        payload,
+        _slack_config(),
+        update_fn=_update,
+        base_dir=tmp_path,
+    )
+
+    assert res.handled is True
+    assert res.decision == "allow"
+    rec = pa.read("appr-aq", base_dir=tmp_path)
+    assert rec["decision"] == "allow"
+    assert rec["selected_option_index"] == 2
+    # chat.update body uses the selected label.
+    assert len(updates) == 1
+    body_text = updates[0]["body"]["text"]
+    assert "Selected `Third`" in body_text
+
+
+def test_option_click_with_invalid_index_suffix_not_handled():
+    """If the action_id suffix isn't an integer, treat as unknown."""
+    payload = _payload("agent_notify_option_xyz", value="appr-1")
+    res = slack_socket.handle_block_actions(payload, _slack_config())
+    assert res.handled is False
+
+
 def test_approve_resolves_pending(tmp_path: Path):
     pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
               base_dir=tmp_path)

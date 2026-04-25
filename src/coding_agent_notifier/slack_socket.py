@@ -29,6 +29,8 @@ from .event import Event
 from .sinks.slack import (
     APPROVE_ACTION_ID,
     DENY_ACTION_ID,
+    OPTION_ACTION_ID_PREFIX,
+    _selected_label_from_record,
     build_resolved_message,
     update_message,
 )
@@ -86,13 +88,24 @@ def handle_block_actions(
         return ButtonClickResult(False, None, None, None, None)
     action = actions[0]
     action_id = action.get("action_id", "")
-    if action_id not in (APPROVE_ACTION_ID, DENY_ACTION_ID):
+    selected_option: int | None = None
+    if action_id == APPROVE_ACTION_ID:
+        decision = "allow"
+    elif action_id == DENY_ACTION_ID:
+        decision = "deny"
+    elif action_id.startswith(OPTION_ACTION_ID_PREFIX):
+        # AskUserQuestion option click: action_id suffix is the option index.
+        try:
+            selected_option = int(action_id[len(OPTION_ACTION_ID_PREFIX):])
+        except ValueError:
+            return ButtonClickResult(False, None, None, None, None)
+        decision = "allow"
+    else:
         return ButtonClickResult(False, None, None, None, None)
 
     approval_id = action.get("value") or ""
     user_id = (payload.get("user") or {}).get("id", "") or ""
     channel_id = (payload.get("channel") or {}).get("id")
-    decision = "allow" if action_id == APPROVE_ACTION_ID else "deny"
 
     authorized, reject_reason = _authorize(
         slack_config, user_id, channel_id, group_member_check
@@ -109,7 +122,13 @@ def handle_block_actions(
                 logger.exception("failed to send ephemeral rejection to %s", user_id)
         return ButtonClickResult(True, None, reject_reason, approval_id, user_id)
 
-    rec = resolve_fn(approval_id, decision, actor=user_id, base_dir=base_dir)
+    rec = resolve_fn(
+        approval_id,
+        decision,
+        actor=user_id,
+        selected_option=selected_option,
+        base_dir=base_dir,
+    )
     if rec is None:
         if ephemeral_fn is not None and channel_id:
             try:
@@ -127,7 +146,10 @@ def handle_block_actions(
     if msg_channel and msg_ts and slack_config.bot_token:
         try:
             event = _event_from_record(rec)
-            body = build_resolved_message(event, decision, f"<@{user_id}>")
+            selected_label = _selected_label_from_record(rec) if selected_option is not None else None
+            body = build_resolved_message(
+                event, decision, f"<@{user_id}>", selected_label=selected_label,
+            )
             update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
         except Exception:
             logger.exception("failed to chat.update original approval message")

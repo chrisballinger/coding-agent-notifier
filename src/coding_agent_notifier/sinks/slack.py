@@ -15,6 +15,12 @@ SLACK_CHAT_UPDATE_URL = "https://slack.com/api/chat.update"
 
 APPROVE_ACTION_ID = "agent_notify_approve"
 DENY_ACTION_ID = "agent_notify_deny"
+# Per-option AskUserQuestion buttons. Suffix is the index into
+# tool_input["questions"][0]["options"]. Daemon parses the index out of
+# action_id and stores it on the resolved approval record.
+OPTION_ACTION_ID_PREFIX = "agent_notify_option_"
+# Slack button text limit; truncate option labels to fit.
+_BUTTON_TEXT_MAX = 75
 
 # Slack attachment color bar per event kind (hex without #).
 _KIND_COLORS: dict[EventKind, str] = {
@@ -273,33 +279,87 @@ def _safe_json(text: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def build_approval_message(
-    event: Event,
-    approval_id: str,
-    *,
-    max_chars: int = DEFAULT_MAX_CHARS,
-    verbosity: Verbosity = "terse",
-) -> dict:
-    """Like `build_slack_message` but with an approve/deny actions block.
+def _ask_user_question_options(
+    tool_name: str | None,
+    tool_input: dict | None,
+) -> list[str] | None:
+    """Return the option labels of an AskUserQuestion's first question, or None.
 
-    Buttons carry `value = approval_id` so the Socket Mode handler can resolve
-    the right `PendingApproval` record on click. Approve has `primary` style +
-    a confirm dialog (an accidental tap on a lock screen shouldn't run a Bash
-    command); Deny is `danger` and needs no confirm (fail-safe direction).
+    Returns None for any non-AskUserQuestion tool, for malformed payloads,
+    or for `multiSelect: true` (out of scope for v1 — single-select only).
     """
-    body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
-    # The confirm dialog is part of the Slack payload — in minimal mode it
-    # would itself leak tool_name / cwd. Strip it to a generic prompt so the
-    # buttons stay opaque to anyone reading the message.
-    if verbosity == "minimal":
-        confirm_text = "Approve pending tool call?"
-    else:
-        tool_label = event.tool_name or "tool"
-        confirm_text = (
-            f"Allow `{tool_label}` to run in "
-            f"`{event.cwd.name or str(event.cwd)}`?"
-        )
-    actions_block = {
+    if tool_name != "AskUserQuestion" or not isinstance(tool_input, dict):
+        return None
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    q = questions[0]
+    if not isinstance(q, dict):
+        return None
+    if q.get("multiSelect") is True:
+        return None
+    options = q.get("options")
+    if not isinstance(options, list) or not options:
+        return None
+    labels: list[str] = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            return None
+        label = opt.get("label")
+        if not isinstance(label, str) or not label:
+            return None
+        labels.append(label)
+    return labels
+
+
+def _selected_label_from_record(rec: dict) -> str | None:
+    """Look up the selected option's label from a resolved approval record."""
+    idx = rec.get("selected_option_index")
+    if not isinstance(idx, int):
+        return None
+    labels = _ask_user_question_options(rec.get("tool_name"), rec.get("tool_input"))
+    if labels is None or not (0 <= idx < len(labels)):
+        return None
+    return labels[idx]
+
+
+def _truncate_button_text(text: str) -> str:
+    if len(text) <= _BUTTON_TEXT_MAX:
+        return text
+    return text[: _BUTTON_TEXT_MAX - 1] + "…"  # …
+
+
+def _build_option_buttons(approval_id: str, labels: list[str]) -> dict:
+    """Block Kit actions block: one button per option label + a Deny button."""
+    elements: list[dict] = []
+    for i, label in enumerate(labels):
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": _truncate_button_text(label), "emoji": False},
+            "action_id": f"{OPTION_ACTION_ID_PREFIX}{i}",
+            "value": approval_id,
+        })
+    elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Deny", "emoji": False},
+        "style": "danger",
+        "action_id": DENY_ACTION_ID,
+        "value": approval_id,
+    })
+    # Slack caps an actions block at 25 elements. With 1 Deny that means
+    # 24 options. Anything beyond that should fall back to a static_select
+    # — punted out of scope; just truncate to fit and log it.
+    if len(elements) > 25:
+        elements = elements[:24] + [elements[-1]]
+    return {
+        "type": "actions",
+        "block_id": f"agent_notify::{approval_id}",
+        "elements": elements,
+    }
+
+
+def _build_approve_deny_block(approval_id: str, confirm_text: str) -> dict:
+    return {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}",
         "elements": [
@@ -325,6 +385,46 @@ def build_approval_message(
             },
         ],
     }
+
+
+def build_approval_message(
+    event: Event,
+    approval_id: str,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+    verbosity: Verbosity = "terse",
+) -> dict:
+    """Like `build_slack_message` but with an actions block for the user.
+
+    For most tools, two buttons: Approve (primary, with confirm dialog so an
+    accidental lock-screen tap doesn't run a Bash command) and Deny (danger,
+    no confirm — fail-safe direction).
+
+    For AskUserQuestion, one button per option label + a Deny button. Tapping
+    an option resolves the approval AND threads the selected index back to
+    the hook so it pre-fills the answer via PermissionRequest's
+    `updatedInput`. Falls back to Approve/Deny if the AskUserQuestion payload
+    is malformed or uses multiSelect (v1 single-select only).
+    """
+    body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
+
+    option_labels = _ask_user_question_options(event.tool_name, event.tool_input)
+    if option_labels:
+        actions_block = _build_option_buttons(approval_id, option_labels)
+    else:
+        # The confirm dialog is part of the Slack payload — in minimal mode
+        # it would itself leak tool_name / cwd. Strip it to a generic prompt
+        # so the buttons stay opaque to anyone reading the message.
+        if verbosity == "minimal":
+            confirm_text = "Approve pending tool call?"
+        else:
+            tool_label = event.tool_name or "tool"
+            confirm_text = (
+                f"Allow `{tool_label}` to run in "
+                f"`{event.cwd.name or str(event.cwd)}`?"
+            )
+        actions_block = _build_approve_deny_block(approval_id, confirm_text)
+
     # Append to the first attachment so the color bar / fallback text stay
     # intact. Falls back to top-level blocks if the builder ever stops using
     # attachments (defensive).
@@ -381,16 +481,24 @@ def build_resolved_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
+    selected_label: str | None = None,
 ) -> dict:
     """Block Kit replacement for `chat.update` after approve/deny or timeout.
 
     Preserves the tool summary so scroll-back context isn't lost, but strips
     the buttons and swaps the header to the outcome.
+
+    When `selected_label` is provided (AskUserQuestion option click), the
+    header reads "Selected `<label>` by @user" instead of the generic
+    "Approved by @user". Decision is still "allow" — the selection both
+    approves the tool call AND chooses the answer.
     """
     if decision == "allow":
         icon = ":white_check_mark:"
         verb = "Approved"
         color = "#2eb67d"
+        if selected_label:
+            verb = f"Selected `{selected_label}`"
     elif decision == "deny":
         icon = ":no_entry_sign:"
         verb = "Denied"

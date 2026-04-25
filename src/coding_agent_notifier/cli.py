@@ -444,11 +444,11 @@ def cmd_permissionrequest(
         _emit_decision(out, "deny", reason=f"agent-notify: Slack post failed: {e}")
         return 0
 
-    decision = pending_approvals.wait(
+    record = pending_approvals.wait(
         approval_id,
         timeout=slack_cfg.approval_timeout_seconds,
     )
-    if decision is None:
+    if record is None:
         _log_event(f"PermissionRequest timed out approval_id={approval_id}")
         # Try to mark the message as timed-out; best-effort.
         try:
@@ -463,20 +463,73 @@ def cmd_permissionrequest(
         _emit_decision(out, "deny", reason="agent-notify: approval timed out")
         return 0
 
-    _log_event(f"PermissionRequest resolved approval_id={approval_id} decision={decision}")
+    decision = record["decision"]
+    selected_idx = record.get("selected_option_index")
+    _log_event(
+        f"PermissionRequest resolved approval_id={approval_id} decision={decision} "
+        f"selected_option_index={selected_idx}"
+    )
     pending_approvals.cleanup(approval_id)
-    _emit_decision(out, decision)
+
+    # If the user clicked an AskUserQuestion option button (vs plain
+    # Approve/Deny), pre-fill the tool's `answers` field via updatedInput
+    # so the AskUserQuestion tool returns the answer immediately instead
+    # of prompting the user in the terminal.
+    updated_input = None
+    if decision == "allow" and isinstance(selected_idx, int):
+        updated_input = _ask_user_question_updated_input(record, selected_idx)
+    _emit_decision(out, decision, updated_input=updated_input)
     return 0
 
 
-def _emit_decision(out, decision: str, *, reason: str | None = None) -> None:
+def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | None:
+    """Build an updatedInput payload for AskUserQuestion from a resolved
+    record + selected option index. Returns None if the record's tool_input
+    isn't a recognizable AskUserQuestion shape.
+    """
+    tool_input = record.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    q = questions[0]
+    if not isinstance(q, dict):
+        return None
+    question_text = q.get("question")
+    options = q.get("options")
+    if not isinstance(question_text, str) or not isinstance(options, list):
+        return None
+    if not (0 <= selected_idx < len(options)):
+        return None
+    opt = options[selected_idx]
+    if not isinstance(opt, dict):
+        return None
+    label = opt.get("label")
+    if not isinstance(label, str):
+        return None
+    return {"answers": {question_text: label}}
+
+
+def _emit_decision(
+    out,
+    decision: str,
+    *,
+    reason: str | None = None,
+    updated_input: dict | None = None,
+) -> None:
     # PermissionRequest's decision schema only allows allow/deny — no "ask"
     # or "defer" (those are PreToolUse-only). Reason is carried as
-    # decision.message and is only meaningful when denying.
+    # decision.message and is only meaningful when denying. updated_input
+    # is allow-only and modifies the tool's parameters before execution
+    # (used to pre-fill an AskUserQuestion's `answers` from a clicked Slack
+    # option button).
     assert decision in ("allow", "deny"), f"invalid decision: {decision!r}"
     decision_obj: dict = {"behavior": decision}
     if reason and decision == "deny":
         decision_obj["message"] = reason
+    if updated_input is not None and decision == "allow":
+        decision_obj["updatedInput"] = updated_input
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",

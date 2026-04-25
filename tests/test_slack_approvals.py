@@ -209,6 +209,118 @@ def test_build_resolved_message_timeout():
     assert "Timed out" in text
 
 
+# --- AskUserQuestion option-button rendering ---
+
+
+def _ask_user_question_event(**overrides) -> Event:
+    """Build a permission Event whose tool is AskUserQuestion."""
+    tool_input = overrides.pop("tool_input", None) or {
+        "questions": [
+            {
+                "question": "How should X be configured?",
+                "header": "Routing shape",
+                "multiSelect": False,
+                "options": [
+                    {"label": "Global config only", "description": "..."},
+                    {"label": "Per-repo files", "description": "..."},
+                    {"label": "Hybrid", "description": "..."},
+                ],
+            }
+        ]
+    }
+    return _event(tool_name="AskUserQuestion", tool_input=tool_input, **overrides)
+
+
+def test_build_approval_message_renders_option_buttons_for_ask_user_question():
+    body = build_approval_message(_ask_user_question_event(), "appr-aq-1")
+    actions = _find_block(body, "actions")
+    assert actions is not None
+    labels = [el["text"]["text"] for el in actions["elements"]]
+    # Three options + a Deny button at the end. NO generic Approve button.
+    assert labels == ["Global config only", "Per-repo files", "Hybrid", "Deny"]
+    # Each option button has a distinct action_id with the index suffix.
+    option_action_ids = [el["action_id"] for el in actions["elements"][:3]]
+    assert option_action_ids == [
+        "agent_notify_option_0",
+        "agent_notify_option_1",
+        "agent_notify_option_2",
+    ]
+    # Deny stays standard.
+    assert actions["elements"][-1]["action_id"] == DENY_ACTION_ID
+    # All buttons carry the approval_id as value.
+    for el in actions["elements"]:
+        assert el["value"] == "appr-aq-1"
+
+
+def test_option_buttons_truncate_long_labels():
+    long_label = "x" * 200
+    ev = _ask_user_question_event(tool_input={
+        "questions": [{
+            "question": "Q?",
+            "options": [{"label": long_label, "description": "..."}],
+        }]
+    })
+    body = build_approval_message(ev, "appr-aq-2")
+    actions = _find_block(body, "actions")
+    text = actions["elements"][0]["text"]["text"]
+    assert len(text) <= 75
+
+
+def test_build_approval_message_falls_back_for_multiselect():
+    """v1 only handles single-select questions. multiSelect → standard
+    Approve/Deny so the user can decide in-terminal."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [{
+            "question": "Pick many",
+            "multiSelect": True,
+            "options": [{"label": "A"}, {"label": "B"}],
+        }]
+    })
+    body = build_approval_message(ev, "appr-multi")
+    actions = _find_block(body, "actions")
+    labels = [el["text"]["text"] for el in actions["elements"]]
+    assert labels == ["Approve", "Deny"]
+
+
+def test_build_approval_message_falls_back_for_malformed_payload():
+    ev = _ask_user_question_event(tool_input={"questions": "not a list"})
+    body = build_approval_message(ev, "appr-bad")
+    actions = _find_block(body, "actions")
+    labels = [el["text"]["text"] for el in actions["elements"]]
+    assert labels == ["Approve", "Deny"]
+
+
+def test_non_ask_user_question_still_renders_approve_deny():
+    """Regression: Bash and other tools keep the standard two-button row."""
+    body = build_approval_message(_event(), "appr-bash")  # _event() defaults to Bash
+    actions = _find_block(body, "actions")
+    labels = [el["text"]["text"] for el in actions["elements"]]
+    assert labels == ["Approve", "Deny"]
+
+
+def test_build_resolved_message_uses_selected_label_when_provided():
+    body = build_resolved_message(
+        _ask_user_question_event(),
+        "allow",
+        "<@U1>",
+        selected_label="Per-repo files",
+    )
+    text_field = body["text"]
+    assert "Selected `Per-repo files`" in text_field
+    # Header block also reflects the selection.
+    blocks = body["attachments"][0]["blocks"]
+    header = blocks[0]["text"]["text"]
+    assert "Selected `Per-repo files`" in header
+    # Color stays the allow-green.
+    assert body["attachments"][0]["color"] == "#2eb67d"
+
+
+def test_build_resolved_message_without_selected_label_keeps_approved_wording():
+    body = build_resolved_message(_event(), "allow", "<@U1>")
+    assert "Approved" in body["text"]
+    assert "Selected" not in body["text"]
+
+
 def test_update_message_posts_to_chat_update():
     poster = _FakePoster(body={"ok": True, "channel": "C1", "ts": "1.0"})
     update_message("xoxb-test", "C1", "1.0", {"text": "hi"}, poster=poster)

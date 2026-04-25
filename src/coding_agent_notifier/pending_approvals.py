@@ -99,6 +99,11 @@ def create(
         "resolved_at": None,
         "channel": None,
         "message_ts": None,
+        # When the gated tool is AskUserQuestion and the user clicked an
+        # option button (vs. plain Approve/Deny), this carries the index
+        # into tool_input["questions"][0]["options"]. Stays None for
+        # non-AskUserQuestion approvals.
+        "selected_option_index": None,
     }
     with _locked(_lock_path(approval_id, base_dir)):
         from . import paths as _paths
@@ -132,10 +137,17 @@ def resolve(
     decision: str,
     *,
     actor: str | None = None,
+    selected_option: int | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict | None:
-    """Mark the approval resolved and wake the waiting hook. Returns record or None."""
+    """Mark the approval resolved and wake the waiting hook. Returns record or None.
+
+    `selected_option` is the index into the AskUserQuestion options list when
+    the user clicked an option button instead of plain Approve/Deny. Stored
+    on the record so the waiting hook can pre-fill the answer via
+    PermissionRequest's `updatedInput`.
+    """
     if decision not in ("allow", "deny"):
         raise ValueError(f"decision must be 'allow' or 'deny', got {decision!r}")
     record = _record_path(approval_id, base_dir)
@@ -150,6 +162,8 @@ def resolve(
         data["decision"] = decision
         data["actor"] = actor
         data["resolved_at"] = clock()
+        if selected_option is not None:
+            data["selected_option_index"] = selected_option
         from . import paths as _paths
         _paths.write_secure(record, json.dumps(data))
     # Wake outside the lock: opening a FIFO for write blocks until a reader
@@ -195,11 +209,12 @@ def wait(
     timeout: float,
     base_dir: Path | None = None,
     poll_interval: float = 1.0,
-) -> str | None:
-    """Block up to `timeout` seconds for a decision. Returns "allow"/"deny" or
-    None on timeout. Polls the record file in addition to select'ing on the
-    FIFO so we recover if the daemon wrote the decision before the FIFO open
-    (race) or if the FIFO write was dropped (ENXIO)."""
+) -> dict | None:
+    """Block up to `timeout` seconds for a decision. Returns the resolved
+    record dict (caller reads `decision`, `selected_option_index`, `actor`,
+    etc.) or None on timeout. Polls the record file in addition to
+    select'ing on the FIFO so we recover if the daemon wrote the decision
+    before the FIFO open (race) or if the FIFO write was dropped (ENXIO)."""
     fifo = _fifo_path(approval_id, base_dir)
     if not fifo.exists():
         fifo.parent.mkdir(parents=True, exist_ok=True)
@@ -211,7 +226,7 @@ def wait(
             # Check record first — handles the resolve-before-wait race.
             rec = read(approval_id, base_dir=base_dir)
             if rec and rec.get("decision") in ("allow", "deny"):
-                return rec["decision"]
+                return rec
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
@@ -223,7 +238,7 @@ def wait(
                     pass
                 rec = read(approval_id, base_dir=base_dir)
                 if rec and rec.get("decision") in ("allow", "deny"):
-                    return rec["decision"]
+                    return rec
                 # Spurious wake (writer opened and closed with no decision
                 # written yet) — loop and re-check.
     finally:
