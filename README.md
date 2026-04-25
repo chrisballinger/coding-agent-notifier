@@ -17,6 +17,8 @@ Duplicate-ping protection is built in: both agents fire two hooks for the same l
 | MCP server asking for input         | `Notification:elicitation_dialog`                 | —                                       |
 | Turn complete                       | `Stop`                                            | `notify` (`agent-turn-complete`), `Stop` |
 
+With actionable approvals enabled (Slack bot install), the permission DM also carries one-tap buttons — Approve/Deny on most tools, one button per option for `AskUserQuestion`, plus per-suggestion buttons that approve **and** extend your allowlist in a single tap. See [Phone-tap approvals](#phone-tap-approvals).
+
 ## Gating — why you won't get spammed
 
 By default (`gating = "idle_or_background"`) a ping is only sent if **either**:
@@ -33,6 +35,8 @@ Requires Python 3.11+ and [`uv`](https://github.com/astral-sh/uv) (or pipx / pip
 
 ```bash
 uv tool install --from . coding-agent-notifier
+# or with the actionable-Slack daemon (Socket Mode listener + buttons):
+uv tool install --from . 'coding-agent-notifier[slack-bot]'
 # or for development
 uv sync
 ```
@@ -126,6 +130,54 @@ On iOS the push preview is tight, so the default layout is optimized for a glanc
 - **Turn-complete snippet** (default on) reads the last assistant message from the transcript and shows its head + tail. Purely local — no API keys, no network.
 - **AskUserQuestion rendering** formats the question + options as a bulleted list rather than raw JSON.
 
+## Phone-tap approvals
+
+When `actionable_approvals = true` is set on a Slack workspace and the daemon is running, the permission DM that lands on your phone is interactive — not just a notification.
+
+**Setup (one-time):**
+
+```bash
+uv tool install --from . 'coding-agent-notifier[slack-bot]'   # base + slack-sdk
+agent-notify install slack-bot                                # writes Claude Code hook + launchd plist
+agent-notify slack add                                        # interactive wizard: tokens to Keychain, config block
+launchctl bootout gui/$(id -u)  ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist  # if previously loaded
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist
+```
+
+The daemon connects to Slack over Socket Mode (outbound WebSocket — no public port). Verify it's up:
+
+```bash
+launchctl print gui/$(id -u)/com.chrisballinger.agent-notify-daemon | grep -E 'state|active count'
+agent-notify slack test default   # posts a smoke message to your DM
+```
+
+**Visual semantics.** The sidebar color reflects what the message is asking of you:
+
+| Tier   | Color  | When                                                             |
+| ------ | ------ | ---------------------------------------------------------------- |
+| Green  | `#2eb67d` | Informational / done / question (turn_complete, idle_prompt, AskUserQuestion) |
+| Yellow | `#ecb22e` | Action required (permission requests on real tool calls)        |
+| Red    | `#a30f18` | Danger override — `tool_input` matched a destructive Bash pattern |
+
+**Button kinds.** Three flavors of interactivity, picked automatically from the tool:
+
+- **Approve / Deny** — the default for any tool needing permission. Approve has a confirmation dialog (an accidental lock-screen tap shouldn't run a Bash command); Deny is one-tap.
+- **Option buttons** — when the tool is `AskUserQuestion`, one button per option label. The first option whose label contains `(Recommended)` gets a filled green CTA. Multi-question questions render as separate actions blocks; tapping records a partial answer (the message updates with a ✓ on each answered question), and the approval finalizes only when every question has an entry. The hook then pre-fills the answers via `decision.updatedInput`, so the AskUserQuestion tool returns immediately without prompting in the terminal.
+- **Suggestion buttons** — when Claude Code attaches `permission_suggestions` to the request (e.g. *"add `Bash(curl:*)` to localSettings"*), each one becomes an extra button below Approve/Deny. Tapping resolves the approval as `allow` and emits `decision.updatedPermissions` so the rule edit is applied immediately — extending your allowlist in one tap.
+
+**Resolved-message wording** updates in place via `chat.update`:
+
+| Outcome                                | Header                                              |
+| -------------------------------------- | --------------------------------------------------- |
+| Plain Approve                          | ✅ Approved by @you                                  |
+| Plain Deny                             | 🚫 Denied by @you                                    |
+| Single-question option click           | ✅ Selected `<label>` by @you                        |
+| Multi-question all-questions answered  | ✅ Answered by @you (+ Q→A summary block)            |
+| Suggestion click                       | ✅ Approved & applied `<rule>` by @you               |
+| Timeout / failed Slack post            | ⏳ Timed out — denied                                |
+
+The daemon authorizes click authors against `approver_user_ids` (or `approver_user_groups` if you set them). If both lists are empty, the click is only honored when it came from a 1:1 DM — defense-in-depth against misconfigured shared channels.
+
 ## Per-repo routing
 
 Need different projects pinging different Slack workspaces or channels? Add `[[routes]]` blocks. The first whose `cwd` glob matches the hook's working directory wins; overrides merge on top of the selected workspace.
@@ -215,6 +267,20 @@ If `bot_token_keychain` is configured but the account is missing or the Keychain
 - **Encryption at rest.** Rely on macOS FileVault / LUKS / dm-crypt.
 - **Audit log of approve/deny decisions.** Separate feature — file if you want it.
 - **End-to-end encryption of push payloads.** See `docs/plans/ios-live-activities.md` for a native-iOS design that does E2EE; Slack itself is in-band encrypted but Slack-readable.
+
+## Troubleshooting
+
+| Symptom                                                                     | Likely cause                                                                                                  | Fix                                                                                                                                                   |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Slack DM arrives but **buttons spin forever**                               | Daemon isn't running — Socket Mode never receives the click.                                                  | `launchctl print gui/$(id -u)/com.chrisballinger.agent-notify-daemon \| grep "active count"`. If `0`, see the next two rows.                          |
+| Daemon logs `ModuleNotFoundError: No module named 'slack_sdk'`              | `uv tool install` was run **without** the `[slack-bot]` extras, so the daemon can't import its dependencies.  | `uv tool install --from . --reinstall 'coding-agent-notifier[slack-bot]'` (note the extras), then bounce the daemon.                                  |
+| `launchctl print` shows `last exit code = 78: EX_CONFIG`, `daemon.log` empty | Old plist used a bare `agent-notify` program name; launchd's PATH excluded `~/.local/bin`.                    | Re-run `agent-notify install slack-bot` (the install now writes the absolute path), then `launchctl bootout` + `bootstrap` to reload.                 |
+| `agent-notify slack test default` says "posted to U…" but **no DM appears** | Bot DMed itself (App Home Messages tab). Manifest wasn't declaring `messages_tab_enabled` at app-create time.  | In Slack admin → your app → **App Home** → toggle **Messages Tab** on. Or recreate the app from the updated `docs/slack-app-manifest.yaml`.           |
+| Reads (or other auto-allowed tools) suddenly **prompt for permission**       | Your hook command emits `permissionDecision: "ask"` somewhere — that overrides allowlists / sandbox.          | Should not happen with this version. If it does, check `~/.claude/settings.json` for stale `PreToolUse` blocks pointing at `agent-notify hook`.       |
+| Hook fires but **nothing reaches Slack**                                    | Likely a stale installed `agent-notify` binary in `~/.local/share/uv/tools/`. The hook spawns the installed copy, not your dev source. | `uv tool install --from . --reinstall 'coding-agent-notifier[slack-bot]'` and confirm `which agent-notify` and `defer.log`'s `spawning=` agree.       |
+| Multi-question AskUserQuestion **only renders Q1**                          | Old version. Multi-question support shipped in this release — just upgrade and reinstall.                     | `uv tool install --from . --reinstall 'coding-agent-notifier[slack-bot]'`.                                                                            |
+
+`~/.agent-notify/logs/daemon.log` is the daemon's stdout/stderr; `defer.log` is every hook fire and dispatch decision. Both are `0600` and owner-only.
 
 ## Commands
 

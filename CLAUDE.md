@@ -32,6 +32,8 @@ tests/             # Mirrors package layout; fixtures/ holds real-shape agent pa
 - **`source_app` comes from `$TERM_PROGRAM`** at hook fire time, translated via `macos.TERM_PROGRAM_TO_APP`. Add new mappings here when adopting new terminals.
 - **Installers back up the target** to `<path>.bak-<timestamp>` before writing. Keep them idempotent: re-running must be a no-op.
 - **HTTP goes through `sinks.base.http_post_json`** (stdlib `urllib`). Don't add `requests` / `httpx` just for one more call — keep the dependency surface small.
+- **Actionable approvals use `PermissionRequest`, not `PreToolUse`.** PermissionRequest fires only when Claude Code was about to prompt the user (auto-allowed tools skip it), so the matcher stays `*` without spamming. Output schema is `decision.behavior` (allow/deny only — no "ask"/"defer"); reasons go in `decision.message`. `updatedInput` pre-fills tool params (used for AskUserQuestion answers); `updatedPermissions` applies a rule edit (used for permission_suggestions). The blocking flow only kicks in when the resolved workspace has `actionable_approvals = true` — otherwise we fall through to the normal parse-and-send notification path.
+- **Per-button click decoding.** Action IDs are parsed in `slack_socket.handle_block_actions`: `agent_notify_approve`/`agent_notify_deny` for the standard pair, `agent_notify_option_<q>_<o>` for AskUserQuestion option clicks (legacy single-Q `_<o>` is also accepted for back-compat), and `agent_notify_suggestion_<i>` for suggestion clicks. Don't change these strings without bumping the back-compat matrix.
 
 ## Testing patterns
 - Hook payloads live in `tests/fixtures/*.json` as real-shape examples. Add a fixture when supporting a new event type; load via the `load_fixture` conftest fixture.
