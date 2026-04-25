@@ -89,8 +89,10 @@ def test_slack_minimal_keeps_approval_buttons():
                 break
     assert actions is not None
     labels = [el["text"]["text"] for el in actions["elements"]]
-    assert labels == ["Approve", "Deny"]
-    # Button values carry only the approval_id, no tool info.
+    assert labels == ["Approve", "Deny", "💬 Deny with reason"]
+    # Button values carry only the approval_id, no tool info. The
+    # deny-with-reason modal opens a text input the user fills in
+    # client-side, so the button itself stays opaque.
     for el in actions["elements"]:
         assert el["value"] == "appr-1"
 

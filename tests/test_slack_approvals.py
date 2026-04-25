@@ -53,7 +53,7 @@ def test_build_approval_message_adds_actions_block():
     actions = _find_block(body, "actions")
     assert actions is not None
     labels = [el["text"]["text"] for el in actions["elements"]]
-    assert labels == ["Approve", "Deny"]
+    assert labels == ["Approve", "Deny", "💬 Deny with reason"]
 
 
 def test_build_approval_message_carries_approval_id_in_button_value():
@@ -64,10 +64,11 @@ def test_build_approval_message_carries_approval_id_in_button_value():
 
 
 def test_build_approval_message_sets_action_ids():
+    from coding_agent_notifier.sinks.slack import DENY_REASON_ACTION_ID
     body = build_approval_message(_event(), "appr-1")
     actions = _find_block(body, "actions")
     action_ids = [el["action_id"] for el in actions["elements"]]
-    assert action_ids == [APPROVE_ACTION_ID, DENY_ACTION_ID]
+    assert action_ids == [APPROVE_ACTION_ID, DENY_ACTION_ID, DENY_REASON_ACTION_ID]
 
 
 def test_approve_button_has_confirm_dialog():
@@ -240,19 +241,24 @@ def test_build_approval_message_renders_option_buttons_for_ask_user_question():
     actions_blocks = _find_blocks(body, "actions")
     assert len(actions_blocks) == 2
     q1, deny_block = actions_blocks
-    # Question 1's options are buttons; action_ids carry both q and o
-    # indices so multi-question clicks are unambiguous.
+    # Question 1's options are buttons + a trailing "✏️ Custom answer"
+    # trigger for the freeform-text modal. Option action_ids carry both
+    # q and o indices so multi-question clicks are unambiguous.
     labels = [el["text"]["text"] for el in q1["elements"]]
-    assert labels == ["Global config only", "Per-repo files", "Hybrid"]
+    assert labels == [
+        "Global config only", "Per-repo files", "Hybrid", "✏️ Custom answer",
+    ]
     option_action_ids = [el["action_id"] for el in q1["elements"]]
     assert option_action_ids == [
         "agent_notify_option_0_0",
         "agent_notify_option_0_1",
         "agent_notify_option_0_2",
+        "agent_notify_custom_answer_0",
     ]
-    # Deny lives in its own actions block at the end.
-    assert deny_block["elements"][0]["action_id"] == DENY_ACTION_ID
-    assert deny_block["elements"][0]["text"]["text"] == "Deny"
+    # Deny lives in its own actions block at the end — one-tap Deny plus
+    # the deny-with-reason modal trigger.
+    deny_labels = [el["text"]["text"] for el in deny_block["elements"]]
+    assert deny_labels == ["Deny", "💬 Deny with reason"]
     # All buttons carry the approval_id as value.
     for el in q1["elements"] + deny_block["elements"]:
         assert el["value"] == "appr-aq-1"
@@ -268,6 +274,7 @@ def test_option_buttons_truncate_long_labels():
     })
     body = build_approval_message(ev, "appr-aq-2")
     actions = _find_block(body, "actions")
+    # First element is the option button; truncate applies to its label.
     text = actions["elements"][0]["text"]["text"]
     assert len(text) <= 75
 
@@ -287,7 +294,8 @@ def test_build_approval_message_renders_text_only_for_multiselect():
     body = build_approval_message(ev, "appr-multi")
     actions_blocks = _find_blocks(body, "actions")
     # Only the trailing Deny block — no option buttons rendered for this
-    # multiSelect question (user finishes in terminal).
+    # multiSelect question (user finishes in terminal). The Deny block
+    # carries one-tap Deny + the deny-with-reason modal trigger.
     assert len(actions_blocks) == 1
     assert actions_blocks[0]["elements"][0]["action_id"] == DENY_ACTION_ID
     # The question header still appears as a section block.
@@ -305,15 +313,16 @@ def test_build_approval_message_falls_back_for_malformed_payload():
     body = build_approval_message(ev, "appr-bad")
     actions = _find_block(body, "actions")
     labels = [el["text"]["text"] for el in actions["elements"]]
-    assert labels == ["Approve", "Deny"]
+    assert labels == ["Approve", "Deny", "💬 Deny with reason"]
 
 
 def test_non_ask_user_question_still_renders_approve_deny():
-    """Regression: Bash and other tools keep the standard two-button row."""
+    """Regression: Bash and other tools keep the standard button row,
+    now extended with the deny-with-reason modal trigger."""
     body = build_approval_message(_event(), "appr-bash")  # _event() defaults to Bash
     actions = _find_block(body, "actions")
     labels = [el["text"]["text"] for el in actions["elements"]]
-    assert labels == ["Approve", "Deny"]
+    assert labels == ["Approve", "Deny", "💬 Deny with reason"]
 
 
 def test_multi_question_renders_one_actions_block_per_question():
@@ -332,12 +341,18 @@ def test_multi_question_renders_one_actions_block_per_question():
 
     q1, q2, deny = actions_blocks
     q1_action_ids = [el["action_id"] for el in q1["elements"]]
-    assert q1_action_ids == ["agent_notify_option_0_0", "agent_notify_option_0_1"]
+    # Each question's actions block: option buttons + custom-answer trigger.
+    assert q1_action_ids == [
+        "agent_notify_option_0_0",
+        "agent_notify_option_0_1",
+        "agent_notify_custom_answer_0",
+    ]
     q2_action_ids = [el["action_id"] for el in q2["elements"]]
     assert q2_action_ids == [
         "agent_notify_option_1_0",
         "agent_notify_option_1_1",
         "agent_notify_option_1_2",
+        "agent_notify_custom_answer_1",
     ]
     assert deny["elements"][0]["action_id"] == DENY_ACTION_ID
 
@@ -413,7 +428,8 @@ def test_permission_suggestions_render_extra_buttons():
     assert len(actions_blocks) == 2
     approve_deny, suggestions = actions_blocks
     approve_deny_ids = [el["action_id"] for el in approve_deny["elements"]]
-    assert approve_deny_ids == [APPROVE_ACTION_ID, DENY_ACTION_ID]
+    from coding_agent_notifier.sinks.slack import DENY_REASON_ACTION_ID
+    assert approve_deny_ids == [APPROVE_ACTION_ID, DENY_ACTION_ID, DENY_REASON_ACTION_ID]
     suggestion_ids = [el["action_id"] for el in suggestions["elements"]]
     assert suggestion_ids == [
         f"{SUGGESTION_ACTION_ID_PREFIX}0",
@@ -426,12 +442,14 @@ def test_permission_suggestions_render_extra_buttons():
 
 
 def test_no_suggestion_buttons_without_suggestions():
-    """No permission_suggestions → just the standard Approve/Deny block."""
+    """No permission_suggestions → just the standard Approve/Deny block
+    (now extended with the deny-with-reason modal trigger)."""
+    from coding_agent_notifier.sinks.slack import DENY_REASON_ACTION_ID
     body = build_approval_message(_event(), "appr-no-sugg")
     actions_blocks = _find_blocks(body, "actions")
     assert len(actions_blocks) == 1
     assert [el["action_id"] for el in actions_blocks[0]["elements"]] == [
-        APPROVE_ACTION_ID, DENY_ACTION_ID,
+        APPROVE_ACTION_ID, DENY_ACTION_ID, DENY_REASON_ACTION_ID,
     ]
 
 
@@ -607,3 +625,177 @@ def _find_blocks(body: dict, block_type: str) -> list[dict]:
         if b.get("type") == block_type:
             out.append(b)
     return out
+
+
+# ----------------------------------------------------------------------
+# Modal builders + extract_modal_text + freeform-aware rendering
+# ----------------------------------------------------------------------
+
+
+def test_build_custom_answer_modal_carries_metadata_and_question_text():
+    from coding_agent_notifier.sinks.slack import build_custom_answer_modal
+    import json as _json
+    view = build_custom_answer_modal("appr-1", 2, "What's the mascot?")
+    assert view["type"] == "modal"
+    assert view["callback_id"] == "agent_notify_modal_custom_answer"
+    metadata = _json.loads(view["private_metadata"])
+    assert metadata == {"approval_id": "appr-1", "question_index": 2}
+    # Question text appears in a section block so the user knows the question.
+    section_texts = [
+        b["text"]["text"] for b in view["blocks"] if b.get("type") == "section"
+    ]
+    assert any("mascot" in t for t in section_texts)
+    # The input block has min_length=1 so empty submits don't reach us.
+    inputs = [b for b in view["blocks"] if b.get("type") == "input"]
+    assert len(inputs) == 1
+    assert inputs[0]["element"]["min_length"] == 1
+    assert inputs[0]["element"]["multiline"] is True
+
+
+def test_build_custom_answer_modal_truncates_long_question_for_title():
+    """Slack view title caps at 24 chars; long questions get truncated."""
+    from coding_agent_notifier.sinks.slack import build_custom_answer_modal
+    long_q = "a" * 200
+    view = build_custom_answer_modal("appr-1", 0, long_q)
+    assert len(view["title"]["text"]) <= 24
+
+
+def test_build_custom_answer_modal_falls_back_to_default_title_for_empty_question():
+    from coding_agent_notifier.sinks.slack import build_custom_answer_modal
+    view = build_custom_answer_modal("appr-1", 0, "")
+    assert view["title"]["text"] == "Custom answer"
+
+
+def test_build_custom_answer_modal_pre_fills_initial_value():
+    from coding_agent_notifier.sinks.slack import build_custom_answer_modal
+    view = build_custom_answer_modal("appr-1", 0, "Q?", initial_value="prior text")
+    inputs = [b for b in view["blocks"] if b.get("type") == "input"]
+    assert inputs[0]["element"]["initial_value"] == "prior text"
+
+
+def test_build_deny_reason_modal_shape():
+    from coding_agent_notifier.sinks.slack import build_deny_reason_modal
+    import json as _json
+    view = build_deny_reason_modal("appr-deny-1")
+    assert view["callback_id"] == "agent_notify_modal_deny_reason"
+    metadata = _json.loads(view["private_metadata"])
+    assert metadata == {"approval_id": "appr-deny-1"}
+    assert view["title"]["text"] == "Why deny?"
+
+
+def test_extract_modal_text_pulls_value_from_state():
+    from coding_agent_notifier.sinks.slack import extract_modal_text
+    view = {
+        "state": {
+            "values": {
+                "agent_notify_modal_input": {
+                    "agent_notify_modal_input_value": {"value": "user typed this"}
+                }
+            }
+        }
+    }
+    assert extract_modal_text(view) == "user typed this"
+
+
+def test_extract_modal_text_returns_none_for_malformed_view():
+    from coding_agent_notifier.sinks.slack import extract_modal_text
+    assert extract_modal_text({}) is None
+    assert extract_modal_text({"state": "not a dict"}) is None
+    assert extract_modal_text({"state": {"values": {}}}) is None
+
+
+def test_freeform_answer_appears_in_question_section_header():
+    """Re-rendering an approval with freeform_answers shows the typed text
+    under the question header (truncated for very long inputs)."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [
+            {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+        ]
+    })
+    body = build_approval_message(
+        ev, "appr-1",
+        freeform_answers={"0": "A pangolin"},
+    )
+    section_texts = [
+        b["text"]["text"]
+        for att in body["attachments"]
+        for b in att.get("blocks", [])
+        if b.get("type") == "section"
+    ]
+    full_text = "\n".join(section_texts)
+    assert "A pangolin" in full_text
+    # Custom-answer button gets a ✓ prefix when freeform is present.
+    actions = _find_blocks(body, "actions")[0]
+    custom_button = next(
+        el for el in actions["elements"]
+        if el["action_id"] == "agent_notify_custom_answer_0"
+    )
+    assert custom_button["text"]["text"].startswith("✓ ")
+
+
+def test_build_resolved_message_renders_freeform_answer_in_qa_summary():
+    """Multi-Q resolve with mixed option-clicks and freeform text shows
+    each in the Q→A summary."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [
+            {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+            {"question": "Color?", "options": [{"label": "Green"}, {"label": "Yellow"}]},
+        ]
+    })
+    body = build_resolved_message(
+        ev, "allow", "<@U1>",
+        selected_options={"1": 1},  # Yellow for Q2
+        freeform_answers={"0": "A pangolin"},  # custom for Q1
+    )
+    text = body["text"]
+    assert "Answered by <@U1>" in text
+    section_texts = [
+        b["text"]["text"]
+        for b in body["attachments"][0]["blocks"]
+        if b.get("type") == "section"
+    ]
+    full = "\n".join(section_texts)
+    assert "A pangolin" in full
+    assert "Yellow" in full
+
+
+def test_build_resolved_message_renders_deny_reason_in_context():
+    """A deny resolution with deny_reason renders the typed reason in a
+    context block under the header."""
+    body = build_resolved_message(
+        _event(), "deny", "<@U1>",
+        deny_reason="don't run shell commands without checking the lockfile",
+    )
+    context_blocks = [
+        b for b in body["attachments"][0]["blocks"] if b.get("type") == "context"
+    ]
+    assert any(
+        "lockfile" in el.get("text", "")
+        for b in context_blocks for el in b.get("elements", [])
+    )
+
+
+def test_selected_label_from_record_prefers_freeform_over_option():
+    from coding_agent_notifier.sinks.slack import _selected_label_from_record
+    rec = {
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+            "questions": [{"question": "Q?", "options": [{"label": "Opt1"}, {"label": "Opt2"}]}]
+        },
+        "selected_options": {"0": 1},  # Opt2
+        "freeform_answers": {"0": "typed override"},
+    }
+    assert _selected_label_from_record(rec) == "typed override"
+
+
+def test_single_question_resolved_header_uses_typed_text():
+    """Single-Q AskUserQuestion with custom answer: header reads
+    'Selected `<typed text>`' the same way it does for an option label."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [{"question": "Q?", "options": [{"label": "Only opt"}]}],
+    })
+    body = build_resolved_message(
+        ev, "allow", "<@U1>",
+        selected_label="my custom answer here",
+    )
+    assert "Selected `my custom answer here`" in body["text"]

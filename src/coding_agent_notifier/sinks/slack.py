@@ -24,8 +24,29 @@ OPTION_ACTION_ID_PREFIX = "agent_notify_option_"
 # permission_suggestions list. Tapping one resolves the approval as
 # allow + emits PermissionRequest's `decision.updatedPermissions`.
 SUGGESTION_ACTION_ID_PREFIX = "agent_notify_suggestion_"
+# Per-question "Custom answer" buttons on AskUserQuestion. Suffix is the
+# question index. Tapping one opens a modal with a text input; the typed
+# string becomes that question's answer (overrides any option click).
+CUSTOM_ANSWER_ACTION_ID_PREFIX = "agent_notify_custom_answer_"
+# "Deny with reason" button (alongside the one-tap Deny). Tapping opens a
+# modal with a single text input; the typed string becomes
+# `decision.message` on the deny path.
+DENY_REASON_ACTION_ID = "agent_notify_deny_reason"
+# Modal callback_ids — daemon's view_submission handler dispatches on these.
+MODAL_CALLBACK_CUSTOM_ANSWER = "agent_notify_modal_custom_answer"
+MODAL_CALLBACK_DENY_REASON = "agent_notify_modal_deny_reason"
+# Block / action IDs used inside the modals to locate the text input value.
+MODAL_INPUT_BLOCK_ID = "agent_notify_modal_input"
+MODAL_INPUT_ACTION_ID = "agent_notify_modal_input_value"
 # Slack button text limit; truncate option labels to fit.
 _BUTTON_TEXT_MAX = 75
+# Slack modal title hard cap (24 chars per Block Kit spec).
+_MODAL_TITLE_MAX = 24
+# Slack plain_text_input max_length cap we expose to users.
+_MODAL_INPUT_MAX = 1000
+# Truncate freeform answer text in resolved-message render so a 1000-char
+# rant doesn't blow out the chat.update payload.
+_RESOLVED_TEXT_MAX = 80
 
 # Slack attachment color bar per event kind. Tier semantics:
 #   green  = informational / done           (turn_complete, idle_prompt, elicitation)
@@ -364,14 +385,17 @@ def _ask_user_question_options(
 def _selected_label_from_record(rec: dict) -> str | None:
     """Look up the selected option's label from a resolved approval record.
 
-    Prefers the new `selected_options` dict (multi-question — returns the
-    label of `questions[0]`'s answer when present). Falls back to the
-    legacy `selected_option_index` for in-flight records from older
-    versions.
+    Prefers freeform_answers (typed text via custom-answer modal) over
+    selected_options (button click) over the legacy selected_option_index.
+    Returns the typed text directly when it wins — the resolved-message
+    header reads "Selected `<text>`" the same way it would for a label.
     """
     questions = _ask_user_question_questions(rec.get("tool_name"), rec.get("tool_input"))
     if not questions:
         return None
+    freeform = rec.get("freeform_answers")
+    if isinstance(freeform, dict) and isinstance(freeform.get("0"), str):
+        return freeform["0"]
     selected_options = rec.get("selected_options")
     if isinstance(selected_options, dict) and "0" in selected_options:
         idx = selected_options["0"]
@@ -395,22 +419,25 @@ def _build_option_buttons_for_question(
     labels: list[str],
     *,
     answered_index: int | None = None,
+    answered_freeform: bool = False,
 ) -> dict:
     """One actions block for a single question: option buttons indexed by
-    `question_index`. Each option's `action_id` is
-    `agent_notify_option_<q>_<o>` so the daemon knows which question the
-    click belongs to.
+    `question_index`, plus a trailing "✏️ Custom answer" trigger that opens
+    a modal. Each option's `action_id` is `agent_notify_option_<q>_<o>` so
+    the daemon knows which question the click belongs to; the custom-answer
+    button uses `agent_notify_custom_answer_<q>`.
 
     The first option whose label contains "(Recommended)" gets
     `style: "primary"` (filled green CTA) — Slack convention is one
-    primary per actions block.
+    primary per actions block. The custom-answer button stays unstyled to
+    scan as a fallback, not a CTA.
 
     `answered_index`, when provided, tags the already-clicked option's
-    button with a check-mark prefix so a follow-up chat.update shows the
-    user which choice they made. The other buttons stay tappable in case
-    they want to change their mind before the approval finalizes — though
-    in practice the approval finalizes the moment all questions have an
-    entry, so this is rarely actionable for the last click.
+    button with a check-mark prefix. `answered_freeform=True` tags the
+    custom-answer button instead (the user typed text). Either way, the
+    other buttons stay tappable so the user can switch their mind before
+    the approval finalizes (rare — finalize fires the moment every question
+    has an entry).
     """
     primary_assigned = False
     elements: list[dict] = []
@@ -428,8 +455,17 @@ def _build_option_buttons_for_question(
             button["style"] = "primary"
             primary_assigned = True
         elements.append(button)
-    if len(elements) > 25:
-        elements = elements[:25]
+    # Reserve one slot for the custom-answer button when within Slack's
+    # 25-element actions cap.
+    if len(elements) > 24:
+        elements = elements[:24]
+    custom_text = "✓ ✏️ Custom answer" if answered_freeform else "✏️ Custom answer"
+    elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": custom_text, "emoji": True},
+        "action_id": f"{CUSTOM_ANSWER_ACTION_ID_PREFIX}{question_index}",
+        "value": approval_id,
+    })
     return {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}::q{question_index}",
@@ -448,9 +484,141 @@ def _build_deny_block(approval_id: str) -> dict:
                 "style": "danger",
                 "action_id": DENY_ACTION_ID,
                 "value": approval_id,
-            }
+            },
+            _build_deny_with_reason_button(approval_id),
         ],
     }
+
+
+def _build_deny_with_reason_button(approval_id: str) -> dict:
+    """Trigger button for the deny-with-reason modal. Sits next to the
+    one-tap Deny — both `style: danger` so the deny semantics scan
+    visually together. Tap → modal with a single text input → submit
+    resolves with `deny_reason` plumbed into `decision.message`.
+    """
+    return {
+        "type": "button",
+        "text": {"type": "plain_text", "text": "💬 Deny with reason", "emoji": True},
+        "style": "danger",
+        "action_id": DENY_REASON_ACTION_ID,
+        "value": approval_id,
+    }
+
+
+def _modal_title(text: str, fallback: str) -> str:
+    """Slack view titles cap at 24 chars; truncate or fall back."""
+    flat = " ".join(text.split())
+    if not flat:
+        return fallback
+    if len(flat) <= _MODAL_TITLE_MAX:
+        return flat
+    return flat[: _MODAL_TITLE_MAX - 1] + "…"
+
+
+def build_custom_answer_modal(
+    approval_id: str,
+    question_index: int,
+    question_text: str,
+    *,
+    initial_value: str | None = None,
+) -> dict:
+    """Slack view payload for the "✏️ Custom answer" modal.
+
+    `private_metadata` carries the JSON `{approval_id, question_index}` so
+    the daemon's view_submission handler can route the typed text back to
+    the right question. `initial_value` pre-fills the field — used when
+    the user re-opens the modal after a previous submission.
+    """
+    metadata = json.dumps({"approval_id": approval_id, "question_index": question_index})
+    element: dict = {
+        "type": "plain_text_input",
+        "action_id": MODAL_INPUT_ACTION_ID,
+        "multiline": True,
+        "min_length": 1,
+        "max_length": _MODAL_INPUT_MAX,
+        "placeholder": {"type": "plain_text", "text": "Your answer…"},
+    }
+    if initial_value:
+        element["initial_value"] = initial_value
+    return {
+        "type": "modal",
+        "callback_id": MODAL_CALLBACK_CUSTOM_ANSWER,
+        "private_metadata": metadata,
+        "title": {"type": "plain_text", "text": _modal_title(question_text, "Custom answer")},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*{question_text}*"},
+            },
+            {
+                "type": "input",
+                "block_id": MODAL_INPUT_BLOCK_ID,
+                "label": {"type": "plain_text", "text": "Your answer"},
+                "element": element,
+            },
+        ],
+    }
+
+
+def build_deny_reason_modal(approval_id: str) -> dict:
+    """Slack view payload for the "💬 Deny with reason" modal.
+
+    The typed text becomes `decision.message` on the deny path — Claude
+    sees it as the rejection reason and can adjust its approach.
+    """
+    metadata = json.dumps({"approval_id": approval_id})
+    return {
+        "type": "modal",
+        "callback_id": MODAL_CALLBACK_DENY_REASON,
+        "private_metadata": metadata,
+        "title": {"type": "plain_text", "text": "Why deny?"},
+        "submit": {"type": "plain_text", "text": "Deny"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": MODAL_INPUT_BLOCK_ID,
+                "label": {"type": "plain_text", "text": "Reason for denial"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": MODAL_INPUT_ACTION_ID,
+                    "multiline": True,
+                    "min_length": 1,
+                    "max_length": _MODAL_INPUT_MAX,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Why is this denied? Claude will see this.",
+                    },
+                },
+            },
+        ],
+    }
+
+
+def extract_modal_text(view: dict) -> str | None:
+    """Pull the user's typed string out of a `view_submission` view.
+
+    Returns the input value at `view.state.values[MODAL_INPUT_BLOCK_ID][MODAL_INPUT_ACTION_ID]`,
+    or None if the shape doesn't match (defensive against Slack schema drift).
+    """
+    if not isinstance(view, dict):
+        return None
+    state = view.get("state")
+    if not isinstance(state, dict):
+        return None
+    values = state.get("values")
+    if not isinstance(values, dict):
+        return None
+    block = values.get(MODAL_INPUT_BLOCK_ID)
+    if not isinstance(block, dict):
+        return None
+    inp = block.get(MODAL_INPUT_ACTION_ID)
+    if not isinstance(inp, dict):
+        return None
+    val = inp.get("value")
+    return val if isinstance(val, str) and val else None
 
 
 def _build_multi_question_blocks(
@@ -458,22 +626,32 @@ def _build_multi_question_blocks(
     questions: list[dict],
     *,
     selected_options: dict[str, int] | None = None,
+    freeform_answers: dict[str, str] | None = None,
 ) -> list[dict]:
     """Block Kit blocks for an N-question AskUserQuestion: a section header
-    per question (with ✓ once answered) followed by its option buttons,
-    then a single trailing Deny block at the end. multiSelect questions
-    render as text-only ("answer this in the terminal") since Slack
-    buttons can't carry multi-select state cleanly.
+    per question (with ✓ once answered) followed by its option buttons +
+    a "✏️ Custom answer" trigger, then a single trailing Deny block at the
+    end. multiSelect questions render as text-only ("answer this in the
+    terminal") since Slack buttons can't carry multi-select state cleanly.
+
+    `freeform_answers` (str_q_idx → typed text) wins over `selected_options`
+    per question — if the user submitted a custom answer modal for Q1, the
+    section header shows the typed text, the custom-answer button gets a ✓,
+    and the option buttons stay un-checked.
     """
     selected = selected_options or {}
+    freeform = freeform_answers or {}
     blocks: list[dict] = []
     for q_idx, q in enumerate(questions):
-        answered = q_idx_str_in_dict(selected, q_idx)
-        check = "✓" if answered is not None else " "
+        freeform_text = freeform.get(str(q_idx)) if isinstance(freeform.get(str(q_idx)), str) else None
+        answered_opt = None if freeform_text else q_idx_str_in_dict(selected, q_idx)
+        check = "✓" if (freeform_text is not None or answered_opt is not None) else " "
         header = q.get("header") or q["question"]
         section_text = f"*{check} Q{q_idx + 1}.* {header}"
-        if answered is not None and 0 <= answered < len(q["options"]):
-            section_text += f"\n_Answered: {q['options'][answered]['label']}_"
+        if freeform_text is not None:
+            section_text += f"\n_Answered: \"{_truncate_resolved_text(freeform_text)}\"_"
+        elif answered_opt is not None and 0 <= answered_opt < len(q["options"]):
+            section_text += f"\n_Answered: {q['options'][answered_opt]['label']}_"
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": section_text},
@@ -487,10 +665,20 @@ def _build_multi_question_blocks(
             continue
         labels = [opt["label"] for opt in q["options"]]
         blocks.append(_build_option_buttons_for_question(
-            approval_id, q_idx, labels, answered_index=answered,
+            approval_id, q_idx, labels,
+            answered_index=answered_opt,
+            answered_freeform=freeform_text is not None,
         ))
     blocks.append(_build_deny_block(approval_id))
     return blocks
+
+
+def _truncate_resolved_text(text: str) -> str:
+    """Cap freeform answer / deny reason text shown in re-rendered messages."""
+    flat = " ".join(text.split())
+    if len(flat) <= _RESOLVED_TEXT_MAX:
+        return flat
+    return flat[: _RESOLVED_TEXT_MAX - 1].rstrip() + "…"
 
 
 def q_idx_str_in_dict(selected: dict[str, int], q_idx: int) -> int | None:
@@ -576,6 +764,7 @@ def _build_approve_deny_block(approval_id: str, confirm_text: str) -> dict:
                 "action_id": DENY_ACTION_ID,
                 "value": approval_id,
             },
+            _build_deny_with_reason_button(approval_id),
         ],
     }
 
@@ -587,6 +776,7 @@ def build_approval_message(
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
     selected_options: dict[str, int] | None = None,
+    freeform_answers: dict[str, str] | None = None,
 ) -> dict:
     """Like `build_slack_message` but with an actions block for the user.
 
@@ -610,7 +800,9 @@ def build_approval_message(
         # AskUserQuestion never gets suggestion buttons — the option
         # buttons ARE the answer; suggestions would conflict.
         appended_blocks = _build_multi_question_blocks(
-            approval_id, questions, selected_options=selected_options,
+            approval_id, questions,
+            selected_options=selected_options,
+            freeform_answers=freeform_answers,
         )
     else:
         # The confirm dialog is part of the Slack payload — in minimal mode
@@ -692,7 +884,9 @@ def build_resolved_message(
     verbosity: Verbosity = "terse",
     selected_label: str | None = None,
     selected_options: dict[str, int] | None = None,
+    freeform_answers: dict[str, str] | None = None,
     selected_suggestion_label: str | None = None,
+    deny_reason: str | None = None,
 ) -> dict:
     """Block Kit replacement for `chat.update` after approve/deny or timeout.
 
@@ -701,25 +895,32 @@ def build_resolved_message(
 
     Args:
       selected_label: legacy single-question AskUserQuestion — header reads
-        "Selected `<label>` by @user".
+        "Selected `<label>` by @user". Pass the typed text here for the
+        single-question custom-answer case.
       selected_options: multi-question AskUserQuestion — header reads
         "Answered" and a section block lists each Q→A pair.
+      freeform_answers: per-question typed text from custom-answer modals.
+        Wins over `selected_options` per question in the Q→A summary.
       selected_suggestion_label: a permission_suggestion was clicked —
         header reads "Approved & applied: <label> by @user".
+      deny_reason: typed text from the deny-with-reason modal. Rendered in
+        a context block under the denied header.
 
-    Decision is still "allow" for these variants; the selection both
-    approves the tool call AND chooses the answer(s) / rule edit.
+    Decision is still "allow" for the answer/suggestion variants; the
+    selection both approves the tool call AND chooses the answer(s) /
+    rule edit.
     """
+    has_multi = bool(selected_options) or bool(freeform_answers)
     if decision == "allow":
         icon = ":white_check_mark:"
         verb = "Approved"
         color = "#2eb67d"
         if selected_suggestion_label:
             verb = f"Approved & applied {selected_suggestion_label}"
-        elif selected_options:
+        elif has_multi:
             verb = "Answered"
         elif selected_label:
-            verb = f"Selected `{selected_label}`"
+            verb = f"Selected `{_truncate_resolved_text(selected_label)}`"
     elif decision == "deny":
         icon = ":no_entry_sign:"
         verb = "Denied"
@@ -733,9 +934,18 @@ def build_resolved_message(
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
+    if decision == "deny" and deny_reason:
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": f"_Reason: \"{_truncate_resolved_text(deny_reason)}\"_",
+            }],
+        })
 
     if verbosity == "minimal":
-        # Outcome + actor only — no tool name, no context footer.
+        # Outcome + actor only — no tool name, no context footer. Reason
+        # text already added above for deny.
         return {
             "text": f"{verb} by {actor_label}",
             "attachments": [{"color": color, "blocks": blocks}],
@@ -749,13 +959,22 @@ def build_resolved_message(
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
 
     # Multi-question Q→A summary block. Renders one mrkdwn line per
-    # answered question; unanswered questions just say "(no answer)".
-    if selected_options:
+    # answered question; freeform text wins over option label per question.
+    if has_multi:
         questions = _ask_user_question_questions(event.tool_name, event.tool_input)
         if questions:
+            options_dict = selected_options or {}
+            freeform_dict = freeform_answers or {}
             lines: list[str] = []
             for q_idx, q in enumerate(questions):
-                ans_idx = q_idx_str_in_dict(selected_options, q_idx)
+                key = str(q_idx)
+                ftext = freeform_dict.get(key) if isinstance(freeform_dict.get(key), str) else None
+                if ftext is not None:
+                    lines.append(
+                        f"*Q{q_idx + 1}.* {q['question']}\n→ \"{_truncate_resolved_text(ftext)}\""
+                    )
+                    continue
+                ans_idx = q_idx_str_in_dict(options_dict, q_idx)
                 if ans_idx is not None and 0 <= ans_idx < len(q["options"]):
                     label = q["options"][ans_idx]["label"]
                     lines.append(f"*Q{q_idx + 1}.* {q['question']}\n→ `{label}`")

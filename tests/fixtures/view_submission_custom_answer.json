@@ -1,0 +1,23 @@
+{
+  "type": "view_submission",
+  "team": {"id": "T0001", "domain": "example"},
+  "user": {"id": "U_TEST", "name": "tester"},
+  "trigger_id": "1234.5678.modal-trigger",
+  "view": {
+    "id": "V_MODAL_001",
+    "type": "modal",
+    "callback_id": "agent_notify_modal_custom_answer",
+    "private_metadata": "{\"approval_id\": \"appr-cust-1\", \"question_index\": 0}",
+    "title": {"type": "plain_text", "text": "Mascot?"},
+    "state": {
+      "values": {
+        "agent_notify_modal_input": {
+          "agent_notify_modal_input_value": {
+            "type": "plain_text_input",
+            "value": "Definitely a raccoon — they get into everything"
+          }
+        }
+      }
+    }
+  }
+}

@@ -493,6 +493,194 @@ def test_emit_decision_drops_updated_input_when_decision_is_deny():
     assert out["hookSpecificOutput"]["decision"]["message"] == "nope"
 
 
+def test_permissionrequest_emits_freeform_answer_in_updated_input(tmp_path, monkeypatch):
+    """When the user submits a custom-answer modal, the typed string lands
+    in `decision.updatedInput.answers["<question>"]` instead of an option
+    label."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(
+                    rec["approval_id"], "allow",
+                    actor="U_OK",
+                    freeform_answers={"0": "A pangolin"},
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {
+                "tool_name": "AskUserQuestion",
+                "tool_input": {
+                    "questions": [{
+                        "question": "Mascot?",
+                        "options": [{"label": "Raccoon"}, {"label": "Capybara"}],
+                    }],
+                },
+                "session_id": "s1",
+            },
+            cfg, poster=poster, stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    decision = json.loads(buf.getvalue())["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert decision["updatedInput"] == {"answers": {"Mascot?": "A pangolin"}}
+
+
+def test_permissionrequest_freeform_wins_over_option_per_question(tmp_path, monkeypatch):
+    """Mixed multi-Q resolution: freeform text on Q1 wins over any option
+    index, while Q2's option label still surfaces normally."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(
+                    rec["approval_id"], "allow",
+                    actor="U_OK",
+                    selected_options={"1": 1},  # Color = Yellow
+                    freeform_answers={"0": "A pangolin"},
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {
+                "tool_name": "AskUserQuestion",
+                "tool_input": {
+                    "questions": [
+                        {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+                        {"question": "Color?", "options": [{"label": "Green"}, {"label": "Yellow"}]},
+                    ],
+                },
+                "session_id": "s1",
+            },
+            cfg, poster=poster, stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    decision = json.loads(buf.getvalue())["hookSpecificOutput"]["decision"]
+    assert decision["updatedInput"] == {
+        "answers": {"Mascot?": "A pangolin", "Color?": "Yellow"},
+    }
+
+
+def test_permissionrequest_emits_deny_reason_as_decision_message(tmp_path, monkeypatch):
+    """Deny resolution with deny_reason puts the typed text into
+    `decision.message` so Claude sees it as the rejection reason."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(
+                    rec["approval_id"], "deny",
+                    actor="U_OK",
+                    deny_reason="check the lockfile first",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {"tool_name": "Bash", "tool_input": {"command": "npm test"}, "session_id": "s1"},
+            cfg, poster=poster, stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    decision = json.loads(buf.getvalue())["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "deny"
+    assert decision["message"] == "check the lockfile first"
+
+
+def test_permissionrequest_deny_without_reason_leaves_message_unset(tmp_path, monkeypatch):
+    """One-tap deny (no modal) → decision has no `message` field."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(rec["approval_id"], "deny", actor="U_OK")
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"},
+            cfg, poster=poster, stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    decision = json.loads(buf.getvalue())["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "deny"
+    assert "message" not in decision
+
+
 def test_permissionrequest_strict_routing_no_match_emits_nothing(tmp_path, monkeypatch):
     """If routes are configured and none match the cwd, strict mode returns
     None from sinks_for. The hook must emit nothing so Claude Code falls

@@ -474,16 +474,21 @@ def cmd_permissionrequest(
     decision = record["decision"]
     selected_idx = record.get("selected_option_index")
     selected_options = record.get("selected_options") or {}
+    freeform_answers = record.get("freeform_answers") or {}
     selected_suggestion_idx = record.get("selected_suggestion_index")
+    deny_reason = record.get("deny_reason")
     _log_event(
         f"PermissionRequest resolved approval_id={approval_id} decision={decision} "
         f"selected_option_index={selected_idx} selected_options={selected_options} "
-        f"selected_suggestion_index={selected_suggestion_idx}"
+        f"freeform_answers_keys={sorted(freeform_answers.keys()) if isinstance(freeform_answers, dict) else None} "
+        f"selected_suggestion_index={selected_suggestion_idx} "
+        f"deny_reason={'<set>' if deny_reason else None}"
     )
     pending_approvals.cleanup(approval_id)
 
     updated_input = None
     updated_permissions = None
+    emit_reason = None
     if decision == "allow":
         # Suggestion clicks → updatedPermissions (apply the rule edit
         # the user picked). Mutually exclusive with AskUserQuestion
@@ -493,15 +498,22 @@ def cmd_permissionrequest(
             updated_permissions = _suggestion_to_updated_permissions(
                 record, selected_suggestion_idx,
             )
-        # AskUserQuestion option button(s) → updatedInput.answers so the
-        # tool returns the answer immediately instead of prompting in
-        # terminal. Multi-Q (dict) preferred over legacy single-Q (int).
-        elif selected_options:
-            updated_input = _ask_user_question_updated_input_multi(record, selected_options)
+        # AskUserQuestion answers → updatedInput.answers. Multi-Q dict
+        # (option clicks + freeform text) preferred over legacy single-Q
+        # int. Freeform text wins per question over option labels.
+        elif selected_options or freeform_answers:
+            updated_input = _ask_user_question_updated_input_multi(
+                record, selected_options, freeform_answers=freeform_answers,
+            )
         elif isinstance(selected_idx, int):
             updated_input = _ask_user_question_updated_input(record, selected_idx)
+    else:
+        # decision == "deny" — surface the typed reason to Claude.
+        if isinstance(deny_reason, str) and deny_reason.strip():
+            emit_reason = deny_reason
     _emit_decision(
         out, decision,
+        reason=emit_reason,
         updated_input=updated_input,
         updated_permissions=updated_permissions,
     )
@@ -556,13 +568,20 @@ def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | 
 
 
 def _ask_user_question_updated_input_multi(
-    record: dict, selected_options: dict[str, int],
+    record: dict,
+    selected_options: dict[str, int],
+    *,
+    freeform_answers: dict[str, str] | None = None,
 ) -> dict | None:
-    """Build an updatedInput payload from a multi-question selected_options
-    dict. Returns {"answers": {<Q text>: <label>, ...}} for every question
-    that has a recorded answer; questions without an answer are omitted
-    (Claude Code falls back to terminal-prompt for those, which matches
-    the AskUserQuestion partial-answer semantic).
+    """Build an updatedInput payload from multi-question answers. Returns
+    {"answers": {<Q text>: <answer>, ...}} for every question that has a
+    recorded answer; questions without an answer are omitted (Claude Code
+    falls back to terminal-prompt for those, which matches the
+    AskUserQuestion partial-answer semantic).
+
+    `freeform_answers` (str_q_idx → typed text) wins over `selected_options`
+    per question — when the user submits a custom answer modal for Q1, the
+    typed string lands in `answers[Q1]` instead of an option label.
     """
     tool_input = record.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -570,22 +589,25 @@ def _ask_user_question_updated_input_multi(
     questions = tool_input.get("questions")
     if not isinstance(questions, list) or not questions:
         return None
+    freeform = freeform_answers if isinstance(freeform_answers, dict) else {}
     answers: dict[str, str] = {}
-    for q_idx_str, opt_idx in selected_options.items():
-        try:
-            q_idx = int(q_idx_str)
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= q_idx < len(questions)):
-            continue
-        q = questions[q_idx]
+    # Iterate questions in order so the answer dict is deterministic.
+    for q_idx, q in enumerate(questions):
         if not isinstance(q, dict):
             continue
         question_text = q.get("question")
-        options = q.get("options")
-        if not isinstance(question_text, str) or not isinstance(options, list):
+        if not isinstance(question_text, str):
             continue
-        if not isinstance(opt_idx, int) or not (0 <= opt_idx < len(options)):
+        key = str(q_idx)
+        ftext = freeform.get(key)
+        if isinstance(ftext, str) and ftext:
+            answers[question_text] = ftext
+            continue
+        opt_idx = selected_options.get(key)
+        if not isinstance(opt_idx, int):
+            continue
+        options = q.get("options")
+        if not isinstance(options, list) or not (0 <= opt_idx < len(options)):
             continue
         opt = options[opt_idx]
         if not isinstance(opt, dict):

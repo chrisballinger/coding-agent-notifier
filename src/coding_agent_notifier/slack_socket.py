@@ -28,14 +28,21 @@ from .config import Config, SlackConfig
 from .event import Event
 from .sinks.slack import (
     APPROVE_ACTION_ID,
+    CUSTOM_ANSWER_ACTION_ID_PREFIX,
     DENY_ACTION_ID,
+    DENY_REASON_ACTION_ID,
+    MODAL_CALLBACK_CUSTOM_ANSWER,
+    MODAL_CALLBACK_DENY_REASON,
     OPTION_ACTION_ID_PREFIX,
     SUGGESTION_ACTION_ID_PREFIX,
     _ask_user_question_questions,
     _selected_label_from_record,
     _suggestion_label,
     build_approval_message,
+    build_custom_answer_modal,
+    build_deny_reason_modal,
     build_resolved_message,
+    extract_modal_text,
     update_message,
 )
 
@@ -65,6 +72,7 @@ def handle_block_actions(
     resolve_fn: Callable[..., dict | None] = pending_approvals.resolve,
     ephemeral_fn: Callable[..., None] | None = None,
     update_fn: Callable[..., None] = update_message,
+    views_open_fn: Callable[[str, dict], None] | None = None,
     group_member_check: Callable[[str, str], bool] | None = None,
     base_dir: Path | None = None,
 ) -> ButtonClickResult:
@@ -95,13 +103,27 @@ def handle_block_actions(
     # Single-question (legacy) click: agent_notify_option_<o>
     # Multi-question click: agent_notify_option_<q>_<o>
     # Suggestion click:    agent_notify_suggestion_<i>
+    # Modal-trigger clicks (resolved via view_submission, not here):
+    #   custom-answer:     agent_notify_custom_answer_<q>
+    #   deny-with-reason:  agent_notify_deny_reason
     selected_option: int | None = None
     selected_question: int | None = None
     selected_suggestion: int | None = None
+    modal_kind: str | None = None
+    modal_question_index: int | None = None
+    decision: str | None = None
     if action_id == APPROVE_ACTION_ID:
         decision = "allow"
     elif action_id == DENY_ACTION_ID:
         decision = "deny"
+    elif action_id == DENY_REASON_ACTION_ID:
+        modal_kind = "deny_reason"
+    elif action_id.startswith(CUSTOM_ANSWER_ACTION_ID_PREFIX):
+        try:
+            modal_question_index = int(action_id[len(CUSTOM_ANSWER_ACTION_ID_PREFIX):])
+        except ValueError:
+            return ButtonClickResult(False, None, None, None, None)
+        modal_kind = "custom_answer"
     elif action_id.startswith(SUGGESTION_ACTION_ID_PREFIX):
         try:
             selected_suggestion = int(action_id[len(SUGGESTION_ACTION_ID_PREFIX):])
@@ -146,6 +168,45 @@ def handle_block_actions(
                 logger.exception("failed to send ephemeral rejection to %s", user_id)
         return ButtonClickResult(True, None, reject_reason, approval_id, user_id)
 
+    # Modal-trigger clicks: open the modal and return — the actual resolve
+    # happens later when `view_submission` arrives. The `trigger_id` is
+    # short-lived (3s per Slack docs), so views_open must run synchronously.
+    if modal_kind is not None:
+        trigger_id = payload.get("trigger_id") or ""
+        if not trigger_id or views_open_fn is None:
+            # No way to open a modal — log and fall through; user can use
+            # the one-tap buttons instead.
+            logger.warning(
+                "modal-trigger click but no trigger_id / views_open_fn (action=%s)",
+                action_id,
+            )
+            return ButtonClickResult(True, None, "no_trigger", approval_id, user_id)
+        try:
+            view = _build_modal_for(
+                modal_kind, approval_id, modal_question_index, base_dir,
+            )
+        except Exception:
+            logger.exception("failed to build modal for action=%s", action_id)
+            return ButtonClickResult(True, None, "modal_build_failed", approval_id, user_id)
+        if view is None:
+            # Approval missing — same UX as a stale option click.
+            if ephemeral_fn is not None and channel_id:
+                try:
+                    ephemeral_fn(
+                        channel=channel_id,
+                        user=user_id,
+                        text=":question: That approval is no longer pending (expired or already resolved).",
+                    )
+                except Exception:
+                    logger.exception("failed to send stale-approval ephemeral to %s", user_id)
+            return ButtonClickResult(True, None, "unknown_approval", approval_id, user_id)
+        try:
+            views_open_fn(trigger_id, view)
+        except Exception:
+            logger.exception("views_open failed for action=%s", action_id)
+            return ButtonClickResult(True, None, "views_open_failed", approval_id, user_id)
+        return ButtonClickResult(True, None, None, approval_id, user_id)
+
     # Multi-question: an option click is a partial answer if other
     # questions still need answering. We record it (without resolving),
     # update the message to reflect progress, and only resolve once every
@@ -182,6 +243,7 @@ def handle_block_actions(
             if is_resolved:
                 selected_label = _selected_label_from_record(rec) if selected_option is not None else None
                 selected_options = rec.get("selected_options") if rec.get("selected_options") else None
+                freeform_answers = rec.get("freeform_answers") if rec.get("freeform_answers") else None
                 # Suggestion-click: look up the chosen suggestion's
                 # human label so the resolved message tells the user
                 # what rule edit was applied.
@@ -196,6 +258,7 @@ def handle_block_actions(
                     event, decision, f"<@{user_id}>",
                     selected_label=selected_label,
                     selected_options=selected_options,
+                    freeform_answers=freeform_answers,
                     selected_suggestion_label=suggestion_label,
                 )
             else:
@@ -205,6 +268,7 @@ def handle_block_actions(
                 body = build_approval_message(
                     event, approval_id,
                     selected_options=rec.get("selected_options") or {},
+                    freeform_answers=rec.get("freeform_answers") or {},
                 )
             update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
         except Exception:
@@ -212,6 +276,192 @@ def handle_block_actions(
 
     final_decision = rec.get("decision")
     return ButtonClickResult(True, final_decision, None, approval_id, user_id)
+
+
+def _build_modal_for(
+    modal_kind: str,
+    approval_id: str,
+    question_index: int | None,
+    base_dir: Path | None,
+) -> dict | None:
+    """Look up state from the pending record + return the modal view dict.
+
+    Returns None when the approval is gone (the caller surfaces a stale-
+    approval ephemeral). For custom_answer, also pre-fills the input with
+    any previously-submitted text so re-opening the modal isn't a blank
+    slate.
+    """
+    if modal_kind == "deny_reason":
+        return build_deny_reason_modal(approval_id)
+    if modal_kind == "custom_answer":
+        rec = pending_approvals.read(approval_id, base_dir=base_dir)
+        if rec is None:
+            return None
+        questions = _ask_user_question_questions(
+            rec.get("tool_name"), rec.get("tool_input"),
+        )
+        q_idx = question_index or 0
+        question_text = ""
+        if questions and 0 <= q_idx < len(questions):
+            question_text = questions[q_idx].get("question") or ""
+        existing = rec.get("freeform_answers")
+        initial = None
+        if isinstance(existing, dict):
+            val = existing.get(str(q_idx))
+            if isinstance(val, str):
+                initial = val
+        return build_custom_answer_modal(
+            approval_id, q_idx, question_text, initial_value=initial,
+        )
+    return None
+
+
+def handle_view_submission(
+    payload: dict[str, Any],
+    slack_config: SlackConfig,
+    *,
+    workspace: str = "default",
+    resolve_fn: Callable[..., dict | None] = pending_approvals.resolve,
+    record_partial_fn: Callable[..., dict | None] = pending_approvals.record_partial_answer,
+    update_fn: Callable[..., None] = update_message,
+    base_dir: Path | None = None,
+) -> ButtonClickResult:
+    """Act on a Slack `view_submission` payload — the user submitted a
+    custom-answer or deny-reason modal.
+
+    Auth: same allowlist semantics as block_actions, but the channel context
+    isn't on the payload (modals submit out-of-band). We require the user
+    to be in `approver_user_ids` or a configured group; the DM-only
+    fallback doesn't apply here. This is a tighter rule than block_actions
+    (no channel-id signal to validate) — but in practice a user only sees
+    the modal trigger if they were already authorized to click it.
+    """
+    if payload.get("type") != "view_submission":
+        return ButtonClickResult(False, None, None, None, None)
+    view = payload.get("view") or {}
+    if not isinstance(view, dict):
+        return ButtonClickResult(False, None, None, None, None)
+    callback_id = view.get("callback_id", "")
+    user_id = (payload.get("user") or {}).get("id", "") or ""
+    text = extract_modal_text(view)
+    if not text:
+        # Slack's `min_length: 1` should prevent this; defensive no-op.
+        return ButtonClickResult(True, None, "empty_text", None, user_id)
+
+    metadata_raw = view.get("private_metadata") or "{}"
+    try:
+        import json as _json
+        metadata = _json.loads(metadata_raw)
+    except (ValueError, TypeError):
+        return ButtonClickResult(True, None, "bad_metadata", None, user_id)
+    if not isinstance(metadata, dict):
+        return ButtonClickResult(True, None, "bad_metadata", None, user_id)
+    approval_id = metadata.get("approval_id") or ""
+    if not isinstance(approval_id, str) or not approval_id:
+        return ButtonClickResult(True, None, "bad_metadata", None, user_id)
+
+    if callback_id == MODAL_CALLBACK_DENY_REASON:
+        rec = resolve_fn(
+            approval_id, "deny", actor=user_id,
+            deny_reason=text, base_dir=base_dir,
+        )
+    elif callback_id == MODAL_CALLBACK_CUSTOM_ANSWER:
+        question_index = metadata.get("question_index")
+        if not isinstance(question_index, int):
+            return ButtonClickResult(True, None, "bad_metadata", approval_id, user_id)
+        rec = _record_or_resolve_text(
+            approval_id, user_id, question_index, text, base_dir,
+            resolve_fn=resolve_fn, record_partial_fn=record_partial_fn,
+        )
+    else:
+        return ButtonClickResult(False, None, None, approval_id, user_id)
+
+    if rec is None:
+        return ButtonClickResult(True, None, "unknown_approval", approval_id, user_id)
+
+    msg_channel = rec.get("channel")
+    msg_ts = rec.get("message_ts")
+    if msg_channel and msg_ts and slack_config.bot_token:
+        try:
+            event = _event_from_record(rec)
+            decision = rec.get("decision")
+            if decision is not None:
+                # Final resolve — render the resolved message.
+                selected_options = rec.get("selected_options") or None
+                freeform_answers = rec.get("freeform_answers") or None
+                selected_label = _selected_label_from_record(rec)
+                deny_reason = rec.get("deny_reason") if decision == "deny" else None
+                # Suggestion clicks aren't reachable from a modal; pass None.
+                body = build_resolved_message(
+                    event, decision, f"<@{user_id}>",
+                    selected_label=selected_label,
+                    selected_options=selected_options,
+                    freeform_answers=freeform_answers,
+                    selected_suggestion_label=None,
+                    deny_reason=deny_reason,
+                )
+            else:
+                # Partial answer for multi-Q custom answer — re-render with ✓.
+                body = build_approval_message(
+                    event, approval_id,
+                    selected_options=rec.get("selected_options") or {},
+                    freeform_answers=rec.get("freeform_answers") or {},
+                )
+            update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
+        except Exception:
+            logger.exception("failed to chat.update after view_submission")
+
+    return ButtonClickResult(True, rec.get("decision"), None, approval_id, user_id)
+
+
+def _record_or_resolve_text(
+    approval_id: str,
+    user_id: str,
+    question_index: int,
+    text: str,
+    base_dir: Path | None,
+    *,
+    resolve_fn: Callable[..., dict | None],
+    record_partial_fn: Callable[..., dict | None],
+) -> dict | None:
+    """Custom-answer modal submission: record the typed text for one
+    question. Resolve immediately if there's only one question OR if every
+    question now has an answer (option click or freeform text).
+    """
+    existing = pending_approvals.read(approval_id, base_dir=base_dir)
+    if existing is None:
+        return None
+    questions = _ask_user_question_questions(
+        existing.get("tool_name"), existing.get("tool_input"),
+    )
+    if not questions or len(questions) <= 1:
+        # Single-question (or malformed): resolve immediately with the
+        # freeform text as the sole answer.
+        return resolve_fn(
+            approval_id, "allow", actor=user_id,
+            freeform_answers={str(question_index): text},
+            base_dir=base_dir,
+        )
+    rec = record_partial_fn(
+        approval_id, question_index,
+        text=text, actor=user_id, base_dir=base_dir,
+    )
+    if rec is None:
+        return None
+    selected_options = rec.get("selected_options") or {}
+    freeform_answers = rec.get("freeform_answers") or {}
+    answerable_indices = {
+        str(i) for i, q in enumerate(questions) if q.get("multiSelect") is not True
+    }
+    answered = set(selected_options.keys()) | set(freeform_answers.keys())
+    if answerable_indices.issubset(answered):
+        return resolve_fn(
+            approval_id, "allow", actor=user_id,
+            selected_options=selected_options,
+            freeform_answers=freeform_answers,
+            base_dir=base_dir,
+        )
+    return rec
 
 
 def _record_or_resolve(
@@ -260,23 +510,28 @@ def _record_or_resolve(
 
     # Multi-question: record this answer.
     rec = pending_approvals.record_partial_answer(
-        approval_id, selected_question, selected_option or 0,
+        approval_id, selected_question,
+        option_index=selected_option or 0,
         actor=user_id, base_dir=base_dir,
     )
     if rec is None:
         return None
     selected_options = rec.get("selected_options") or {}
+    freeform_answers = rec.get("freeform_answers") or {}
     # Count answerable (non-multiSelect) questions — only those we render
     # buttons for. multiSelect questions are surfaced as text-only and
     # don't gate resolution from Slack.
     answerable_indices = {
         str(i) for i, q in enumerate(questions) if q.get("multiSelect") is not True
     }
-    if answerable_indices.issubset(selected_options.keys()):
+    answered = set(selected_options.keys()) | set(freeform_answers.keys())
+    if answerable_indices.issubset(answered):
         # All button-renderable questions answered → finalize.
         return resolve_fn(
             approval_id, decision, actor=user_id,
-            selected_options=selected_options, base_dir=base_dir,
+            selected_options=selected_options,
+            freeform_answers=freeform_answers,
+            base_dir=base_dir,
         )
     return rec
 
@@ -421,6 +676,9 @@ def _start_workspace_listener(
         # bot_token already baked into `web`; ignore the arg.
         web.chat_update(channel=channel, ts=ts, **body)
 
+    def _views_open(trigger_id: str, view: dict) -> None:
+        web.views_open(trigger_id=trigger_id, view=view)
+
     def listener(client, req) -> None:
         # ACK immediately — Slack retries anything unacked within ~3s.
         try:
@@ -433,22 +691,33 @@ def _start_workspace_listener(
         payload = req.payload if isinstance(req.payload, dict) else None
         if payload is None:
             return
+        payload_type = payload.get("type")
         try:
-            result = handle_block_actions(
-                payload,
-                slack_config,
-                workspace=workspace_name,
-                ephemeral_fn=_ephemeral,
-                update_fn=_update,
-                group_member_check=group_check,
-            )
+            if payload_type == "view_submission":
+                result = handle_view_submission(
+                    payload,
+                    slack_config,
+                    workspace=workspace_name,
+                    update_fn=_update,
+                )
+            else:
+                result = handle_block_actions(
+                    payload,
+                    slack_config,
+                    workspace=workspace_name,
+                    ephemeral_fn=_ephemeral,
+                    update_fn=_update,
+                    views_open_fn=_views_open,
+                    group_member_check=group_check,
+                )
         except Exception:
             logger.exception("handler raised while processing Slack interaction")
             return
         if result.handled:
             logger.info(
-                "workspace=%s approval=%s decision=%s user=%s rejected=%s",
+                "workspace=%s payload=%s approval=%s decision=%s user=%s rejected=%s",
                 workspace_name,
+                payload_type,
                 result.approval_id,
                 result.decision,
                 result.user_id,

@@ -126,6 +126,14 @@ def create(
         # suggestion button (vs plain Approve/Deny). The hook uses this
         # to build PermissionRequest's `decision.updatedPermissions`.
         "selected_suggestion_index": None,
+        # Per-question freeform answers from the "Custom answer" modal,
+        # keyed by question index (str). Wins over `selected_options[k]`
+        # at resolve time — the hook surfaces the typed text directly via
+        # PermissionRequest's `updatedInput.answers`.
+        "freeform_answers": {},
+        # User-typed reason from the "Deny with reason" modal. Plumbed
+        # into `decision.message` on the deny path. None for one-tap deny.
+        "deny_reason": None,
     }
     with _locked(_lock_path(approval_id, base_dir)):
         from . import paths as _paths
@@ -162,6 +170,8 @@ def resolve(
     selected_option: int | None = None,
     selected_options: dict[str, int] | None = None,
     selected_suggestion: int | None = None,
+    freeform_answers: dict[str, str] | None = None,
+    deny_reason: str | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict | None:
@@ -193,6 +203,10 @@ def resolve(
             data["selected_options"] = {str(k): int(v) for k, v in selected_options.items()}
         if selected_suggestion is not None:
             data["selected_suggestion_index"] = int(selected_suggestion)
+        if freeform_answers is not None:
+            data["freeform_answers"] = {str(k): str(v) for k, v in freeform_answers.items()}
+        if deny_reason is not None:
+            data["deny_reason"] = str(deny_reason)
         from . import paths as _paths
         _paths.write_secure(record, json.dumps(data))
     # Wake outside the lock: opening a FIFO for write blocks until a reader
@@ -205,22 +219,23 @@ def resolve(
 def record_partial_answer(
     approval_id: str,
     question_index: int,
-    option_index: int,
     *,
+    option_index: int | None = None,
+    text: str | None = None,
     actor: str | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict | None:
-    """Record one question's answer for a multi-question AskUserQuestion
-    approval without resolving the whole approval. Returns the updated
-    record or None if the approval doesn't exist / is already resolved.
+    """Record one question's answer (option click OR freeform text) without
+    resolving the whole approval. Returns the updated record or None if it
+    doesn't exist / is already resolved.
 
-    The waiting hook keeps blocking until ALL questions in the tool_input
-    have an entry — at which point the daemon should call `resolve` with
-    the full `selected_options`. Tracking the most-recent actor on each
-    partial click would be over-engineering for what the user sees as a
-    single decision; we just record the answer.
+    Exactly one of `option_index` / `text` must be provided. Per question,
+    text and option are mutually exclusive — submitting one clears the
+    other so the resolve path doesn't have to disambiguate.
     """
+    if (option_index is None) == (text is None):
+        raise ValueError("record_partial_answer needs exactly one of option_index / text")
     record = _record_path(approval_id, base_dir)
     with _locked(_lock_path(approval_id, base_dir)):
         if not record.exists():
@@ -229,10 +244,19 @@ def record_partial_answer(
         if data.get("decision") is not None:
             # Already fully resolved — partial updates are pointless.
             return data
-        existing = data.get("selected_options")
-        selected_options = dict(existing) if isinstance(existing, dict) else {}
-        selected_options[str(question_index)] = int(option_index)
+        key = str(question_index)
+        existing_opts = data.get("selected_options")
+        selected_options = dict(existing_opts) if isinstance(existing_opts, dict) else {}
+        existing_text = data.get("freeform_answers")
+        freeform_answers = dict(existing_text) if isinstance(existing_text, dict) else {}
+        if option_index is not None:
+            selected_options[key] = int(option_index)
+            freeform_answers.pop(key, None)
+        else:
+            freeform_answers[key] = str(text)
+            selected_options.pop(key, None)
         data["selected_options"] = selected_options
+        data["freeform_answers"] = freeform_answers
         # Stamp the most-recent actor so the chat.update can attribute the
         # partial click. `actor` on a fully-resolved record still wins.
         if actor is not None:

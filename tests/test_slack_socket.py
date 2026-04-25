@@ -557,3 +557,353 @@ def test_group_member_check_caches_per_group():
     check("S_ONE", "U_B")
     # One API call per distinct group, cached afterward.
     assert web.calls == ["S_ONE", "S_TWO"]
+
+
+# ----------------------------------------------------------------------
+# Modal trigger + view_submission flow
+# ----------------------------------------------------------------------
+
+
+def _ask_user_question_record(approval_id: str, *, base_dir: Path,
+                              questions: list[dict] | None = None) -> None:
+    """Helper: write an AskUserQuestion approval record + message ref."""
+    pa.create(
+        approval_id,
+        agent="claude-code",
+        session_id="s",
+        tool_name="AskUserQuestion",
+        tool_input={
+            "questions": questions or [
+                {
+                    "question": "Mascot?",
+                    "options": [{"label": "Raccoon"}, {"label": "Capybara"}],
+                }
+            ]
+        },
+        base_dir=base_dir,
+    )
+    pa.set_message_ref(approval_id, "C1", "1.0", base_dir=base_dir)
+
+
+def _modal_payload(callback_id: str, *, approval_id: str,
+                   text: str, question_index: int | None = None,
+                   user_id: str = "U_OK") -> dict:
+    """Build a Slack view_submission payload matching the daemon's expected shape."""
+    import json as _json
+    metadata: dict[str, Any] = {"approval_id": approval_id}
+    if question_index is not None:
+        metadata["question_index"] = question_index
+    return {
+        "type": "view_submission",
+        "user": {"id": user_id},
+        "view": {
+            "callback_id": callback_id,
+            "private_metadata": _json.dumps(metadata),
+            "state": {
+                "values": {
+                    "agent_notify_modal_input": {
+                        "agent_notify_modal_input_value": {
+                            "type": "plain_text_input",
+                            "value": text,
+                        }
+                    }
+                }
+            },
+        },
+    }
+
+
+def test_custom_answer_button_opens_modal_without_resolving(tmp_path: Path):
+    """Tapping the ✏️ Custom answer button calls views_open with a modal
+    pre-loaded with the question text — and does NOT resolve the approval
+    (the resolve happens later on view_submission)."""
+    _ask_user_question_record("appr-custom", base_dir=tmp_path)
+    opened: list[dict] = []
+
+    def _views_open(trigger_id, view):
+        opened.append({"trigger_id": trigger_id, "view": view})
+
+    payload = _payload("agent_notify_custom_answer_0", value="appr-custom")
+    payload["trigger_id"] = "trig-001"
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        views_open_fn=_views_open,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision is None  # Modal-trigger doesn't resolve.
+    rec = pa.read("appr-custom", base_dir=tmp_path)
+    assert rec["decision"] is None
+    assert len(opened) == 1
+    view = opened[0]["view"]
+    assert view["callback_id"] == "agent_notify_modal_custom_answer"
+    # Question text appears in the modal so the user knows what they're answering.
+    assert any(
+        "Mascot" in (b.get("text", {}).get("text", ""))
+        for b in view["blocks"]
+    )
+
+
+def test_deny_reason_button_opens_modal_without_resolving(tmp_path: Path):
+    """Tapping 💬 Deny with reason opens the modal without denying."""
+    pa.create(
+        "appr-dr", agent="claude-code", session_id="s",
+        tool_name="Bash", tool_input={"command": "npm test"},
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-dr", "C1", "1.0", base_dir=tmp_path)
+    opened: list[dict] = []
+
+    def _views_open(trigger_id, view):
+        opened.append({"trigger_id": trigger_id, "view": view})
+
+    payload = _payload("agent_notify_deny_reason", value="appr-dr")
+    payload["trigger_id"] = "trig-002"
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        views_open_fn=_views_open,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision is None
+    rec = pa.read("appr-dr", base_dir=tmp_path)
+    assert rec["decision"] is None
+    assert len(opened) == 1
+    assert opened[0]["view"]["callback_id"] == "agent_notify_modal_deny_reason"
+
+
+def test_custom_answer_modal_trigger_without_views_open_warns(tmp_path: Path):
+    """If views_open_fn isn't wired (defensive), the click still ACKs but
+    leaves the approval pending — the user can fall back to one-tap option."""
+    _ask_user_question_record("appr-no-views", base_dir=tmp_path)
+    payload = _payload("agent_notify_custom_answer_0", value="appr-no-views")
+    payload["trigger_id"] = "trig-003"
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(), base_dir=tmp_path,  # no views_open_fn
+    )
+    assert res.handled is True
+    assert res.decision is None
+    assert res.rejected_reason == "no_trigger"
+    rec = pa.read("appr-no-views", base_dir=tmp_path)
+    assert rec["decision"] is None
+
+
+def test_custom_answer_modal_trigger_for_unknown_approval(tmp_path: Path):
+    """Modal trigger for an approval that no longer exists → stale ephemeral."""
+    ephemerals: list[dict] = []
+
+    def _ephemeral(channel, user, text):
+        ephemerals.append({"channel": channel, "user": user, "text": text})
+
+    payload = _payload("agent_notify_custom_answer_0", value="appr-gone")
+    payload["trigger_id"] = "trig-004"
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        ephemeral_fn=_ephemeral,
+        views_open_fn=lambda t, v: None,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.rejected_reason == "unknown_approval"
+    assert ephemerals and "no longer pending" in ephemerals[0]["text"]
+
+
+def test_view_submission_custom_answer_single_question_resolves(tmp_path: Path):
+    """For a single-question AskUserQuestion, submitting the custom-answer
+    modal resolves immediately with the typed text in `freeform_answers`."""
+    _ask_user_question_record("appr-single-cust", base_dir=tmp_path)
+    updates: list[dict] = []
+
+    def _update(bot_token, channel, ts, body):
+        updates.append({"channel": channel, "ts": ts, "body": body})
+
+    payload = _modal_payload(
+        "agent_notify_modal_custom_answer",
+        approval_id="appr-single-cust",
+        text="Definitely a raccoon",
+        question_index=0,
+    )
+    res = slack_socket.handle_view_submission(
+        payload, _slack_config(),
+        update_fn=_update, base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision == "allow"
+    rec = pa.read("appr-single-cust", base_dir=tmp_path)
+    assert rec["decision"] == "allow"
+    assert rec["freeform_answers"] == {"0": "Definitely a raccoon"}
+    assert rec["actor"] == "U_OK"
+    # The chat.update body's Q→A summary contains the typed text.
+    assert len(updates) == 1
+    body = updates[0]["body"]
+    assert "Answered by <@U_OK>" in body["text"]
+    section_texts = [
+        b["text"]["text"]
+        for b in body["attachments"][0]["blocks"]
+        if b.get("type") == "section"
+    ]
+    assert any("Definitely a raccoon" in t for t in section_texts)
+
+
+def test_view_submission_custom_answer_multi_question_partial(tmp_path: Path):
+    """Submitting custom answer for 1 of 2 questions records the text but
+    doesn't resolve — the approval still needs Q2."""
+    _ask_user_question_record(
+        "appr-multi-cust", base_dir=tmp_path,
+        questions=[
+            {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+            {"question": "Color?", "options": [{"label": "Green"}, {"label": "Yellow"}]},
+        ],
+    )
+    payload = _modal_payload(
+        "agent_notify_modal_custom_answer",
+        approval_id="appr-multi-cust",
+        text="A pangolin",
+        question_index=0,
+    )
+    res = slack_socket.handle_view_submission(
+        payload, _slack_config(),
+        update_fn=lambda *a, **kw: None, base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision is None  # Q2 still unanswered.
+    rec = pa.read("appr-multi-cust", base_dir=tmp_path)
+    assert rec["decision"] is None
+    assert rec["freeform_answers"] == {"0": "A pangolin"}
+
+
+def test_view_submission_custom_answer_multi_finalizes_when_all_answered(tmp_path: Path):
+    """When custom-answer fills the last unanswered question, the approval
+    resolves with both option-click and freeform answers in one go."""
+    _ask_user_question_record(
+        "appr-mix", base_dir=tmp_path,
+        questions=[
+            {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+            {"question": "Color?", "options": [{"label": "Green"}, {"label": "Yellow"}]},
+        ],
+    )
+    # Pre-record an option click for Q2.
+    pa.record_partial_answer(
+        "appr-mix", 1, option_index=1, actor="U_OK", base_dir=tmp_path,
+    )
+    payload = _modal_payload(
+        "agent_notify_modal_custom_answer",
+        approval_id="appr-mix",
+        text="A pangolin",
+        question_index=0,
+    )
+    res = slack_socket.handle_view_submission(
+        payload, _slack_config(),
+        update_fn=lambda *a, **kw: None, base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision == "allow"
+    rec = pa.read("appr-mix", base_dir=tmp_path)
+    assert rec["decision"] == "allow"
+    assert rec["freeform_answers"] == {"0": "A pangolin"}
+    assert rec["selected_options"] == {"1": 1}
+
+
+def test_view_submission_deny_reason_resolves_with_message(tmp_path: Path):
+    """Submitting the deny-reason modal resolves the approval as deny + carries
+    the typed text into `deny_reason`."""
+    pa.create(
+        "appr-deny-text", agent="claude-code", session_id="s",
+        tool_name="Bash", tool_input={"command": "npm test"},
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-deny-text", "C1", "1.0", base_dir=tmp_path)
+    updates: list[dict] = []
+
+    def _update(bot_token, channel, ts, body):
+        updates.append({"channel": channel, "ts": ts, "body": body})
+
+    payload = _modal_payload(
+        "agent_notify_modal_deny_reason",
+        approval_id="appr-deny-text",
+        text="check the lockfile first",
+    )
+    res = slack_socket.handle_view_submission(
+        payload, _slack_config(),
+        update_fn=_update, base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision == "deny"
+    rec = pa.read("appr-deny-text", base_dir=tmp_path)
+    assert rec["decision"] == "deny"
+    assert rec["deny_reason"] == "check the lockfile first"
+    # Resolved-message render shows the reason.
+    assert len(updates) == 1
+    blocks = updates[0]["body"]["attachments"][0]["blocks"]
+    rendered = "\n".join(
+        b.get("elements", [{}])[0].get("text", "") if b.get("type") == "context"
+        else b.get("text", {}).get("text", "")
+        for b in blocks
+    )
+    assert "check the lockfile first" in rendered
+
+
+def test_view_submission_unknown_approval(tmp_path: Path):
+    """view_submission for an approval that no longer exists is a no-op."""
+    payload = _modal_payload(
+        "agent_notify_modal_deny_reason",
+        approval_id="appr-vanished",
+        text="too late",
+    )
+    res = slack_socket.handle_view_submission(
+        payload, _slack_config(),
+        update_fn=lambda *a, **kw: None, base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision is None
+    assert res.rejected_reason == "unknown_approval"
+
+
+def test_view_submission_bad_metadata(tmp_path: Path):
+    """Malformed private_metadata → handled=True with rejected_reason."""
+    payload = {
+        "type": "view_submission",
+        "user": {"id": "U_OK"},
+        "view": {
+            "callback_id": "agent_notify_modal_deny_reason",
+            "private_metadata": "not-json",
+            "state": {
+                "values": {
+                    "agent_notify_modal_input": {
+                        "agent_notify_modal_input_value": {"value": "anything"}
+                    }
+                }
+            },
+        },
+    }
+    res = slack_socket.handle_view_submission(payload, _slack_config(), base_dir=tmp_path)
+    assert res.handled is True
+    assert res.rejected_reason == "bad_metadata"
+
+
+def test_view_submission_unknown_callback_not_handled(tmp_path: Path):
+    """A view_submission with a callback_id we don't know about is not ours."""
+    payload = _modal_payload(
+        "some_other_modal",
+        approval_id="appr-x", text="anything",
+    )
+    res = slack_socket.handle_view_submission(payload, _slack_config(), base_dir=tmp_path)
+    assert res.handled is False
+
+
+def test_view_submission_empty_text_noop(tmp_path: Path):
+    """Empty text input (defensive against Slack's min_length escaping) is a no-op."""
+    pa.create(
+        "appr-empty", agent="claude-code", session_id="s",
+        tool_name="Bash", tool_input={"command": "x"},
+        base_dir=tmp_path,
+    )
+    payload = _modal_payload(
+        "agent_notify_modal_deny_reason",
+        approval_id="appr-empty", text="",
+    )
+    res = slack_socket.handle_view_submission(payload, _slack_config(), base_dir=tmp_path)
+    assert res.handled is True
+    assert res.rejected_reason == "empty_text"
+    rec = pa.read("appr-empty", base_dir=tmp_path)
+    assert rec["decision"] is None

@@ -233,3 +233,99 @@ def test_safe_filenames_sanitize_path_chars(tmp_path: Path):
     assert len(matches) == 1
     # Every non-alnum/dash/underscore got sanitized to _
     assert "/" not in matches[0].name
+
+
+# ----------------------------------------------------------------------
+# freeform_answers + deny_reason (custom-answer / deny-reason modal flow)
+# ----------------------------------------------------------------------
+
+
+def test_create_initializes_freeform_and_deny_reason_fields(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name="Bash",
+              base_dir=tmp_path)
+    rec = pa.read("a", base_dir=tmp_path)
+    assert rec["freeform_answers"] == {}
+    assert rec["deny_reason"] is None
+
+
+def test_record_partial_answer_with_text_writes_freeform(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name="AskUserQuestion",
+              tool_input={"questions": [
+                  {"question": "Q1?", "options": [{"label": "A"}]},
+                  {"question": "Q2?", "options": [{"label": "B"}]},
+              ]}, base_dir=tmp_path)
+    rec = pa.record_partial_answer(
+        "a", 0, text="freeform answer here", actor="U1", base_dir=tmp_path,
+    )
+    assert rec["freeform_answers"] == {"0": "freeform answer here"}
+    assert rec["selected_options"] == {}
+    assert rec["actor"] == "U1"
+    # Approval still pending — only one of two answered.
+    assert rec["decision"] is None
+
+
+def test_record_partial_answer_text_overrides_existing_option(tmp_path: Path):
+    """Submitting a custom answer for a question that already had an option
+    click should clear the option (mutually exclusive per question)."""
+    pa.create("a", agent="claude-code", session_id=None, tool_name="AskUserQuestion",
+              tool_input={"questions": [
+                  {"question": "Q?", "options": [{"label": "A"}, {"label": "B"}]},
+              ]}, base_dir=tmp_path)
+    pa.record_partial_answer("a", 0, option_index=1, base_dir=tmp_path)
+    rec = pa.record_partial_answer(
+        "a", 0, text="actually, neither", base_dir=tmp_path,
+    )
+    assert rec["freeform_answers"] == {"0": "actually, neither"}
+    assert rec["selected_options"] == {}
+
+
+def test_record_partial_answer_option_overrides_existing_text(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name="AskUserQuestion",
+              tool_input={"questions": [
+                  {"question": "Q?", "options": [{"label": "A"}, {"label": "B"}]},
+              ]}, base_dir=tmp_path)
+    pa.record_partial_answer("a", 0, text="a thought", base_dir=tmp_path)
+    rec = pa.record_partial_answer("a", 0, option_index=1, base_dir=tmp_path)
+    assert rec["selected_options"] == {"0": 1}
+    assert rec["freeform_answers"] == {}
+
+
+def test_record_partial_answer_requires_exactly_one_of_option_or_text(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name=None,
+              base_dir=tmp_path)
+    with pytest.raises(ValueError, match="exactly one"):
+        pa.record_partial_answer("a", 0, base_dir=tmp_path)
+    with pytest.raises(ValueError, match="exactly one"):
+        pa.record_partial_answer(
+            "a", 0, option_index=0, text="x", base_dir=tmp_path,
+        )
+
+
+def test_resolve_with_freeform_answers_persists_dict(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name="AskUserQuestion",
+              tool_input={"questions": [
+                  {"question": "Q?", "options": [{"label": "A"}]},
+              ]}, base_dir=tmp_path)
+    rec = pa.resolve(
+        "a", "allow", actor="U1",
+        freeform_answers={"0": "typed answer"},
+        base_dir=tmp_path,
+    )
+    assert rec["decision"] == "allow"
+    assert rec["freeform_answers"] == {"0": "typed answer"}
+    got = pa.wait("a", timeout=0.5, base_dir=tmp_path)
+    assert got["freeform_answers"] == {"0": "typed answer"}
+
+
+def test_resolve_with_deny_reason_persists_text(tmp_path: Path):
+    pa.create("a", agent="claude-code", session_id=None, tool_name="Bash",
+              tool_input={"command": "npm test"}, base_dir=tmp_path)
+    rec = pa.resolve(
+        "a", "deny", actor="U1",
+        deny_reason="don't touch this",
+        base_dir=tmp_path,
+    )
+    assert rec["decision"] == "deny"
+    assert rec["deny_reason"] == "don't touch this"
+
+
