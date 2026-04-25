@@ -314,6 +314,70 @@ def test_permissionrequest_emits_updated_input_for_ask_user_question(tmp_path, m
     }
 
 
+def test_permissionrequest_emits_multi_question_updated_input(tmp_path, monkeypatch):
+    """Multi-question AskUserQuestion: when the resolved record carries
+    `selected_options` (dict), the hook emits `updatedInput.answers` with
+    one entry per answered question."""
+    monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
+    cfg = _enabled_config()
+    cfg = cfg.__class__(
+        **{**cfg.__dict__,
+           "slack": cfg.slack.__class__(**{**cfg.slack.__dict__, "approval_timeout_seconds": 10.0})}
+    )
+    poster = _good_poster()
+    buf = io.StringIO()
+
+    def resolver():
+        base_dir = pending_approvals.default_approvals_dir()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            records = list(base_dir.glob("*.json")) if base_dir.exists() else []
+            if records:
+                rec = json.loads(records[0].read_text())
+                pending_approvals.resolve(
+                    rec["approval_id"], "allow",
+                    actor="U_OK",
+                    selected_options={"0": 0, "1": 1},
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=resolver)
+    t.start()
+    try:
+        rc = cli.cmd_permissionrequest(
+            {
+                "tool_name": "AskUserQuestion",
+                "tool_input": {
+                    "questions": [
+                        {
+                            "question": "Mascot?",
+                            "options": [{"label": "Raccoon"}, {"label": "Capybara"}],
+                        },
+                        {
+                            "question": "Color?",
+                            "options": [{"label": "Green"}, {"label": "Yellow"}],
+                        },
+                    ]
+                },
+                "session_id": "s1",
+            },
+            cfg,
+            poster=poster,
+            stdout=buf,
+        )
+    finally:
+        t.join(timeout=5.0)
+
+    assert rc == 0
+    out = json.loads(buf.getvalue())
+    decision = out["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert decision["updatedInput"] == {
+        "answers": {"Mascot?": "Raccoon", "Color?": "Yellow"},
+    }
+
+
 def test_permissionrequest_no_updated_input_for_plain_approve(tmp_path, monkeypatch):
     """Approve clicks (not option clicks) on a non-AskUserQuestion tool emit
     `behavior: allow` with NO `updatedInput` field — we don't modify the

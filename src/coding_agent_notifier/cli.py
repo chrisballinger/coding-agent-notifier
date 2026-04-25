@@ -465,27 +465,32 @@ def cmd_permissionrequest(
 
     decision = record["decision"]
     selected_idx = record.get("selected_option_index")
+    selected_options = record.get("selected_options") or {}
     _log_event(
         f"PermissionRequest resolved approval_id={approval_id} decision={decision} "
-        f"selected_option_index={selected_idx}"
+        f"selected_option_index={selected_idx} selected_options={selected_options}"
     )
     pending_approvals.cleanup(approval_id)
 
-    # If the user clicked an AskUserQuestion option button (vs plain
-    # Approve/Deny), pre-fill the tool's `answers` field via updatedInput
-    # so the AskUserQuestion tool returns the answer immediately instead
-    # of prompting the user in the terminal.
+    # If the user clicked AskUserQuestion option button(s), pre-fill the
+    # tool's `answers` field via updatedInput so the AskUserQuestion tool
+    # returns the answer(s) immediately instead of prompting in terminal.
+    # Multi-question (selected_options dict) takes precedence over the
+    # legacy single-question (selected_option_index int).
     updated_input = None
-    if decision == "allow" and isinstance(selected_idx, int):
-        updated_input = _ask_user_question_updated_input(record, selected_idx)
+    if decision == "allow":
+        if selected_options:
+            updated_input = _ask_user_question_updated_input_multi(record, selected_options)
+        elif isinstance(selected_idx, int):
+            updated_input = _ask_user_question_updated_input(record, selected_idx)
     _emit_decision(out, decision, updated_input=updated_input)
     return 0
 
 
 def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | None:
-    """Build an updatedInput payload for AskUserQuestion from a resolved
-    record + selected option index. Returns None if the record's tool_input
-    isn't a recognizable AskUserQuestion shape.
+    """Build an updatedInput payload for the legacy single-question
+    AskUserQuestion path. Returns None if the record's tool_input isn't
+    a recognizable AUQ shape.
     """
     tool_input = record.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -509,6 +514,50 @@ def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | 
     if not isinstance(label, str):
         return None
     return {"answers": {question_text: label}}
+
+
+def _ask_user_question_updated_input_multi(
+    record: dict, selected_options: dict[str, int],
+) -> dict | None:
+    """Build an updatedInput payload from a multi-question selected_options
+    dict. Returns {"answers": {<Q text>: <label>, ...}} for every question
+    that has a recorded answer; questions without an answer are omitted
+    (Claude Code falls back to terminal-prompt for those, which matches
+    the AskUserQuestion partial-answer semantic).
+    """
+    tool_input = record.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    answers: dict[str, str] = {}
+    for q_idx_str, opt_idx in selected_options.items():
+        try:
+            q_idx = int(q_idx_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= q_idx < len(questions)):
+            continue
+        q = questions[q_idx]
+        if not isinstance(q, dict):
+            continue
+        question_text = q.get("question")
+        options = q.get("options")
+        if not isinstance(question_text, str) or not isinstance(options, list):
+            continue
+        if not isinstance(opt_idx, int) or not (0 <= opt_idx < len(options)):
+            continue
+        opt = options[opt_idx]
+        if not isinstance(opt, dict):
+            continue
+        label = opt.get("label")
+        if not isinstance(label, str):
+            continue
+        answers[question_text] = label
+    if not answers:
+        return None
+    return {"answers": answers}
 
 
 def _emit_decision(

@@ -99,11 +99,17 @@ def create(
         "resolved_at": None,
         "channel": None,
         "message_ts": None,
-        # When the gated tool is AskUserQuestion and the user clicked an
-        # option button (vs. plain Approve/Deny), this carries the index
-        # into tool_input["questions"][0]["options"]. Stays None for
-        # non-AskUserQuestion approvals.
+        # Single-question AskUserQuestion legacy field — index into
+        # tool_input["questions"][0]["options"]. Kept for back-compat with
+        # in-flight approvals from older versions; new code prefers
+        # `selected_options` below.
         "selected_option_index": None,
+        # Multi-question AskUserQuestion answers, keyed by question index
+        # (str — JSON keys must be strings) → selected option index. Filled
+        # incrementally as the user taps buttons; resolution fires only
+        # when every question has an entry. Stays empty for non-AskUser-
+        # Question approvals.
+        "selected_options": {},
     }
     with _locked(_lock_path(approval_id, base_dir)):
         from . import paths as _paths
@@ -138,15 +144,17 @@ def resolve(
     *,
     actor: str | None = None,
     selected_option: int | None = None,
+    selected_options: dict[str, int] | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict | None:
     """Mark the approval resolved and wake the waiting hook. Returns record or None.
 
-    `selected_option` is the index into the AskUserQuestion options list when
-    the user clicked an option button instead of plain Approve/Deny. Stored
-    on the record so the waiting hook can pre-fill the answer via
-    PermissionRequest's `updatedInput`.
+    `selected_option` (legacy single-question AskUserQuestion) is the index
+    into `tool_input["questions"][0]["options"]`. New multi-question code
+    passes `selected_options` instead — a dict mapping question index (str)
+    → selected option index. Both flow into PermissionRequest's
+    `updatedInput.answers` via `cmd_permissionrequest`.
     """
     if decision not in ("allow", "deny"):
         raise ValueError(f"decision must be 'allow' or 'deny', got {decision!r}")
@@ -164,6 +172,8 @@ def resolve(
         data["resolved_at"] = clock()
         if selected_option is not None:
             data["selected_option_index"] = selected_option
+        if selected_options is not None:
+            data["selected_options"] = {str(k): int(v) for k, v in selected_options.items()}
         from . import paths as _paths
         _paths.write_secure(record, json.dumps(data))
     # Wake outside the lock: opening a FIFO for write blocks until a reader
@@ -171,6 +181,46 @@ def resolve(
     # write-open inside `_locked` would deadlock.
     _kick(fifo)
     return data
+
+
+def record_partial_answer(
+    approval_id: str,
+    question_index: int,
+    option_index: int,
+    *,
+    actor: str | None = None,
+    base_dir: Path | None = None,
+    clock: Callable[[], float] = time.time,
+) -> dict | None:
+    """Record one question's answer for a multi-question AskUserQuestion
+    approval without resolving the whole approval. Returns the updated
+    record or None if the approval doesn't exist / is already resolved.
+
+    The waiting hook keeps blocking until ALL questions in the tool_input
+    have an entry — at which point the daemon should call `resolve` with
+    the full `selected_options`. Tracking the most-recent actor on each
+    partial click would be over-engineering for what the user sees as a
+    single decision; we just record the answer.
+    """
+    record = _record_path(approval_id, base_dir)
+    with _locked(_lock_path(approval_id, base_dir)):
+        if not record.exists():
+            return None
+        data = json.loads(record.read_text())
+        if data.get("decision") is not None:
+            # Already fully resolved — partial updates are pointless.
+            return data
+        existing = data.get("selected_options")
+        selected_options = dict(existing) if isinstance(existing, dict) else {}
+        selected_options[str(question_index)] = int(option_index)
+        data["selected_options"] = selected_options
+        # Stamp the most-recent actor so the chat.update can attribute the
+        # partial click. `actor` on a fully-resolved record still wins.
+        if actor is not None:
+            data["actor"] = actor
+        from . import paths as _paths
+        _paths.write_secure(record, json.dumps(data))
+        return data
 
 
 def _kick(fifo: Path) -> None:

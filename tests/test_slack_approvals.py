@@ -233,22 +233,27 @@ def _ask_user_question_event(**overrides) -> Event:
 
 def test_build_approval_message_renders_option_buttons_for_ask_user_question():
     body = build_approval_message(_ask_user_question_event(), "appr-aq-1")
-    actions = _find_block(body, "actions")
-    assert actions is not None
-    labels = [el["text"]["text"] for el in actions["elements"]]
-    # Three options + a Deny button at the end. NO generic Approve button.
-    assert labels == ["Global config only", "Per-repo files", "Hybrid", "Deny"]
-    # Each option button has a distinct action_id with the index suffix.
-    option_action_ids = [el["action_id"] for el in actions["elements"][:3]]
+    # Multi-question render: each question gets its own actions block; a
+    # final actions block holds the trailing Deny. With a single Q here,
+    # we expect 2 actions blocks total (1 question + 1 deny).
+    actions_blocks = _find_blocks(body, "actions")
+    assert len(actions_blocks) == 2
+    q1, deny_block = actions_blocks
+    # Question 1's options are buttons; action_ids carry both q and o
+    # indices so multi-question clicks are unambiguous.
+    labels = [el["text"]["text"] for el in q1["elements"]]
+    assert labels == ["Global config only", "Per-repo files", "Hybrid"]
+    option_action_ids = [el["action_id"] for el in q1["elements"]]
     assert option_action_ids == [
-        "agent_notify_option_0",
-        "agent_notify_option_1",
-        "agent_notify_option_2",
+        "agent_notify_option_0_0",
+        "agent_notify_option_0_1",
+        "agent_notify_option_0_2",
     ]
-    # Deny stays standard.
-    assert actions["elements"][-1]["action_id"] == DENY_ACTION_ID
+    # Deny lives in its own actions block at the end.
+    assert deny_block["elements"][0]["action_id"] == DENY_ACTION_ID
+    assert deny_block["elements"][0]["text"]["text"] == "Deny"
     # All buttons carry the approval_id as value.
-    for el in actions["elements"]:
+    for el in q1["elements"] + deny_block["elements"]:
         assert el["value"] == "appr-aq-1"
 
 
@@ -266,9 +271,11 @@ def test_option_buttons_truncate_long_labels():
     assert len(text) <= 75
 
 
-def test_build_approval_message_falls_back_for_multiselect():
-    """v1 only handles single-select questions. multiSelect → standard
-    Approve/Deny so the user can decide in-terminal."""
+def test_build_approval_message_renders_text_only_for_multiselect():
+    """multiSelect questions can't be button-driven (no text input), so
+    they're surfaced as the question header + a "answer in terminal"
+    note — but the wrapper Q+Deny structure is still the AskUserQuestion
+    flow (not the legacy Approve/Deny pair)."""
     ev = _ask_user_question_event(tool_input={
         "questions": [{
             "question": "Pick many",
@@ -277,9 +284,19 @@ def test_build_approval_message_falls_back_for_multiselect():
         }]
     })
     body = build_approval_message(ev, "appr-multi")
-    actions = _find_block(body, "actions")
-    labels = [el["text"]["text"] for el in actions["elements"]]
-    assert labels == ["Approve", "Deny"]
+    actions_blocks = _find_blocks(body, "actions")
+    # Only the trailing Deny block — no option buttons rendered for this
+    # multiSelect question (user finishes in terminal).
+    assert len(actions_blocks) == 1
+    assert actions_blocks[0]["elements"][0]["action_id"] == DENY_ACTION_ID
+    # The question header still appears as a section block.
+    section_texts = [
+        b["text"]["text"]
+        for att in body.get("attachments", [])
+        for b in att.get("blocks", [])
+        if b.get("type") == "section"
+    ]
+    assert any("Pick many" in t for t in section_texts)
 
 
 def test_build_approval_message_falls_back_for_malformed_payload():
@@ -296,6 +313,86 @@ def test_non_ask_user_question_still_renders_approve_deny():
     actions = _find_block(body, "actions")
     labels = [el["text"]["text"] for el in actions["elements"]]
     assert labels == ["Approve", "Deny"]
+
+
+def test_multi_question_renders_one_actions_block_per_question():
+    """Multi-question AskUserQuestion: each question gets its own actions
+    block (option buttons indexed by q,o), plus a single trailing Deny
+    actions block at the end."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [
+            {"question": "Q1?", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2?", "options": [{"label": "A2"}, {"label": "B2"}, {"label": "C2"}]},
+        ]
+    })
+    body = build_approval_message(ev, "appr-multi-1")
+    actions_blocks = _find_blocks(body, "actions")
+    assert len(actions_blocks) == 3  # Q1 + Q2 + Deny
+
+    q1, q2, deny = actions_blocks
+    q1_action_ids = [el["action_id"] for el in q1["elements"]]
+    assert q1_action_ids == ["agent_notify_option_0_0", "agent_notify_option_0_1"]
+    q2_action_ids = [el["action_id"] for el in q2["elements"]]
+    assert q2_action_ids == [
+        "agent_notify_option_1_0",
+        "agent_notify_option_1_1",
+        "agent_notify_option_1_2",
+    ]
+    assert deny["elements"][0]["action_id"] == DENY_ACTION_ID
+
+
+def test_multi_question_renders_check_marks_for_answered_questions():
+    """When `selected_options` is passed (chat.update during partial flow),
+    the answered options get a ✓ prefix and the section header notes the
+    answer."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [
+            {"question": "Q1?", "options": [{"label": "A1"}, {"label": "B1"}]},
+            {"question": "Q2?", "options": [{"label": "A2"}, {"label": "B2"}]},
+        ]
+    })
+    body = build_approval_message(
+        ev, "appr-partial-1", selected_options={"0": 1},  # answered Q1 with B1
+    )
+    actions_blocks = _find_blocks(body, "actions")
+    q1 = actions_blocks[0]
+    # Answered option (index 1) gets the ✓ prefix.
+    assert q1["elements"][1]["text"]["text"].startswith("✓ ")
+    # Unanswered option doesn't.
+    assert not q1["elements"][0]["text"]["text"].startswith("✓ ")
+
+    # Q2 still has no checks.
+    q2 = actions_blocks[1]
+    for el in q2["elements"]:
+        assert not el["text"]["text"].startswith("✓ ")
+
+
+def test_build_resolved_message_renders_qa_summary_for_multi_question():
+    """Final chat.update for a multi-question approval lists every
+    Q → answered-label pair so the resolved message captures the
+    full decision."""
+    ev = _ask_user_question_event(tool_input={
+        "questions": [
+            {"question": "Mascot?", "options": [{"label": "Raccoon"}, {"label": "Capybara"}]},
+            {"question": "Color?", "options": [{"label": "Green"}, {"label": "Yellow"}]},
+        ]
+    })
+    body = build_resolved_message(
+        ev, "allow", "<@U1>",
+        selected_options={"0": 0, "1": 1},  # Raccoon, Yellow
+    )
+    text = body["text"]
+    # Header now uses "Answered" rather than "Approved" / "Selected `…`".
+    assert "Answered by <@U1>" in text
+    # The Q→A summary block contains both questions and both answers.
+    section_texts = [
+        b["text"]["text"]
+        for b in body["attachments"][0]["blocks"]
+        if b.get("type") == "section"
+    ]
+    full_text = "\n".join(section_texts)
+    assert "Mascot?" in full_text and "Raccoon" in full_text
+    assert "Color?" in full_text and "Yellow" in full_text
 
 
 def test_recommended_option_gets_primary_style():
@@ -424,3 +521,18 @@ def _find_block(body: dict, block_type: str) -> dict | None:
         if b.get("type") == block_type:
             return b
     return None
+
+
+def _find_blocks(body: dict, block_type: str) -> list[dict]:
+    """Like _find_block but returns ALL matches in document order. Needed
+    for multi-question AskUserQuestion which has one actions block per
+    question plus a trailing Deny block."""
+    out: list[dict] = []
+    for att in body.get("attachments") or []:
+        for b in att.get("blocks", []):
+            if b.get("type") == block_type:
+                out.append(b)
+    for b in body.get("blocks", []):
+        if b.get("type") == block_type:
+            out.append(b)
+    return out

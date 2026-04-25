@@ -303,48 +303,79 @@ def _safe_json(text: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _ask_user_question_options(
+def _ask_user_question_questions(
     tool_name: str | None,
     tool_input: dict | None,
-) -> list[str] | None:
-    """Return the option labels of an AskUserQuestion's first question, or None.
+) -> list[dict] | None:
+    """Return AskUserQuestion's questions list, or None for non-AUQ / malformed.
 
-    Returns None for any non-AskUserQuestion tool, for malformed payloads,
-    or for `multiSelect: true` (out of scope for v1 — single-select only).
+    Each question is a dict with at least `question` (str), `options`
+    (list of {label, description?}). `multiSelect` and `header` are
+    optional. The slack renderer iterates this list — questions with
+    `multiSelect: true` are surfaced as text-only (no buttons), since
+    Slack actions can't carry multi-select state cleanly.
     """
     if tool_name != "AskUserQuestion" or not isinstance(tool_input, dict):
         return None
     questions = tool_input.get("questions")
     if not isinstance(questions, list) or not questions:
         return None
-    q = questions[0]
-    if not isinstance(q, dict):
+    valid: list[dict] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            return None
+        if not isinstance(q.get("question"), str):
+            return None
+        options = q.get("options")
+        if not isinstance(options, list) or not options:
+            return None
+        # Validate that every option has a string label so the renderer
+        # doesn't crash mid-build.
+        for opt in options:
+            if not isinstance(opt, dict) or not isinstance(opt.get("label"), str):
+                return None
+        valid.append(q)
+    return valid
+
+
+def _ask_user_question_options(
+    tool_name: str | None,
+    tool_input: dict | None,
+) -> list[str] | None:
+    """Back-compat shim: returns option labels of `questions[0]` only.
+
+    Kept so the legacy single-question path (and its tests) still resolves.
+    Use `_ask_user_question_questions` for multi-question rendering.
+    """
+    questions = _ask_user_question_questions(tool_name, tool_input)
+    if not questions:
         return None
+    q = questions[0]
     if q.get("multiSelect") is True:
         return None
-    options = q.get("options")
-    if not isinstance(options, list) or not options:
-        return None
-    labels: list[str] = []
-    for opt in options:
-        if not isinstance(opt, dict):
-            return None
-        label = opt.get("label")
-        if not isinstance(label, str) or not label:
-            return None
-        labels.append(label)
-    return labels
+    return [opt["label"] for opt in q["options"]]
 
 
 def _selected_label_from_record(rec: dict) -> str | None:
-    """Look up the selected option's label from a resolved approval record."""
+    """Look up the selected option's label from a resolved approval record.
+
+    Prefers the new `selected_options` dict (multi-question — returns the
+    label of `questions[0]`'s answer when present). Falls back to the
+    legacy `selected_option_index` for in-flight records from older
+    versions.
+    """
+    questions = _ask_user_question_questions(rec.get("tool_name"), rec.get("tool_input"))
+    if not questions:
+        return None
+    selected_options = rec.get("selected_options")
+    if isinstance(selected_options, dict) and "0" in selected_options:
+        idx = selected_options["0"]
+        if isinstance(idx, int) and 0 <= idx < len(questions[0]["options"]):
+            return questions[0]["options"][idx]["label"]
     idx = rec.get("selected_option_index")
-    if not isinstance(idx, int):
-        return None
-    labels = _ask_user_question_options(rec.get("tool_name"), rec.get("tool_input"))
-    if labels is None or not (0 <= idx < len(labels)):
-        return None
-    return labels[idx]
+    if isinstance(idx, int) and 0 <= idx < len(questions[0]["options"]):
+        return questions[0]["options"][idx]["label"]
+    return None
 
 
 def _truncate_button_text(text: str) -> str:
@@ -353,44 +384,114 @@ def _truncate_button_text(text: str) -> str:
     return text[: _BUTTON_TEXT_MAX - 1] + "…"  # …
 
 
-def _build_option_buttons(approval_id: str, labels: list[str]) -> dict:
-    """Block Kit actions block: one button per option label + a Deny button.
+def _build_option_buttons_for_question(
+    approval_id: str,
+    question_index: int,
+    labels: list[str],
+    *,
+    answered_index: int | None = None,
+) -> dict:
+    """One actions block for a single question: option buttons indexed by
+    `question_index`. Each option's `action_id` is
+    `agent_notify_option_<q>_<o>` so the daemon knows which question the
+    click belongs to.
 
-    The first option whose label contains "(Recommended)" (the convention
-    AskUserQuestion uses to flag a default choice) gets `style: "primary"`
-    — Slack renders that as a filled green CTA, signaling the suggested
-    pick. Only one primary per actions block per Slack's recommendation.
+    The first option whose label contains "(Recommended)" gets
+    `style: "primary"` (filled green CTA) — Slack convention is one
+    primary per actions block.
+
+    `answered_index`, when provided, tags the already-clicked option's
+    button with a check-mark prefix so a follow-up chat.update shows the
+    user which choice they made. The other buttons stay tappable in case
+    they want to change their mind before the approval finalizes — though
+    in practice the approval finalizes the moment all questions have an
+    entry, so this is rarely actionable for the last click.
     """
     primary_assigned = False
     elements: list[dict] = []
     for i, label in enumerate(labels):
+        text = label
+        if answered_index == i:
+            text = f"✓ {label}"
         button: dict = {
             "type": "button",
-            "text": {"type": "plain_text", "text": _truncate_button_text(label), "emoji": False},
-            "action_id": f"{OPTION_ACTION_ID_PREFIX}{i}",
+            "text": {"type": "plain_text", "text": _truncate_button_text(text), "emoji": False},
+            "action_id": f"{OPTION_ACTION_ID_PREFIX}{question_index}_{i}",
             "value": approval_id,
         }
         if not primary_assigned and "(Recommended)" in label:
             button["style"] = "primary"
             primary_assigned = True
         elements.append(button)
-    elements.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": "Deny", "emoji": False},
-        "style": "danger",
-        "action_id": DENY_ACTION_ID,
-        "value": approval_id,
-    })
-    # Slack caps an actions block at 25 elements. With 1 Deny that means
-    # 24 options. Anything beyond that should fall back to a static_select
-    # — punted out of scope; just truncate to fit and log it.
     if len(elements) > 25:
-        elements = elements[:24] + [elements[-1]]
+        elements = elements[:25]
     return {
         "type": "actions",
-        "block_id": f"agent_notify::{approval_id}",
+        "block_id": f"agent_notify::{approval_id}::q{question_index}",
         "elements": elements,
     }
+
+
+def _build_deny_block(approval_id: str) -> dict:
+    return {
+        "type": "actions",
+        "block_id": f"agent_notify::{approval_id}::deny",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Deny", "emoji": False},
+                "style": "danger",
+                "action_id": DENY_ACTION_ID,
+                "value": approval_id,
+            }
+        ],
+    }
+
+
+def _build_multi_question_blocks(
+    approval_id: str,
+    questions: list[dict],
+    *,
+    selected_options: dict[str, int] | None = None,
+) -> list[dict]:
+    """Block Kit blocks for an N-question AskUserQuestion: a section header
+    per question (with ✓ once answered) followed by its option buttons,
+    then a single trailing Deny block at the end. multiSelect questions
+    render as text-only ("answer this in the terminal") since Slack
+    buttons can't carry multi-select state cleanly.
+    """
+    selected = selected_options or {}
+    blocks: list[dict] = []
+    for q_idx, q in enumerate(questions):
+        answered = q_idx_str_in_dict(selected, q_idx)
+        check = "✓" if answered is not None else " "
+        header = q.get("header") or q["question"]
+        section_text = f"*{check} Q{q_idx + 1}.* {header}"
+        if answered is not None and 0 <= answered < len(q["options"]):
+            section_text += f"\n_Answered: {q['options'][answered]['label']}_"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": section_text},
+        })
+        if q.get("multiSelect") is True:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn",
+                              "text": "_multi-select question — answer in the terminal._"}],
+            })
+            continue
+        labels = [opt["label"] for opt in q["options"]]
+        blocks.append(_build_option_buttons_for_question(
+            approval_id, q_idx, labels, answered_index=answered,
+        ))
+    blocks.append(_build_deny_block(approval_id))
+    return blocks
+
+
+def q_idx_str_in_dict(selected: dict[str, int], q_idx: int) -> int | None:
+    """Return the option index recorded for question `q_idx`, or None."""
+    val = selected.get(str(q_idx))
+    return val if isinstance(val, int) else None
 
 
 def _build_approve_deny_block(approval_id: str, confirm_text: str) -> dict:
@@ -428,6 +529,7 @@ def build_approval_message(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
+    selected_options: dict[str, int] | None = None,
 ) -> dict:
     """Like `build_slack_message` but with an actions block for the user.
 
@@ -435,17 +537,22 @@ def build_approval_message(
     accidental lock-screen tap doesn't run a Bash command) and Deny (danger,
     no confirm — fail-safe direction).
 
-    For AskUserQuestion, one button per option label + a Deny button. Tapping
-    an option resolves the approval AND threads the selected index back to
-    the hook so it pre-fills the answer via PermissionRequest's
-    `updatedInput`. Falls back to Approve/Deny if the AskUserQuestion payload
-    is malformed or uses multiSelect (v1 single-select only).
+    For AskUserQuestion, one actions block per question (option buttons
+    labeled from each option) plus a trailing Deny block. `selected_options`
+    (dict[str_question_index, option_index]) renders ✓ marks on already-
+    clicked options — the daemon passes this into chat.update calls during
+    the multi-question flow so the message reflects partial progress.
+    Falls back to Approve/Deny if the tool isn't AskUserQuestion or the
+    payload is malformed.
     """
     body = build_slack_message(event, max_chars=max_chars, verbosity=verbosity)
 
-    option_labels = _ask_user_question_options(event.tool_name, event.tool_input)
-    if option_labels:
-        actions_block = _build_option_buttons(approval_id, option_labels)
+    questions = _ask_user_question_questions(event.tool_name, event.tool_input)
+    if questions:
+        # One actions block per question + a single trailing Deny.
+        appended_blocks = _build_multi_question_blocks(
+            approval_id, questions, selected_options=selected_options,
+        )
     else:
         # The confirm dialog is part of the Slack payload — in minimal mode
         # it would itself leak tool_name / cwd. Strip it to a generic prompt
@@ -458,15 +565,15 @@ def build_approval_message(
                 f"Allow `{tool_label}` to run in "
                 f"`{event.cwd.name or str(event.cwd)}`?"
             )
-        actions_block = _build_approve_deny_block(approval_id, confirm_text)
+        appended_blocks = [_build_approve_deny_block(approval_id, confirm_text)]
 
     # Append to the first attachment so the color bar / fallback text stay
     # intact. Falls back to top-level blocks if the builder ever stops using
     # attachments (defensive).
     if body.get("attachments"):
-        body["attachments"][0].setdefault("blocks", []).append(actions_block)
+        body["attachments"][0].setdefault("blocks", []).extend(appended_blocks)
     else:
-        body.setdefault("blocks", []).append(actions_block)
+        body.setdefault("blocks", []).extend(appended_blocks)
     return body
 
 
@@ -517,22 +624,29 @@ def build_resolved_message(
     max_chars: int = DEFAULT_MAX_CHARS,
     verbosity: Verbosity = "terse",
     selected_label: str | None = None,
+    selected_options: dict[str, int] | None = None,
 ) -> dict:
     """Block Kit replacement for `chat.update` after approve/deny or timeout.
 
     Preserves the tool summary so scroll-back context isn't lost, but strips
     the buttons and swaps the header to the outcome.
 
-    When `selected_label` is provided (AskUserQuestion option click), the
-    header reads "Selected `<label>` by @user" instead of the generic
-    "Approved by @user". Decision is still "allow" — the selection both
-    approves the tool call AND chooses the answer.
+    Args:
+      selected_label: legacy single-question AskUserQuestion — header reads
+        "Selected `<label>` by @user".
+      selected_options: multi-question AskUserQuestion — header reads
+        "Answered" and a section block lists each Q→A pair.
+
+    Decision is still "allow" for both; the selection both approves the
+    tool call AND chooses the answer(s).
     """
     if decision == "allow":
         icon = ":white_check_mark:"
         verb = "Approved"
         color = "#2eb67d"
-        if selected_label:
+        if selected_options:
+            verb = "Answered"
+        elif selected_label:
             verb = f"Selected `{selected_label}`"
     elif decision == "deny":
         icon = ":no_entry_sign:"
@@ -561,6 +675,25 @@ def build_resolved_message(
         summary = f"*{event.tool_name}:* {summary}"
     if summary:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
+
+    # Multi-question Q→A summary block. Renders one mrkdwn line per
+    # answered question; unanswered questions just say "(no answer)".
+    if selected_options:
+        questions = _ask_user_question_questions(event.tool_name, event.tool_input)
+        if questions:
+            lines: list[str] = []
+            for q_idx, q in enumerate(questions):
+                ans_idx = q_idx_str_in_dict(selected_options, q_idx)
+                if ans_idx is not None and 0 <= ans_idx < len(q["options"]):
+                    label = q["options"][ans_idx]["label"]
+                    lines.append(f"*Q{q_idx + 1}.* {q['question']}\n→ `{label}`")
+                else:
+                    lines.append(f"*Q{q_idx + 1}.* {q['question']}\n→ _(no answer)_")
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n\n".join(lines)},
+            })
+
     footer = _terse_footer(event) if verbosity == "terse" else None
     if footer:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})

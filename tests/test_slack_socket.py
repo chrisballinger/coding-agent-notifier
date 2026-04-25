@@ -102,6 +102,98 @@ def test_option_click_with_invalid_index_suffix_not_handled():
     assert res.handled is False
 
 
+def test_multi_question_partial_click_records_without_resolving(tmp_path: Path):
+    """For a 2-question AskUserQuestion, clicking ONE option records the
+    answer but does NOT mark the approval resolved — wait() should keep
+    blocking until the other question is also answered."""
+    pa.create(
+        "appr-mq",
+        agent="claude-code",
+        session_id="s",
+        tool_name="AskUserQuestion",
+        tool_input={
+            "questions": [
+                {"question": "Q1?", "options": [{"label": "A1"}, {"label": "B1"}]},
+                {"question": "Q2?", "options": [{"label": "A2"}, {"label": "B2"}]},
+            ]
+        },
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-mq", "C1", "1.0", base_dir=tmp_path)
+    updates: list[dict] = []
+    def _update(bot_token, channel, ts, body):
+        updates.append({"body": body})
+
+    # Click Q1 → option B1 (index 1).
+    payload = _payload("agent_notify_option_0_1", value="appr-mq")
+    res = slack_socket.handle_block_actions(
+        payload, _slack_config(),
+        update_fn=_update,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    # No final decision yet.
+    assert res.decision is None
+
+    rec = pa.read("appr-mq", base_dir=tmp_path)
+    assert rec["decision"] is None
+    assert rec["selected_options"] == {"0": 1}
+
+    # The chat.update body re-rendered the approval message with ✓ on
+    # the answered Q1 option — buttons remain tappable for Q2.
+    assert len(updates) == 1
+    blocks = updates[0]["body"]["attachments"][0]["blocks"]
+    actions_blocks = [b for b in blocks if b.get("type") == "actions"]
+    assert len(actions_blocks) == 3  # Q1 + Q2 + Deny still present
+
+
+def test_multi_question_final_click_resolves_with_selected_options(tmp_path: Path):
+    """When the second-and-last answer comes in, the daemon resolves with
+    the full selected_options dict and the chat.update uses
+    build_resolved_message (no buttons)."""
+    pa.create(
+        "appr-mq2",
+        agent="claude-code",
+        session_id="s",
+        tool_name="AskUserQuestion",
+        tool_input={
+            "questions": [
+                {"question": "Q1?", "options": [{"label": "A1"}, {"label": "B1"}]},
+                {"question": "Q2?", "options": [{"label": "A2"}, {"label": "B2"}]},
+            ]
+        },
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-mq2", "C1", "1.0", base_dir=tmp_path)
+
+    def _update(bot_token, channel, ts, body):
+        pass
+
+    # First click: Q1 → A1.
+    slack_socket.handle_block_actions(
+        _payload("agent_notify_option_0_0", value="appr-mq2"),
+        _slack_config(),
+        update_fn=_update,
+        base_dir=tmp_path,
+    )
+    rec = pa.read("appr-mq2", base_dir=tmp_path)
+    assert rec["decision"] is None  # still partial
+
+    # Second click: Q2 → B2. Resolves the approval.
+    res = slack_socket.handle_block_actions(
+        _payload("agent_notify_option_1_1", value="appr-mq2"),
+        _slack_config(),
+        update_fn=_update,
+        base_dir=tmp_path,
+    )
+    assert res.handled is True
+    assert res.decision == "allow"
+
+    rec = pa.read("appr-mq2", base_dir=tmp_path)
+    assert rec["decision"] == "allow"
+    assert rec["selected_options"] == {"0": 0, "1": 1}
+
+
 def test_approve_resolves_pending(tmp_path: Path):
     pa.create("appr-1", agent="claude-code", session_id="s", tool_name="Bash",
               base_dir=tmp_path)

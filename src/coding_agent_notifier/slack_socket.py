@@ -30,7 +30,9 @@ from .sinks.slack import (
     APPROVE_ACTION_ID,
     DENY_ACTION_ID,
     OPTION_ACTION_ID_PREFIX,
+    _ask_user_question_questions,
     _selected_label_from_record,
+    build_approval_message,
     build_resolved_message,
     update_message,
 )
@@ -88,15 +90,27 @@ def handle_block_actions(
         return ButtonClickResult(False, None, None, None, None)
     action = actions[0]
     action_id = action.get("action_id", "")
+    # Single-question (legacy) click: agent_notify_option_<o>
+    # Multi-question click: agent_notify_option_<q>_<o>
     selected_option: int | None = None
+    selected_question: int | None = None
     if action_id == APPROVE_ACTION_ID:
         decision = "allow"
     elif action_id == DENY_ACTION_ID:
         decision = "deny"
     elif action_id.startswith(OPTION_ACTION_ID_PREFIX):
-        # AskUserQuestion option click: action_id suffix is the option index.
+        suffix = action_id[len(OPTION_ACTION_ID_PREFIX):]
+        parts = suffix.split("_")
         try:
-            selected_option = int(action_id[len(OPTION_ACTION_ID_PREFIX):])
+            if len(parts) == 1:
+                # Legacy single-question encoding — treat as question 0.
+                selected_question = 0
+                selected_option = int(parts[0])
+            elif len(parts) == 2:
+                selected_question = int(parts[0])
+                selected_option = int(parts[1])
+            else:
+                return ButtonClickResult(False, None, None, None, None)
         except ValueError:
             return ButtonClickResult(False, None, None, None, None)
         decision = "allow"
@@ -122,12 +136,19 @@ def handle_block_actions(
                 logger.exception("failed to send ephemeral rejection to %s", user_id)
         return ButtonClickResult(True, None, reject_reason, approval_id, user_id)
 
-    rec = resolve_fn(
+    # Multi-question: an option click is a partial answer if other
+    # questions still need answering. We record it (without resolving),
+    # update the message to reflect progress, and only resolve once every
+    # question has an entry. Single-question clicks (legacy) and Approve/
+    # Deny clicks resolve immediately.
+    rec = _record_or_resolve(
         approval_id,
         decision,
-        actor=user_id,
-        selected_option=selected_option,
-        base_dir=base_dir,
+        user_id,
+        selected_question,
+        selected_option,
+        base_dir,
+        resolve_fn=resolve_fn,
     )
     if rec is None:
         if ephemeral_fn is not None and channel_id:
@@ -146,15 +167,93 @@ def handle_block_actions(
     if msg_channel and msg_ts and slack_config.bot_token:
         try:
             event = _event_from_record(rec)
-            selected_label = _selected_label_from_record(rec) if selected_option is not None else None
-            body = build_resolved_message(
-                event, decision, f"<@{user_id}>", selected_label=selected_label,
-            )
+            is_resolved = rec.get("decision") is not None
+            if is_resolved:
+                selected_label = _selected_label_from_record(rec) if selected_option is not None else None
+                selected_options = rec.get("selected_options") if rec.get("selected_options") else None
+                body = build_resolved_message(
+                    event, decision, f"<@{user_id}>",
+                    selected_label=selected_label,
+                    selected_options=selected_options,
+                )
+            else:
+                # Partial answer: re-render the approval message with
+                # ✓ marks on the answered options. Buttons stay tappable
+                # for unanswered questions.
+                body = build_approval_message(
+                    event, approval_id,
+                    selected_options=rec.get("selected_options") or {},
+                )
             update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
         except Exception:
             logger.exception("failed to chat.update original approval message")
 
-    return ButtonClickResult(True, decision, None, approval_id, user_id)
+    final_decision = rec.get("decision")
+    return ButtonClickResult(True, final_decision, None, approval_id, user_id)
+
+
+def _record_or_resolve(
+    approval_id: str,
+    decision: str,
+    user_id: str,
+    selected_question: int | None,
+    selected_option: int | None,
+    base_dir: Path | None,
+    *,
+    resolve_fn: Callable[..., dict | None],
+) -> dict | None:
+    """For Approve/Deny and single-question (legacy) clicks, resolve
+    immediately. For multi-question option clicks, record the partial
+    answer and resolve only when every question has an entry — otherwise
+    return the partially-answered record so the daemon updates the
+    message without unblocking the hook.
+
+    Returns the (partial or final) record, or None if the approval doesn't
+    exist.
+    """
+    # Approve / Deny short-circuits multi-question logic.
+    if selected_question is None:
+        return resolve_fn(
+            approval_id, decision, actor=user_id,
+            selected_option=selected_option, base_dir=base_dir,
+        )
+
+    # Read the existing record to know how many questions there are.
+    existing = pending_approvals.read(approval_id, base_dir=base_dir)
+    if existing is None:
+        return None
+    questions = _ask_user_question_questions(
+        existing.get("tool_name"), existing.get("tool_input"),
+    )
+    # Buttons-rendered single-question case OR fewer than 2 questions:
+    # resolve immediately with the legacy single-index field for back-compat.
+    if not questions or len(questions) <= 1:
+        return resolve_fn(
+            approval_id, decision, actor=user_id,
+            selected_option=selected_option, base_dir=base_dir,
+        )
+
+    # Multi-question: record this answer.
+    rec = pending_approvals.record_partial_answer(
+        approval_id, selected_question, selected_option or 0,
+        actor=user_id, base_dir=base_dir,
+    )
+    if rec is None:
+        return None
+    selected_options = rec.get("selected_options") or {}
+    # Count answerable (non-multiSelect) questions — only those we render
+    # buttons for. multiSelect questions are surfaced as text-only and
+    # don't gate resolution from Slack.
+    answerable_indices = {
+        str(i) for i, q in enumerate(questions) if q.get("multiSelect") is not True
+    }
+    if answerable_indices.issubset(selected_options.keys()):
+        # All button-renderable questions answered → finalize.
+        return resolve_fn(
+            approval_id, decision, actor=user_id,
+            selected_options=selected_options, base_dir=base_dir,
+        )
+    return rec
 
 
 def _authorize(
