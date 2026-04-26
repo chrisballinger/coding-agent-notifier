@@ -311,6 +311,63 @@ approver_user_ids = ["U01"]
     assert "MISSING" in out
 
 
+def test_doctor_reports_approver_allowlist_size(monkeypatch, tmp_path: Path, capsys):
+    """For workspaces with actionable_approvals=true, doctor surfaces the
+    approver count so install-time auth posture is visible."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+bot_token = "xoxb-test"
+app_token = "xapp-test"
+actionable_approvals = true
+approver_user_ids = ["U01", "U02"]
+approver_user_groups = ["S99"]
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.base.http_post_json",
+        lambda *a, **k: (200, '{"ok": true, "team": "T", "user": "B"}'),
+    )
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "approvers: 2 user(s), 1 group(s)" in out
+
+
+def test_doctor_flags_dm_only_fallback_for_empty_allowlist(monkeypatch, tmp_path: Path, capsys):
+    """Empty allowlist + channel='@me' is the documented DM-only mode;
+    doctor should make that explicit so the user knows clicks are gated
+    by DM membership rather than an explicit allowlist."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _write_config(
+        tmp_path,
+        """
+gating = "always"
+[slack.workspaces.default]
+enabled = true
+bot_token = "xoxb-test"
+app_token = "xapp-test"
+actionable_approvals = true
+channel = "@me"
+""".strip(),
+    )
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.idle_seconds", lambda: 0)
+    monkeypatch.setattr("coding_agent_notifier.cli.macos.frontmost_app", lambda: None)
+    monkeypatch.setattr(
+        "coding_agent_notifier.sinks.base.http_post_json",
+        lambda *a, **k: (200, '{"ok": true, "team": "T", "user": "B"}'),
+    )
+    cli.main(["--config", str(cfg), "doctor"])
+    out = capsys.readouterr().out
+    assert "approvers: 0 user(s), 0 group(s)" in out
+    assert "DM-only" in out
+
+
 def test_doctor_skips_daemon_check_when_not_actionable(monkeypatch, tmp_path: Path, capsys):
     cfg = _write_config(
         tmp_path,

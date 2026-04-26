@@ -1024,6 +1024,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ok, msg = _doctor_probe_slack_auth(ws.bot_token)
                 marker = "✓" if ok else "✗"
                 print(f"    {marker} auth.test: {msg}")
+            if ws.actionable_approvals:
+                n_users = len(ws.approver_user_ids)
+                n_groups = len(ws.approver_user_groups)
+                line = f"    approvers: {n_users} user(s), {n_groups} group(s)"
+                if n_users == 0 and n_groups == 0 and (ws.channel or "@me") == "@me":
+                    line += "  (DM-only — only the installing user can click)"
+                print(line)
     else:
         print("Slack workspaces: (none configured)")
     print(f"Discord: enabled={config.discord.enabled} webhook={bool(config.discord.webhook_url)}")

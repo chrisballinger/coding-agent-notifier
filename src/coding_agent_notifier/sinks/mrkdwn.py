@@ -30,7 +30,7 @@ in load-bearing order:
   7. Strikethrough `~~x~~` → `~x~`.
   8. Headings ``^#{1,6}\\s+(.+)$`` → `*<title>*`. All levels collapse to
      bold (Slack's own `markdown` block does the same).
-  9. Bullets `^[-*+]\s+` → `• `. Numbered lists left as-is.
+  9. Bullets `^[-*+]\\s+` → `• `. Numbered lists left as-is.
  10. Path-as-inline-code (`_PATH_RE`) — keep an existing readability win.
  11. Restore code-region placeholders byte-for-byte.
 
