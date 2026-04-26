@@ -190,7 +190,15 @@ def merge_claude_permissionrequest(settings: dict[str, Any]) -> tuple[dict[str, 
     return settings, added
 
 
-LAUNCHD_LABEL = "com.chrisballinger.agent-notify-daemon"
+LAUNCHD_LABEL = "app.coding-agent-notifier.daemon"
+
+# Pre-rename label. Kept so installs older than the rename can be cleanly
+# migrated: on install we boot out and unlink the old plist before writing
+# the new one, otherwise the user ends up with two daemons fighting over
+# the same Socket Mode token.
+_LEGACY_LAUNCHD_LABELS: tuple[str, ...] = (
+    "com.chrisballinger.agent-notify-daemon",
+)
 
 
 def install_slack_bot(
@@ -232,6 +240,9 @@ def install_slack_bot(
     if install_plist:
         la_dir = launch_agents_dir or (Path.home() / "Library" / "LaunchAgents")
         la_dir.mkdir(parents=True, exist_ok=True)
+        legacy_removed = _remove_legacy_plists(la_dir)
+        if legacy_removed:
+            summary["legacy_plists_removed"] = legacy_removed
         plist_path = la_dir / f"{LAUNCHD_LABEL}.plist"
         # Resolve to an absolute path. launchd's PATH (set on the plist's
         # EnvironmentVariables) is /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
@@ -258,6 +269,45 @@ def install_slack_bot(
         summary["plist_written"] = write
 
     return summary
+
+
+def _remove_legacy_plists(la_dir: Path) -> list[str]:
+    """Boot out and unlink legacy launchd plists from before the rename.
+
+    Two daemons running under different labels would race for the same
+    Socket Mode token (Slack rejects duplicate connections), so we have to
+    actively remove the old one rather than letting it linger. Best-effort:
+    a missing `launchctl` or a bootout failure is fine — the file unlink
+    is what actually stops the next session from re-bootstrapping it.
+
+    Returns the list of legacy labels that were cleaned up.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    cleaned: list[str] = []
+    launchctl = _shutil.which("launchctl")
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    for label in _LEGACY_LAUNCHD_LABELS:
+        legacy = la_dir / f"{label}.plist"
+        if not legacy.exists():
+            continue
+        if launchctl and uid is not None:
+            # Best-effort. If the daemon isn't loaded, bootout returns
+            # nonzero — fine; we still want to delete the file.
+            try:
+                _subprocess.run(
+                    [launchctl, "bootout", f"gui/{uid}", str(legacy)],
+                    capture_output=True, timeout=5,
+                )
+            except (OSError, _subprocess.SubprocessError):
+                pass
+        try:
+            legacy.unlink()
+        except OSError:
+            continue
+        cleaned.append(label)
+    return cleaned
 
 
 def _launchd_plist_contents(agent_notify_bin: str) -> str:

@@ -1097,7 +1097,17 @@ def _doctor_check_daemon() -> None:
     surface as advisory text, never raise."""
     import shutil as _shutil
     import subprocess as _subprocess
-    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{install.LAUNCHD_LABEL}.plist"
+    la_dir = Path.home() / "Library" / "LaunchAgents"
+    for legacy_label in install._LEGACY_LAUNCHD_LABELS:
+        legacy = la_dir / f"{legacy_label}.plist"
+        if legacy.exists():
+            print(
+                f"  ! legacy plist present: {legacy} — re-run "
+                "`agent-notify install slack-bot` to remove it (a stale "
+                "daemon under the old label will fight the current one for "
+                "the Socket Mode connection)"
+            )
+    plist_path = la_dir / f"{install.LAUNCHD_LABEL}.plist"
     if plist_path.exists():
         print(f"  ✓ plist:  {plist_path}")
     else:

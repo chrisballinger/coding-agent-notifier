@@ -55,7 +55,7 @@ uv tool install 'coding-agent-notifier[slack-bot]'
 agent-notify config init
 agent-notify slack add                     # interactive wizard: tokens → Keychain, [slack.workspaces.default] block
 agent-notify install slack-bot             # writes Claude Code hook + launchd plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.coding-agent-notifier.daemon.plist
 agent-notify slack test default            # smoke message DM'd to you
 agent-notify doctor                        # confirms config, daemon, route match
 ```
@@ -145,14 +145,14 @@ When `actionable_approvals = true` is set on a Slack workspace and the daemon is
 uv tool install --from . 'coding-agent-notifier[slack-bot]'   # base + slack-sdk
 agent-notify install slack-bot                                # writes Claude Code hook + launchd plist
 agent-notify slack add                                        # interactive wizard: tokens to Keychain, config block
-launchctl bootout gui/$(id -u)  ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist  # if previously loaded
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist
+launchctl bootout gui/$(id -u)  ~/Library/LaunchAgents/app.coding-agent-notifier.daemon.plist  # if previously loaded
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.coding-agent-notifier.daemon.plist
 ```
 
 The daemon connects to Slack over Socket Mode (outbound WebSocket — no public port). Verify it's up:
 
 ```bash
-launchctl print gui/$(id -u)/com.chrisballinger.agent-notify-daemon | grep -E 'state|active count'
+launchctl print gui/$(id -u)/app.coding-agent-notifier.daemon | grep -E 'state|active count'
 agent-notify slack test default   # posts a smoke message to your DM
 ```
 
@@ -279,7 +279,7 @@ If `bot_token_keychain` is configured but the account is missing or the Keychain
 
 | Symptom                                                                     | Likely cause                                                                                                  | Fix                                                                                                                                                   |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Slack DM arrives but **buttons spin forever**                               | Daemon isn't running — Socket Mode never receives the click.                                                  | `launchctl print gui/$(id -u)/com.chrisballinger.agent-notify-daemon \| grep "active count"`. If `0`, see the next two rows.                          |
+| Slack DM arrives but **buttons spin forever**                               | Daemon isn't running — Socket Mode never receives the click.                                                  | `launchctl print gui/$(id -u)/app.coding-agent-notifier.daemon \| grep "active count"`. If `0`, see the next two rows.                          |
 | Daemon logs `ModuleNotFoundError: No module named 'slack_sdk'`              | `uv tool install` was run **without** the `[slack-bot]` extras, so the daemon can't import its dependencies.  | `uv tool install --from . --reinstall 'coding-agent-notifier[slack-bot]'` (note the extras), then bounce the daemon.                                  |
 | `launchctl print` shows `last exit code = 78: EX_CONFIG`, `daemon.log` empty | Old plist used a bare `agent-notify` program name; launchd's PATH excluded `~/.local/bin`.                    | Re-run `agent-notify install slack-bot` (the install now writes the absolute path), then `launchctl bootout` + `bootstrap` to reload.                 |
 | `agent-notify slack test default` says "posted to U…" but **no DM appears** | Bot DMed itself (App Home Messages tab). Manifest wasn't declaring `messages_tab_enabled` at app-create time.  | In Slack admin → your app → **App Home** → toggle **Messages Tab** on. Or recreate the app from the updated `docs/slack-app-manifest.yaml`.           |

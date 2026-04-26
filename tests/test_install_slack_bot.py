@@ -208,6 +208,41 @@ def test_install_slack_bot_no_launchd(tmp_path: Path):
     assert not la_dir.exists() or not list(la_dir.iterdir())
 
 
+def test_install_slack_bot_removes_legacy_plist(tmp_path: Path, monkeypatch):
+    """A pre-rename plist (`com.chrisballinger.agent-notify-daemon.plist`)
+    must be unlinked before the new one is written; otherwise two daemons
+    fight for the same Socket Mode connection. We swallow launchctl errors
+    so the migration works even when the old daemon isn't actually loaded."""
+    settings = tmp_path / "settings.json"
+    la_dir = tmp_path / "LaunchAgents"
+    la_dir.mkdir()
+    legacy_label = install._LEGACY_LAUNCHD_LABELS[0]
+    legacy_plist = la_dir / f"{legacy_label}.plist"
+    legacy_plist.write_text("<plist>old</plist>")
+    # Stub launchctl so the test doesn't touch the real launchd.
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/launchctl" if name == "launchctl" else None)
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = ""
+        return _R()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    summary = install.install_slack_bot(settings, launch_agents_dir=la_dir)
+
+    assert not legacy_plist.exists(), "legacy plist must be removed"
+    assert summary["legacy_plists_removed"] == [legacy_label]
+    # bootout was attempted with the right label.
+    assert any(legacy_label in " ".join(a) for a in calls)
+    # The new plist is in place.
+    assert (la_dir / f"{install.LAUNCHD_LABEL}.plist").exists()
+
+
 def test_install_slack_bot_preserves_existing_claude_hooks(tmp_path: Path):
     settings = tmp_path / "settings.json"
     la_dir = tmp_path / "LaunchAgents"
