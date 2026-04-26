@@ -255,6 +255,31 @@ def test_ask_user_question_handles_missing_options():
     assert r.code_block is False
 
 
+def test_ask_user_question_does_not_truncate_long_descriptions():
+    """Renderer must pass full Q+options text through so the downstream Slack
+    Show more / Show less toggle can elide on its own terms. Truncating here
+    would defeat the toggle and leave later options' descriptions clipped
+    even after the user taps Show more."""
+    sentinel = "END-OF-AUQ-XYZ"
+    long_desc = "Lorem ipsum dolor sit amet. " * 30  # ~840 chars per option
+    payload = {
+        "questions": [
+            {
+                "question": "Pick a path",
+                "options": [
+                    {"label": "First option", "description": long_desc},
+                    {"label": "Second option", "description": long_desc},
+                    {"label": "Final option", "description": f"ends-with-{sentinel}"},
+                ],
+            }
+        ]
+    }
+    r = render("AskUserQuestion", payload, max_chars=400)
+    assert r.detail is not None
+    assert r.detail.endswith(sentinel)
+    assert len(r.detail) > 400
+
+
 def test_ask_user_question_malformed_falls_through_to_generic():
     # Missing `questions` key → generic JSON fallback
     r = render("AskUserQuestion", {"foo": "bar"})

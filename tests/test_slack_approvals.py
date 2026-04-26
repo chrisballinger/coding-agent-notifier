@@ -863,6 +863,55 @@ def test_post_approval_long_plan_attaches_show_more_and_persists(expandable_stor
     assert APPROVE_ACTION_ID in full_action_ids
 
 
+def test_post_approval_long_ask_user_question_full_body_not_truncated(expandable_store):
+    """Long AskUserQuestion descriptions must reach Slack in full — the renderer
+    used to cap detail at tool_input_max_chars (400), so even after the user
+    tapped Show more the body still ended mid-description. The persisted
+    full_body should contain a sentinel placed at the end of the last option's
+    description verbatim."""
+    sentinel = "END-OF-AUQ-XYZ"
+    long_desc = "Lorem ipsum dolor sit amet. " * 30  # ~840 chars per option
+    auq_event = _event(
+        tool_name="AskUserQuestion",
+        tool_input={
+            "questions": [
+                {
+                    "question": "Pick a path",
+                    "options": [
+                        {"label": "First option", "description": long_desc},
+                        {"label": "Second option", "description": long_desc},
+                        {"label": "Final option", "description": f"ends-with-{sentinel}"},
+                    ],
+                }
+            ]
+        },
+        message="",
+    )
+    poster = _FakePoster()
+    cfg = SlackConfig(enabled=True, bot_token="xoxb", channel="C1")
+    post_approval_message(
+        auq_event,
+        cfg,
+        "appr-long-auq",
+        message_preview_head_chars=250,
+        message_preview_tail_chars=250,
+        workspace="default",
+        poster=poster,
+    )
+
+    files = list(expandable_store.glob("*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    body_text = "\n\n".join(
+        blk["text"]["text"]
+        for blk in rec["full_body"]["attachments"][0]["blocks"]
+        if blk.get("type") == "section"
+        and isinstance(blk.get("block_id"), str)
+        and blk["block_id"].startswith("agent_notify_body_")
+    )
+    assert body_text.rstrip().endswith(sentinel)
+
+
 def test_post_approval_short_tool_input_no_toggle(expandable_store):
     """Short Bash command → no Show more, nothing persisted (regression)."""
     poster = _FakePoster()

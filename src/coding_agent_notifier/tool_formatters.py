@@ -195,9 +195,13 @@ def _render_ask_user_question(tool_input: dict[str, Any], max_chars: int) -> Too
                 blocks.append(line)
         blocks.append("")  # blank line between questions
 
+    # Q+options text is prose with per-option descriptions — pass it through
+    # full-length so the downstream Show more / Show less toggle (in
+    # `post_approval_message`) can elide it on its own terms, not pre-truncated
+    # to `max_chars` (which is sized for Bash/Edit commands and would defeat
+    # the toggle, leaving later options' descriptions clipped even after
+    # Show more). Mirrors the same intentional skip in `_render_exit_plan_mode`.
     detail = "\n".join(blocks).rstrip() or None
-    if detail is not None:
-        detail = truncate(detail, max_chars)
     return ToolRender(summary=summary, detail=detail, code_block=False)
 
 
