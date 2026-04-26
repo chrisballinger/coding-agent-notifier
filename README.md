@@ -4,6 +4,11 @@
 
 > In case it's not obvious, this is all slop. Use at your own risk.
 
+| AskUserQuestion | Plan approval |
+| :---: | :---: |
+| <img src="docs/media/ask-user-question-example.png" alt="AskUserQuestion options rendered in Slack with a green Recommended CTA" width="320"> | <img src="docs/media/approval-example.png" alt="ExitPlanMode plan approval in Slack with Approve / Deny / Deny-with-reason / Show more buttons" width="320"> |
+| One tap per option; the `(Recommended)` pick gets a filled green CTA. Multi-question prompts update in place as you answer. | Long plans post as a head…tail preview with **Show more / Show less**, alongside Approve / Deny / Deny-with-reason. |
+
 Ping yourself on Slack when Claude Code needs your attention, but
 only when you're actually away from the keyboard.
 
