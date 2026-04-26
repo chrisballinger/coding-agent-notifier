@@ -46,6 +46,48 @@ First public release.
   to the new dot directory `~/.agent-notify/`.
 - `SECURITY.md` documenting the threat model, secret-handling tradeoffs,
   and reporting process.
+- **Show more / Show less toggle** for long Slack message bodies
+  (turn-complete + ExitPlanMode plan approvals). When the rendered body
+  exceeds `display.message_preview_head_chars` + `_tail_chars` + 5
+  (defaults 250 + 250), the message posts as a head…tail elision with a
+  "Show more" button; tapping rewrites the message in place to the full
+  body and a "Show less" button. Persisted via a new
+  `expandable_messages` state directory. Skipped when `verbosity =
+  "minimal"`, when `display.message_max_chars > 0`, or when only a
+  webhook is configured (no `chat.update`).
+- **Markdown → Slack mrkdwn converter** (`sinks/mrkdwn.py`) so agent
+  messages render bold/italic/strike/links/headings/bullets natively
+  instead of showing literal `**bold**` / `## Heading` characters.
+  Fenced + inline code regions are protected (markdown inside ``` stays
+  literal). Discord is untouched — it accepts CommonMark natively.
+- **Markdown table rendering**: 1-/2-/N-column markdown tables in agent
+  output convert to bullet-per-row blocks (`• *col:* val`). Cell content
+  still flows through bold/italic/link/inline-code conversion.
+- **Top-of-message preview text polish**: the Slack `text` field (iOS
+  push preview + the line above the green attachment) now runs through
+  `_mrkdwn_polish` so bold/italic/strike/links render in the preview
+  instead of literal markdown markers.
+- **ExitPlanMode plan-approval improvements**: plan body no longer
+  wrapped in a code fence (renders as formatted markdown); approval
+  message gets the Show more / Show less toggle alongside Approve / Deny
+  / Deny-with-reason buttons; heading regex matches all heading levels
+  so `## Summary` becomes the title `Summary`.
+- **`approval_timeout_seconds = 0` means wait forever** — leave the
+  approval pending until resolved from Slack on any device (no
+  auto-deny). Earlier behavior of timing out after N seconds is still
+  the default (300s).
+- New `[display]` keys: `message_max_chars`, `message_preview_head_chars`,
+  `message_preview_tail_chars` for controlling body truncation and the
+  Show more / Show less budget.
+- `[summary] head_chars` / `tail_chars` defaults bumped 250 → 2000 so
+  turn-complete bodies have room for the toggle to elide.
+- `agent-notify doctor` reports the approver-allowlist size per
+  workspace (`approvers: N user(s), M group(s)`); annotates the
+  documented DM-only fallback when the allowlist is empty and
+  `channel = "@me"`.
+- README gains a "Network attack surface" subsection in Security
+  spelling out the outbound-only design (no listener, no localhost
+  port, click-path auth-gated, no `shell=True`).
 
 ### Security
 
