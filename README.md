@@ -2,13 +2,12 @@
 
 [![CI](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml)
 
-> ⚠️ **Hobby-grade software — use at your own risk.**
-> This is a personal tool I largely vibe-coded with Claude Code. It works
-> on my machine and I depend on it daily, but it isn't battle-tested,
-> isn't audited, and ships with no warranty (see [LICENSE](LICENSE)).
-> Don't run it against credentials or workspaces you can't afford to
-> lose. If you do use it on anything sensitive, read
-> [SECURITY.md](SECURITY.md) first.
+> ⚠️ **Use at your own risk — this codebase was largely AI-generated.**
+> Apologies in advance for any slop. The code isn't battle-tested or
+> audited and ships with no warranty (see [LICENSE](LICENSE)). Don't
+> run it against credentials or workspaces you can't afford to lose.
+> Read [SECURITY.md](SECURITY.md) before running it on anything
+> sensitive.
 
 Ping yourself on Slack or Discord when a coding agent — Claude Code,
 Codex — needs your attention, but only when you're actually away from
