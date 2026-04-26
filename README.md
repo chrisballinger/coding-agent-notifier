@@ -4,9 +4,8 @@
 
 > In case it's not obvious, this is all slop. Use at your own risk.
 
-Ping yourself on Slack or Discord when a coding agent — Claude Code,
-Codex — needs your attention, but only when you're actually away from
-the keyboard.
+Ping yourself on Slack when Claude Code needs your attention, but
+only when you're actually away from the keyboard.
 
 Fills the gap left by Claude Code Remote in the Claude iOS app, which
 doesn't yet support push notifications. Also covers Claude Code
@@ -17,14 +16,18 @@ Built for the workflow where you kick off an agent, switch to another
 task, and want to know *the moment* it asks for approval or finishes —
 without having to babysit the terminal.
 
+Other agents (Codex) and other destinations (Discord) have scaffolding
+in the codebase but aren't supported flows yet — they may land in a
+future release.
+
 ## What triggers a ping
 
-| Event                         | Claude Code                                       | Codex                                   |
-| ----------------------------- | ------------------------------------------------- | --------------------------------------- |
-| Tool-approval prompt          | `PermissionRequest`, `Notification:permission_prompt` | `PermissionRequest` hook            |
-| Agent waiting for your answer | `Notification:idle_prompt`                        | not emitted by Codex today              |
-| MCP server asking for input   | `Notification:elicitation_dialog`                 | —                                       |
-| Turn complete                 | `Stop`                                            | `notify` (`agent-turn-complete`), `Stop` |
+| Event                         | Claude Code hook                                      |
+| ----------------------------- | ----------------------------------------------------- |
+| Tool-approval prompt          | `PermissionRequest`, `Notification:permission_prompt` |
+| Agent waiting for your answer | `Notification:idle_prompt`                            |
+| MCP server asking for input   | `Notification:elicitation_dialog`                     |
+| Turn complete                 | `Stop`                                                |
 
 By default a ping only fires when your machine has been idle past 60s
 **or** the agent's terminal isn't frontmost — see
@@ -46,11 +49,8 @@ uv tool install 'coding-agent-notifier'
 agent-notify config init
 $EDITOR "$(agent-notify config path)"   # add a [slack.workspaces.default] block with webhook_url
 agent-notify install claude-code        # merges hooks into ~/.claude/settings.json
-agent-notify install codex              # writes ~/.codex/config.toml + hooks.json
 agent-notify test --force               # synthetic ping to confirm round-trip
 ```
-
-Discord is the same shape (`webhook_url` under `[sinks.discord]`).
 
 ### B) Slack bot — phone-tap approvals
 
@@ -165,10 +165,10 @@ Highlights:
 | --- | --- |
 | `agent-notify --version` | Print the package version. |
 | `agent-notify --debug …` | Lower the stderr log level to DEBUG. Combine with any subcommand. |
-| `agent-notify hook --source {claude-code,codex}` | Reads a hook payload on stdin; invoked by the agents. |
+| `agent-notify hook --source claude-code` | Reads a hook payload on stdin; invoked by the agent. |
 | `agent-notify test [--force] [--kind …]` | Send a synthetic event end-to-end. |
 | `agent-notify config init \| path` | Write / locate the config file. |
-| `agent-notify install {claude-code,codex,slack-bot}` | Install hooks into the target agent (`slack-bot` also writes the launchd plist). |
+| `agent-notify install {claude-code,slack-bot}` | Install hooks into Claude Code (`slack-bot` also writes the launchd plist). |
 | `agent-notify slack add \| list \| remove <name> \| test <name>` | Workspace setup wizard + management. |
 | `agent-notify daemon` | Run the Slack Socket Mode listener (required when `actionable_approvals` is on). |
 | `agent-notify doctor` | Summarize config, list workspaces with live `auth.test`, check daemon + route match. |
