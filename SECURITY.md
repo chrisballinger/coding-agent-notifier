@@ -20,6 +20,22 @@ When reporting, include:
 
 ## Threat model
 
+### Network attack surface
+
+The daemon **never opens a listening socket** — no HTTP server, no
+localhost port, nothing for a browser tab or rogue local process to
+`fetch()` or DNS-rebind into. Its only network presence is an *outbound*
+WebSocket to Slack via Socket Mode (`wss-primary.slack.com`).
+Approve/Deny clicks travel back over that same outbound connection:
+Slack authenticates the click sender (real Slack `user_id`); the daemon
+then re-checks against your `approver_user_ids` / `approver_user_groups`
+allowlist before mutating any state. Toggle clicks (Show more / Show
+less) hit the same gate. Empty allowlists are accepted only when
+`channel = "@me"` (DM with the bot) — anything else fails at
+config-load with a `ConfigError`. There is no shell-injection path:
+every `subprocess.run` in the codebase uses argv-style invocation;
+`shell=True` does not appear anywhere.
+
 ### What we defend against
 
 - A misconfigured Slack app that posts approval messages to a channel
@@ -29,7 +45,9 @@ When reporting, include:
   rejection sent back).
 - A failure in any of the dispatch paths — Slack post, FIFO read, daemon
   crash, network timeout — fails closed (deny) for the
-  `actionable_approvals` flow.
+  `actionable_approvals` flow. Worst case is a one-line "denied"
+  message and you re-run in the terminal; silently approving on failure
+  would be much worse.
 - Group/world-readable `config.toml` carrying inline secrets (warned
   loudly; `secrets.toml` hard-fails).
 - Writes to state files (`~/.agent-notify/state/`) and logs go through
@@ -60,38 +78,100 @@ When reporting, include:
 
 ## Secret handling
 
-### macOS Keychain (recommended)
+Each token (`bot_token`, `app_token`, `webhook_url`) resolves from the
+first matching source in this order. Use the highest-trust one your
+environment supports.
 
-`agent-notify slack add` stores Slack bot and app tokens in macOS Keychain
-under accounts named `agent-notify:<workspace>:bot_token` and
+### 1. macOS Keychain (recommended on macOS)
+
+`bot_token_keychain = "default:bot_token"`. `agent-notify slack add`
+stores Slack bot and app tokens in macOS Keychain under accounts named
+`agent-notify:<workspace>:bot_token` and
 `agent-notify:<workspace>:app_token`. The wizard shells out to
-`/usr/bin/security add-generic-password -w <token>`. **Known tradeoff:**
-for the duration of that subprocess, the token is visible in `ps` to
-processes that can see your argv. macOS' `security(1)` does not have a
-stdin mode, so we accept this on single-user Macs as a documented
-limitation. On shared / multi-user macOS hosts, prefer the env-var path
-below.
+`/usr/bin/security add-generic-password -w <token>`. Keychain entries
+outlive config resets and are protected by the user's login keychain
+ACL.
 
-### Environment variables
+**Known tradeoff:** for the duration of that subprocess, the token is
+visible in `ps` to processes that can see your argv. macOS'
+`security(1)` does not have a stdin mode, so we accept this on
+single-user Macs as a documented limitation. On shared / multi-user
+macOS hosts, prefer the `secrets.toml` route below.
 
-Each token field accepts a `<field>_env = "VAR_NAME"` resolver in
-`config.toml`. Use this on shared machines, in CI, or when you want
-tokens managed by an external secret store (1Password CLI, AWS SSM,
-direnv, etc.). The env var is read once at config-load time.
+If `bot_token_keychain` is configured but the account is missing or the
+Keychain subprocess fails, config load fails loudly rather than silently
+falling through.
 
-### Inline tokens
-
-Inline values in `config.toml` work but trigger a loud stderr warning if
-the file isn't `0600`. Prefer Keychain or env vars for anything you'd be
-sad to leak.
-
-### `secrets.toml`
+### 2. `secrets.toml` (recommended on Linux / WSL / shared hosts)
 
 A sibling `secrets.toml` (in the same dot directory) is treated as a
 fill-in-missing layer over `config.toml`. Permissions are **enforced**
 at `0600` — a group-readable `secrets.toml` aborts the load rather than
 warning. This is the right path for "I want to commit `config.toml` to
-my dotfiles repo without committing tokens."
+my dotfiles repo without committing tokens", and the cleanest secret
+store on Linux today.
+
+### 3. Environment variables
+
+`bot_token_env = "SLACK_BOT_TOKEN"`. Cross-platform, works in CI.
+*Tradeoff:* env vars leak via process listings (`ps e`), subprocess
+inheritance, and shell rc-file commits. Prefer Keychain or
+`secrets.toml` on a developer machine.
+
+### 4. Inline tokens (discouraged)
+
+Inline values in `config.toml` work but trigger a loud stderr warning if
+the file isn't `0600`. Acceptable only on encrypted disks; prefer
+anything else above.
+
+### Logging
+
+`logs/defer.log` records metadata only — approval IDs, session IDs
+(short), tool names, decisions — and is created at `0600`. `tool_input`
+contents are never logged. If you see a stack trace in the log, it's
+from our own code; no token or command body is printed there either.
+
+## Data minimization (what actually transits Slack / Discord)
+
+The `display.verbosity` setting controls how much of each event leaves
+the machine. Pick the tier that matches your environment's compliance
+posture:
+
+| Mode      | Event title | Tool name | `tool_input` (commands / code) | Transcript snippet | Project path / session ID |
+| --------- | :---------: | :-------: | :-----------------------------: | :----------------: | :-----------------------: |
+| `normal`  |      ✓      |     ✓     |                ✓                |          ✓         |             ✓             |
+| `terse`   |      ✓      |     ✓     |                ✓                |          ✓         |       ✓ (compact)         |
+| `minimal` |      ✓      |     —     |                —                |          —         |             —             |
+
+`minimal` mode exists for environments where the *content* of an
+agent's pending tool call — a command, a snippet of code, the name of a
+repo — cannot transit a third-party service. You still get a ping that
+tells you to glance at the terminal; the terminal is authoritative for
+what's waiting. Approve/deny buttons still work (they carry only an
+opaque UUID), and the Slack confirm dialog is stripped of tool-specific
+text.
+
+For shared / corporate workspaces, the safest combination is:
+
+```toml
+[display]
+verbosity = "minimal"
+
+[slack.workspaces.default]
+channel = "@me"                        # bot-DM only, never a shared channel
+actionable_approvals = true            # buttons still work in minimal mode
+approver_user_ids = ["U0YOURID"]       # explicit allowlist
+```
+
+## Safer example commands
+
+No destructive shell patterns (`rm -rf …`) appear in fixtures, examples,
+screenshots, or the `agent-notify test --dangerous` synthetic event —
+on the theory that a user who copies a command out of a notification
+into a terminal should not be harmed by it. Placeholder commands use
+`https://example.invalid/...` (a reserved TLD that never resolves) so
+`curl | bash`-style examples are cosmetically dangerous but cannot
+actually do anything.
 
 ## Filesystem layout
 
@@ -125,7 +205,7 @@ delete it.
 ## launchd daemon
 
 The `agent-notify install slack-bot` flow writes a launchd LaunchAgent
-plist at `~/Library/LaunchAgents/com.chrisballinger.agent-notify-daemon.plist`
+plist at `~/Library/LaunchAgents/app.coding-agent-notifier.daemon.plist`
 (mode `0600`). The plist:
 
 - Runs as the installing user (no `sudo`, no system daemon).
