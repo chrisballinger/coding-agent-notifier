@@ -2,12 +2,7 @@
 
 [![CI](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisballinger/coding-agent-notifier/actions/workflows/ci.yml)
 
-> ⚠️ **Use at your own risk — this codebase was largely AI-generated.**
-> Apologies in advance for any slop. The code isn't battle-tested or
-> audited and ships with no warranty (see [LICENSE](LICENSE)). Don't
-> run it against credentials or workspaces you can't afford to lose.
-> Read [SECURITY.md](SECURITY.md) before running it on anything
-> sensitive.
+> In case it's not obvious, this is all slop. Use at your own risk.
 
 Ping yourself on Slack or Discord when a coding agent — Claude Code,
 Codex — needs your attention, but only when you're actually away from
