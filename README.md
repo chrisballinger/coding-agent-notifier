@@ -6,9 +6,16 @@
 
 Ping yourself on Slack or Discord when a coding agent — Claude Code,
 Codex — needs your attention, but only when you're actually away from
-the keyboard. Built for the workflow where you kick off an agent,
-switch to another task, and want to know *the moment* it asks for
-approval or finishes — without having to babysit the terminal.
+the keyboard.
+
+Fills the gap left by Claude Code Remote in the Claude iOS app, which
+doesn't yet support push notifications. Also covers Claude Code
+deployments running against Amazon Bedrock, where Claude Code Remote
+isn't available at all.
+
+Built for the workflow where you kick off an agent, switch to another
+task, and want to know *the moment* it asks for approval or finishes —
+without having to babysit the terminal.
 
 ## What triggers a ping
 
