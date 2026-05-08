@@ -1,0 +1,15 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "abc123",
+  "transcript_path": "/Users/me/.claude/projects/myproj/00893aaf.jsonl",
+  "cwd": "/Users/me/myproj",
+  "tool_name": "ExitPlanMode",
+  "tool_use_id": "toolu_02XYZ",
+  "tool_input": {
+    "plan": "1. Do the thing\n2. Do the other thing"
+  },
+  "tool_response": {
+    "decision": "allow",
+    "approved": true
+  }
+}

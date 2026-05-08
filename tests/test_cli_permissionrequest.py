@@ -69,8 +69,12 @@ def test_permissionrequest_actionable_off_emits_nothing():
     assert buf.getvalue() == ""
 
 
-def test_permissionrequest_times_out_denies(tmp_path, monkeypatch):
-    # Keep the dedup + pending cache isolated.
+def test_permissionrequest_times_out_falls_through(tmp_path, monkeypatch):
+    """Slack timeout must not deny — emit nothing on stdout so Claude Code
+    falls through to its native TUI / Claude Code Remote prompt. The user
+    is on a non-Slack surface; treating their absence as a deny breaks
+    their actual work.
+    """
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
     buf = io.StringIO()
     rc = cli.cmd_permissionrequest(
@@ -82,9 +86,15 @@ def test_permissionrequest_times_out_denies(tmp_path, monkeypatch):
         stdout=buf,
     )
     assert rc == 0
-    out = json.loads(buf.getvalue())
-    assert out["hookSpecificOutput"]["decision"]["behavior"] == "deny"
-    assert "timed out" in out["hookSpecificOutput"]["decision"].get("message", "").lower()
+    # Empty stdout = "no decision" → Claude Code shows its own prompt.
+    assert buf.getvalue() == ""
+    # Record should be marked timed_out so a late Slack click is a no-op
+    # and PostToolUse can later upgrade it with the actual answer.
+    pending = list((tmp_path / "state" / "approvals").glob("*.json"))
+    assert len(pending) == 1
+    rec = json.loads(pending[0].read_text())
+    assert rec["decision"] == "timed_out"
+    assert rec["actor"] == "timeout"
 
 
 def test_permissionrequest_returns_allow_on_resolve(tmp_path, monkeypatch):

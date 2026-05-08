@@ -24,6 +24,42 @@ def test_install_slack_bot_adds_permissionrequest_hook(tmp_path: Path):
     assert "PermissionRequest" in summary["claude_hooks_added"]
 
 
+def test_install_slack_bot_adds_posttooluse_hook(tmp_path: Path):
+    """PostToolUse with matcher AskUserQuestion|ExitPlanMode is the back-fill
+    path for cross-surface answers (TUI / Claude Code Remote on iOS) — must
+    be installed alongside PermissionRequest, not require a separate command."""
+    settings = tmp_path / "settings.json"
+    la_dir = tmp_path / "LaunchAgents"
+    summary = install.install_slack_bot(settings, launch_agents_dir=la_dir)
+    data = json.loads(settings.read_text())
+    assert "PostToolUse" in data["hooks"]
+    entries = data["hooks"]["PostToolUse"]
+    matchers = [e.get("matcher") for e in entries]
+    assert "AskUserQuestion|ExitPlanMode" in matchers
+    pt_cmds = [
+        h["command"]
+        for entry in entries
+        for h in entry.get("hooks", [])
+    ]
+    assert any("agent-notify hook" in c for c in pt_cmds)
+    assert "PostToolUse" in summary["claude_hooks_added"]
+
+
+def test_install_slack_bot_posttooluse_idempotent(tmp_path: Path):
+    """Running install_slack_bot twice must not duplicate the PostToolUse
+    entry — that would fire our hook subprocess twice per AskUserQuestion."""
+    settings = tmp_path / "settings.json"
+    la_dir = tmp_path / "LaunchAgents"
+    install.install_slack_bot(settings, launch_agents_dir=la_dir)
+    install.install_slack_bot(settings, launch_agents_dir=la_dir)
+    data = json.loads(settings.read_text())
+    entries = data["hooks"]["PostToolUse"]
+    ours = [e for e in entries if any(
+        "agent-notify hook" in h.get("command", "") for h in e.get("hooks", [])
+    )]
+    assert len(ours) == 1
+
+
 def test_install_slack_bot_sets_long_timeout_on_permissionrequest(tmp_path: Path):
     settings = tmp_path / "settings.json"
     la_dir = tmp_path / "LaunchAgents"

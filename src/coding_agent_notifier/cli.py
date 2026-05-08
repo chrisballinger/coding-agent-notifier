@@ -242,6 +242,16 @@ def cmd_hook(args: argparse.Namespace) -> int:
                 return cmd_permissionrequest(payload, config)
         # else: fall through to the notification flow below.
 
+    # PostToolUse is a back-fill signal, not a ping: when the user answers an
+    # AskUserQuestion / ExitPlanMode prompt on a non-Slack surface (TUI,
+    # Claude Code Remote on iOS, etc.), Claude Code fires PostToolUse with
+    # the answer in `tool_response`. We use it to update the corresponding
+    # Slack message — collapsing the buttons and showing what was selected —
+    # so the channel record stays accurate. Matcher in install.py is narrowed
+    # to AskUserQuestion|ExitPlanMode so we don't pay this cost per tool call.
+    if args.source == "claude-code" and payload.get("hook_event_name") == "PostToolUse":
+        return cmd_posttooluse(payload, args)
+
     source_app = macos.term_program_to_app(os.environ.get("TERM_PROGRAM"))
     parse = src_claude.parse if args.source == "claude-code" else src_codex.parse
     event = parse(payload, source_app=source_app)
@@ -285,6 +295,211 @@ def cmd_hook(args: argparse.Namespace) -> int:
     event = _maybe_apply_snippet(event, config)
     _dispatch(event, config)
     return 0
+
+
+def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
+    """Back-fill the Slack message for an AskUserQuestion / ExitPlanMode
+    answer that arrived on a non-Slack surface.
+
+    Looks up the pending approval (by tool_use_id, falling back to
+    session_id+tool_name), parses the user's selections out of
+    `tool_response`, marks the record resolved (idempotent — safe if a
+    Slack click already won), and edits the Slack message in place via
+    chat.update. Best-effort throughout; any failure is logged and
+    swallowed so a hook subprocess never blocks the agent.
+    """
+    from .sinks import slack as slack_sink
+
+    tool_name = payload.get("tool_name")
+    if tool_name not in ("AskUserQuestion", "ExitPlanMode"):
+        return 0
+
+    session_id = payload.get("session_id")
+    tool_use_id_raw = payload.get("tool_use_id")
+    tool_use_id = tool_use_id_raw if isinstance(tool_use_id_raw, str) else None
+    tool_response = payload.get("tool_response")
+
+    rec = None
+    if tool_use_id:
+        rec = pending_approvals.find_by_tool_use_id(tool_use_id)
+    if rec is None and session_id:
+        rec = pending_approvals.find_active_for_session(session_id, tool_name)
+    if rec is None:
+        # No pending approval for this tool call — either we never sent it
+        # to Slack, or it was already finalized via a Slack click. Either
+        # way nothing to back-fill.
+        return 0
+
+    if rec.get("decision") in ("allow", "deny"):
+        # Slack already won; the message has been updated. Nothing to do.
+        return 0
+
+    config = load_config(args.config)
+    cwd_raw = payload.get("cwd")
+    cwd = Path(cwd_raw) if isinstance(cwd_raw, str) and cwd_raw else Path(".")
+    resolved = sinks_for(cwd, config)
+    if resolved is None:
+        return 0
+    slack_cfg, _ = resolved
+    if not (slack_cfg.enabled and slack_cfg.bot_token):
+        return 0
+
+    approval_id = rec.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        return 0
+
+    # Reconstruct an Event with enough fields for build_resolved_message.
+    suggestions = rec.get("permission_suggestions")
+    event = Event(
+        agent="claude-code",
+        kind="permission",
+        message="",
+        cwd=cwd,
+        session_id=session_id,
+        tool_name=tool_name,
+        tool_input=rec.get("tool_input") if isinstance(rec.get("tool_input"), dict) else None,
+        permission_suggestions=(
+            tuple(s for s in suggestions if isinstance(s, dict))
+            if isinstance(suggestions, list) and suggestions else None
+        ),
+    )
+
+    if tool_name == "AskUserQuestion":
+        decision, selected_options, freeform_answers = _extract_ask_user_question_answer(
+            event.tool_input, tool_response,
+        )
+    else:  # ExitPlanMode
+        decision, selected_options, freeform_answers = _extract_exit_plan_mode_answer(
+            tool_response,
+        )
+
+    # Persist the resolution. `resolve` accepts upgrades from "timed_out" →
+    # "allow"/"deny" but is otherwise idempotent, so a Slack click that
+    # raced PostToolUse stays the winner.
+    pending_approvals.resolve(
+        approval_id,
+        decision,
+        actor="external",
+        selected_options=selected_options if selected_options else None,
+        freeform_answers=freeform_answers if freeform_answers else None,
+    )
+
+    channel = rec.get("channel")
+    message_ts = rec.get("message_ts")
+    if not (channel and message_ts):
+        return 0
+    try:
+        body = slack_sink.build_resolved_message(
+            event, decision, "another surface",
+            verbosity=config.display.verbosity,
+            selected_options=selected_options if selected_options else None,
+            freeform_answers=freeform_answers if freeform_answers else None,
+        )
+        slack_sink.update_message(slack_cfg.bot_token, channel, message_ts, body)
+    except Exception:  # noqa: BLE001 - hooks must never block the agent
+        traceback.print_exc(file=sys.stderr)
+        return 0
+
+    # Cleanup the on-disk record now that both Slack and Claude Code
+    # are in sync. Best-effort.
+    try:
+        pending_approvals.cleanup(approval_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _extract_ask_user_question_answer(
+    tool_input: dict | None,
+    tool_response: Any,
+) -> tuple[str, dict[str, int], dict[str, str]]:
+    """Parse AskUserQuestion's tool_response into (decision, selected_options,
+    freeform_answers).
+
+    Tolerant of multiple shapes since Claude Code's exact tool_response
+    payload for AskUserQuestion isn't pinned down in our fixtures yet.
+    Recognized shapes:
+      - {"answers": {<question text>: <chosen label or freeform text>}}
+      - {<question text>: <chosen label>} (flat dict)
+      - [<chosen label>, <chosen label>, ...] (positional list)
+
+    Returns ("allow", {}, {}) when the response can't be parsed — the
+    Slack message still collapses, just without the per-question selections.
+    """
+    selected_options: dict[str, int] = {}
+    freeform_answers: dict[str, str] = {}
+    if not isinstance(tool_input, dict):
+        return "allow", selected_options, freeform_answers
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return "allow", selected_options, freeform_answers
+
+    answers_by_text: dict[str, str] = {}
+    if isinstance(tool_response, dict):
+        candidate = tool_response.get("answers")
+        if isinstance(candidate, dict):
+            answers_by_text = {
+                str(k): str(v) for k, v in candidate.items() if isinstance(v, str)
+            }
+        else:
+            answers_by_text = {
+                str(k): str(v) for k, v in tool_response.items() if isinstance(v, str)
+            }
+    elif isinstance(tool_response, list):
+        for q_idx, ans in enumerate(tool_response):
+            if isinstance(ans, str) and q_idx < len(questions):
+                q = questions[q_idx]
+                if isinstance(q, dict):
+                    qtext = q.get("question")
+                    if isinstance(qtext, str):
+                        answers_by_text[qtext] = ans
+
+    for q_idx, q in enumerate(questions):
+        if not isinstance(q, dict):
+            continue
+        qtext = q.get("question")
+        if not isinstance(qtext, str):
+            continue
+        ans = answers_by_text.get(qtext)
+        if not isinstance(ans, str):
+            continue
+        options = q.get("options")
+        matched_idx: int | None = None
+        if isinstance(options, list):
+            for o_idx, opt in enumerate(options):
+                if isinstance(opt, dict) and opt.get("label") == ans:
+                    matched_idx = o_idx
+                    break
+        if matched_idx is not None:
+            selected_options[str(q_idx)] = matched_idx
+        else:
+            freeform_answers[str(q_idx)] = ans
+
+    return "allow", selected_options, freeform_answers
+
+
+def _extract_exit_plan_mode_answer(
+    tool_response: Any,
+) -> tuple[str, dict[str, int], dict[str, str]]:
+    """Parse ExitPlanMode's tool_response into (decision, selected_options,
+    freeform_answers).
+
+    ExitPlanMode is a binary approve/deny with optional freeform feedback.
+    Tolerant of multiple shapes — we infer "allow" by default since plan
+    mode exit only happens after the user engaged with the prompt; a
+    "deny" only registers if we see explicit signal.
+    """
+    decision = "allow"
+    if isinstance(tool_response, dict):
+        for key in ("decision", "behavior", "result"):
+            v = tool_response.get(key)
+            if isinstance(v, str) and v.lower() in ("deny", "denied", "rejected", "cancelled", "canceled"):
+                decision = "deny"
+                break
+        approved = tool_response.get("approved")
+        if isinstance(approved, bool) and not approved:
+            decision = "deny"
+    return decision, {}, {}
 
 
 def cmd_defer_dispatch(args: argparse.Namespace) -> int:
@@ -412,6 +627,8 @@ def cmd_permissionrequest(
     session_id = payload.get("session_id")
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else None
+    tool_use_id_raw = payload.get("tool_use_id")
+    tool_use_id = tool_use_id_raw if isinstance(tool_use_id_raw, str) and tool_use_id_raw else None
     transcript_raw = payload.get("transcript_path")
     transcript_path = Path(transcript_raw) if isinstance(transcript_raw, str) and transcript_raw else None
     permission_suggestions = _validate_permission_suggestions(
@@ -443,6 +660,7 @@ def cmd_permissionrequest(
         tool_input=tool_input,
         workspace=workspace_name,
         permission_suggestions=list(permission_suggestions) if permission_suggestions else None,
+        tool_use_id=tool_use_id,
     )
 
     try:
@@ -476,18 +694,41 @@ def cmd_permissionrequest(
     )
     record = pending_approvals.wait(approval_id, timeout=wait_timeout)
     if record is None:
-        _log_event(f"PermissionRequest timed out approval_id={approval_id}")
-        # Try to mark the message as timed-out; best-effort.
+        _log_event(f"PermissionRequest timed out approval_id={approval_id} — falling through to TUI")
+        # Mark the record so:
+        #   1. A late Slack click is treated as a no-op by the daemon
+        #      (it loaded a `timed_out` record).
+        #   2. PostToolUse can later upgrade this to a real allow/deny
+        #      with the answer the user gave on TUI/Remote, and update
+        #      the Slack message in place via chat.update.
+        # Best-effort — `resolve` returns None if the record's gone.
         try:
-            if slack_cfg.bot_token:
-                body = slack_sink.build_resolved_message(event, "timeout", "system")
+            pending_approvals.resolve(
+                approval_id, "timed_out", actor="timeout",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # In minimal-content mode the user has explicitly opted out of
+        # transmitting answer details to Slack — collapse the message to a
+        # generic "awaiting answer" body now and skip the future PostToolUse
+        # rewrite. In normal mode, leave the message alone: PostToolUse will
+        # replace the body with the actual selections shortly.
+        if slack_cfg.bot_token and config.display.verbosity == "minimal":
+            try:
+                body = slack_sink.build_resolved_message(
+                    event, "timed_out", "another surface",
+                    verbosity=config.display.verbosity,
+                )
                 slack_sink.update_message(
                     slack_cfg.bot_token, channel, message_ts, body, poster=poster,
                 )
-        except Exception:  # noqa: BLE001
-            pass
-        pending_approvals.cleanup(approval_id)
-        _emit_decision(out, "deny", reason="agent-notify: approval timed out")
+            except Exception:  # noqa: BLE001
+                pass
+        # DO NOT cleanup the record — PostToolUse needs it to find the
+        # Slack (channel, ts) and back-fill the actual answer. A daemon-
+        # side gc reaps stale `timed_out` records eventually.
+        # Emit no decision: empty stdout signals "fall through" to Claude
+        # Code, which then shows its native TUI / Remote prompt.
         return 0
 
     decision = record["decision"]

@@ -1289,6 +1289,7 @@ def build_resolved_message(
     rule edit.
     """
     has_multi = bool(selected_options) or bool(freeform_answers)
+    is_external = actor_label == "another surface"
     if decision == "allow":
         icon = ":white_check_mark:"
         verb = "Approved"
@@ -1303,12 +1304,20 @@ def build_resolved_message(
         icon = ":no_entry_sign:"
         verb = "Denied"
         color = "#e01e5a"
-    else:  # "timeout"
+    else:  # "timed_out"
         icon = ":hourglass:"
-        verb = "Timed out — denied"
+        verb = "Awaiting answer"
         color = "#a0a0a0"
 
-    header = f"{icon} *{verb} by {actor_label}*"
+    # When the answer arrived on a non-Slack surface (TUI / Claude Code
+    # Remote) we surface that explicitly — "Answered on another surface"
+    # reads better than "Answered by another surface" and signals the
+    # user to look at their terminal / iOS app instead of the buttons.
+    preposition = "on" if is_external else "by"
+    if decision == "timed_out":
+        header = f"{icon} *{verb} on another surface*"
+    else:
+        header = f"{icon} *{verb} {preposition} {actor_label}*"
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
     ]
@@ -1324,8 +1333,12 @@ def build_resolved_message(
     if verbosity == "minimal":
         # Outcome + actor only — no tool name, no context footer. Reason
         # text already added above for deny.
+        if decision == "timed_out":
+            fallback = f"{verb} on another surface"
+        else:
+            fallback = f"{verb} {preposition} {actor_label}"
         return {
-            "text": f"{verb} by {actor_label}",
+            "text": fallback,
             "attachments": [{"color": color, "blocks": blocks}],
         }
 
@@ -1366,8 +1379,12 @@ def build_resolved_message(
     footer = _terse_footer(event) if verbosity == "terse" else None
     if footer:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]})
+    if decision == "timed_out":
+        fallback = f"{verb} on another surface — {event.tool_name or 'tool'}"
+    else:
+        fallback = f"{verb} {preposition} {actor_label} — {event.tool_name or 'tool'}"
     return {
-        "text": f"{verb} by {actor_label} — {event.tool_name or 'tool'}",
+        "text": fallback,
         "attachments": [{"color": color, "blocks": blocks}],
     }
 

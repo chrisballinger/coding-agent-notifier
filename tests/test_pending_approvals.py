@@ -92,6 +92,78 @@ def test_resolve_invalid_decision_raises(tmp_path: Path):
         pa.resolve("abc", "maybe", base_dir=tmp_path)  # type: ignore[arg-type]
 
 
+def test_resolve_timed_out_then_upgraded_to_allow(tmp_path: Path):
+    """The hook marks `timed_out` after its Slack wait elapsed; the user
+    then answers in TUI / Remote and PostToolUse calls resolve again with
+    the actual answer. The upgrade must take — otherwise Slack stays
+    showing "awaiting" forever."""
+    pa.create("abc", agent="claude-code", session_id="s", tool_name="AskUserQuestion", base_dir=tmp_path)
+    first = pa.resolve("abc", "timed_out", actor="timeout", base_dir=tmp_path)
+    assert first["decision"] == "timed_out"
+    upgraded = pa.resolve(
+        "abc", "allow", actor="external",
+        selected_options={"0": 1}, base_dir=tmp_path,
+    )
+    assert upgraded["decision"] == "allow"
+    assert upgraded["actor"] == "external"
+    assert upgraded["selected_options"] == {"0": 1}
+
+
+def test_resolve_real_decision_blocks_subsequent_writes(tmp_path: Path):
+    """An allow/deny resolution is final — a stray late call (e.g. from
+    a delayed PostToolUse arriving after a Slack click) must NOT clobber
+    the real decision."""
+    pa.create("abc", agent="claude-code", session_id=None, tool_name=None, base_dir=tmp_path)
+    pa.resolve("abc", "allow", actor="U_OK", base_dir=tmp_path)
+    # PostToolUse arrives late and tries to overwrite — should no-op.
+    second = pa.resolve("abc", "deny", actor="external", base_dir=tmp_path)
+    assert second["decision"] == "allow"
+    assert second["actor"] == "U_OK"
+
+
+def test_create_persists_tool_use_id(tmp_path: Path):
+    pa.create(
+        "abc", agent="claude-code", session_id="s", tool_name="AskUserQuestion",
+        tool_use_id="toolu_abc", base_dir=tmp_path,
+    )
+    rec = pa.read("abc", base_dir=tmp_path)
+    assert rec["tool_use_id"] == "toolu_abc"
+
+
+def test_find_by_tool_use_id_returns_match(tmp_path: Path):
+    pa.create(
+        "first", agent="claude-code", session_id="s1", tool_name="AskUserQuestion",
+        tool_use_id="toolu_X", base_dir=tmp_path,
+    )
+    pa.create(
+        "second", agent="claude-code", session_id="s2", tool_name="ExitPlanMode",
+        tool_use_id="toolu_Y", base_dir=tmp_path,
+    )
+    rec = pa.find_by_tool_use_id("toolu_Y", base_dir=tmp_path)
+    assert rec is not None
+    assert rec["approval_id"] == "second"
+
+
+def test_find_by_tool_use_id_returns_none(tmp_path: Path):
+    assert pa.find_by_tool_use_id("toolu_missing", base_dir=tmp_path) is None
+
+
+def test_find_active_for_session_skips_resolved(tmp_path: Path):
+    """Fallback lookup for older approvals without tool_use_id. Must NOT
+    return records that are already allow/deny — those are done. Records
+    in `timed_out` state ARE returned because they're awaiting back-fill."""
+    pa.create("done", agent="claude-code", session_id="s",
+              tool_name="AskUserQuestion", base_dir=tmp_path)
+    pa.resolve("done", "allow", base_dir=tmp_path)
+    pa.create("waiting", agent="claude-code", session_id="s",
+              tool_name="AskUserQuestion", base_dir=tmp_path)
+    pa.resolve("waiting", "timed_out", actor="timeout", base_dir=tmp_path)
+
+    rec = pa.find_active_for_session("s", "AskUserQuestion", base_dir=tmp_path)
+    assert rec is not None
+    assert rec["approval_id"] == "waiting"
+
+
 def test_wait_returns_record_written_before_wait(tmp_path: Path):
     pa.create("abc", agent="claude-code", session_id=None, tool_name=None, base_dir=tmp_path)
     pa.resolve("abc", "deny", base_dir=tmp_path)

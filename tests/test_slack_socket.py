@@ -41,6 +41,54 @@ def test_non_interactive_payload_not_handled():
     assert res.handled is False
 
 
+def test_click_on_timed_out_record_is_noop(tmp_path: Path):
+    """Once the hook timed out and fell through to the TUI, a late Slack
+    click can't change Claude Code's behavior — the hook process is gone.
+    Treat the click as a no-op (with an ephemeral hint), don't try to
+    resolve, and don't overwrite the resolved-elsewhere body that
+    PostToolUse will write."""
+    pa.create(
+        "appr-timeout",
+        agent="claude-code",
+        session_id="s",
+        tool_name="AskUserQuestion",
+        tool_input={"questions": [{"question": "Q?", "options": [{"label": "A"}, {"label": "B"}]}]},
+        base_dir=tmp_path,
+    )
+    pa.set_message_ref("appr-timeout", "C1", "1.0", base_dir=tmp_path)
+    pa.resolve("appr-timeout", "timed_out", actor="timeout", base_dir=tmp_path)
+
+    updates: list[dict] = []
+    ephemerals: list[dict] = []
+
+    def _update(bot_token, channel, ts, body):
+        updates.append({"channel": channel, "ts": ts, "body": body})
+
+    def _ephemeral(*, channel, user, text):
+        ephemerals.append({"channel": channel, "user": user, "text": text})
+
+    payload = _payload("agent_notify_option_0", value="appr-timeout")
+    res = slack_socket.handle_block_actions(
+        payload,
+        _slack_config(),
+        update_fn=_update,
+        ephemeral_fn=_ephemeral,
+        base_dir=tmp_path,
+    )
+
+    assert res.handled is True
+    assert res.rejected_reason == "timed_out"
+    # No chat.update — PostToolUse owns the resolution rendering.
+    assert updates == []
+    # User got an ephemeral hint redirecting them to TUI / Remote.
+    assert len(ephemerals) == 1
+    assert "terminal" in ephemerals[0]["text"].lower()
+    # Record stays in `timed_out` state (not upgraded to allow/deny by
+    # the click).
+    rec = pa.read("appr-timeout", base_dir=tmp_path)
+    assert rec["decision"] == "timed_out"
+
+
 def test_unknown_action_id_not_handled():
     payload = _payload("some_other_button")
     res = slack_socket.handle_block_actions(payload, _slack_config())

@@ -74,6 +74,7 @@ def create(
     tool_input: dict | None = None,
     workspace: str = "default",
     permission_suggestions: list[dict] | None = None,
+    tool_use_id: str | None = None,
     base_dir: Path | None = None,
     clock: Callable[[], float] = time.time,
 ) -> Path:
@@ -87,6 +88,10 @@ def create(
     `permission_suggestions` is the PermissionRequest payload's suggestion
     list — stored on the record so the daemon can look it up at click time
     (avoids re-shipping it through the action_id value).
+
+    `tool_use_id` is Claude Code's per-call identifier for the tool
+    invocation. Stored so the PostToolUse back-fill path can find the
+    matching record without a session-wide scan.
     """
     record = _record_path(approval_id, base_dir)
     fifo = _fifo_path(approval_id, base_dir)
@@ -97,6 +102,7 @@ def create(
         "session_id": session_id,
         "tool_name": tool_name,
         "tool_input": tool_input if isinstance(tool_input, dict) else None,
+        "tool_use_id": tool_use_id,
         "workspace": workspace,
         "created_at": clock(),
         "decision": None,
@@ -177,22 +183,37 @@ def resolve(
 ) -> dict | None:
     """Mark the approval resolved and wake the waiting hook. Returns record or None.
 
+    `decision` is one of: "allow", "deny", "timed_out". The first two come
+    from a Slack click or modal submission and produce a real Claude Code
+    decision. "timed_out" is recorded by the hook itself when the Slack
+    wait elapsed without a click — it marks the record as no-longer-
+    actionable so concurrent Slack clicks become idempotent no-ops, while
+    leaving the door open for a later PostToolUse back-fill (which calls
+    `resolve` again with "allow"/"deny" and the answers from another
+    surface).
+
     `selected_option` (legacy single-question AskUserQuestion) is the index
     into `tool_input["questions"][0]["options"]`. New multi-question code
     passes `selected_options` instead — a dict mapping question index (str)
     → selected option index. Both flow into PermissionRequest's
     `updatedInput.answers` via `cmd_permissionrequest`.
     """
-    if decision not in ("allow", "deny"):
-        raise ValueError(f"decision must be 'allow' or 'deny', got {decision!r}")
+    if decision not in ("allow", "deny", "timed_out"):
+        raise ValueError(f"decision must be 'allow', 'deny', or 'timed_out', got {decision!r}")
     record = _record_path(approval_id, base_dir)
     fifo = _fifo_path(approval_id, base_dir)
     with _locked(_lock_path(approval_id, base_dir)):
         if not record.exists():
             return None
         data = json.loads(record.read_text())
-        if data.get("decision") is not None:
-            # Already resolved — idempotent no-op.
+        existing = data.get("decision")
+        # "timed_out" records are intentionally upgradable to a real decision:
+        # the hook timed out and fell through to the TUI, then the user
+        # answered there and PostToolUse called us back with the actual
+        # answer. Real decisions (allow/deny) are still idempotent.
+        if existing in ("allow", "deny"):
+            return data
+        if existing == "timed_out" and decision == "timed_out":
             return data
         data["decision"] = decision
         data["actor"] = actor
@@ -381,6 +402,84 @@ def list_pending(*, base_dir: Path | None = None) -> list[dict]:
         if data.get("decision") is None:
             out.append(data)
     return out
+
+
+def find_by_tool_use_id(
+    tool_use_id: str,
+    *,
+    base_dir: Path | None = None,
+) -> dict | None:
+    """Return the most recent record matching `tool_use_id`, or None.
+
+    Used by the PostToolUse back-fill path: when Claude Code reports that
+    a tool finished, we need the original approval record (to know which
+    Slack message to update). Scans all records — there's no on-disk
+    index, but the approvals directory is small in practice (recently-
+    completed records get garbage-collected via `gc_stale`).
+
+    Includes already-resolved records so a PostToolUse arriving just
+    after a `timed_out` mark can still find the original.
+    """
+    root = base_dir or default_approvals_dir()
+    if not root.exists():
+        return None
+    best: dict | None = None
+    best_created = -1.0
+    for path in sorted(root.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("tool_use_id") != tool_use_id:
+            continue
+        created = data.get("created_at")
+        c = float(created) if isinstance(created, (int, float)) else 0.0
+        if c > best_created:
+            best = data
+            best_created = c
+    return best
+
+
+def find_active_for_session(
+    session_id: str,
+    tool_name: str,
+    *,
+    base_dir: Path | None = None,
+) -> dict | None:
+    """Fallback lookup when `tool_use_id` is unavailable.
+
+    Returns the most recent record (by `created_at`) for `(session_id,
+    tool_name)` whose decision is None or "timed_out" — i.e. records
+    that haven't been finalized via Slack. Used by the PostToolUse
+    back-fill for older approvals stored before `tool_use_id` was
+    persisted.
+    """
+    root = base_dir or default_approvals_dir()
+    if not root.exists():
+        return None
+    best: dict | None = None
+    best_created = -1.0
+    for path in sorted(root.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("session_id") != session_id:
+            continue
+        if data.get("tool_name") != tool_name:
+            continue
+        if data.get("decision") in ("allow", "deny"):
+            continue
+        created = data.get("created_at")
+        c = float(created) if isinstance(created, (int, float)) else 0.0
+        if c > best_created:
+            best = data
+            best_created = c
+    return best
 
 
 def gc_stale(*, max_age_seconds: float = 3600.0, base_dir: Path | None = None,

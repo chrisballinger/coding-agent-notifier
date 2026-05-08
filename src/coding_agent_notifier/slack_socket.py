@@ -230,6 +230,24 @@ def handle_block_actions(
             return ButtonClickResult(True, None, "views_open_failed", approval_id, user_id)
         return ButtonClickResult(True, None, None, approval_id, user_id)
 
+    # If the hook already timed out and fell through to the TUI/Remote
+    # prompt, a late Slack click is meaningless — Claude Code is no
+    # longer waiting on us, and PostToolUse will deliver the actual
+    # answer. Drop the click with an ephemeral hint instead of trying
+    # to resolve.
+    existing_record = pending_approvals.read(approval_id, base_dir=base_dir)
+    if existing_record is not None and existing_record.get("decision") == "timed_out":
+        if ephemeral_fn is not None and channel_id:
+            try:
+                ephemeral_fn(
+                    channel=channel_id,
+                    user=user_id,
+                    text=":hourglass: Slack timed out for this prompt — please answer in your terminal or Claude Code Remote.",
+                )
+            except Exception:
+                logger.exception("failed to send timed-out ephemeral to %s", user_id)
+        return ButtonClickResult(True, None, "timed_out", approval_id, user_id)
+
     # Multi-question: an option click is a partial answer if other
     # questions still need answering. We record it (without resolving),
     # update the message to reflect progress, and only resolve once every
@@ -398,6 +416,12 @@ def handle_view_submission(
             channel=channel, user=user_id, ephemeral_fn=ephemeral_fn,
         )
         return ButtonClickResult(True, None, "freeform_disabled", approval_id, user_id)
+
+    # Same timed-out guard as handle_block_actions: if the hook already
+    # fell through, Claude Code isn't waiting for our decision anymore.
+    existing_record = pending_approvals.read(approval_id, base_dir=base_dir)
+    if existing_record is not None and existing_record.get("decision") == "timed_out":
+        return ButtonClickResult(True, None, "timed_out", approval_id, user_id)
 
     if callback_id == MODAL_CALLBACK_DENY_REASON:
         rec = resolve_fn(

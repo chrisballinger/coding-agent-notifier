@@ -35,6 +35,21 @@ CLAUDE_PERMISSIONREQUEST_ENTRIES: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
+# PostToolUse is the back-fill signal that lets us update a Slack approval
+# message after the user answered on a non-Slack surface (TUI, Claude Code
+# Remote on iOS). The matcher is narrow — only the two tools we collapse
+# Slack messages for — so we don't pay a hook subprocess per tool call.
+# Installed alongside PermissionRequest by `install_slack_bot`; not part of
+# the base notification install.
+CLAUDE_POSTTOOLUSE_ENTRIES: dict[str, list[dict[str, Any]]] = {
+    "PostToolUse": [
+        {
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}],
+        }
+    ],
+}
+
 # Base notification hooks. PermissionRequest is intentionally NOT here — it
 # becomes a blocking decision hook only when the Slack bot install runs (see
 # CLAUDE_PERMISSIONREQUEST_ENTRIES). For non-actionable installs the
@@ -147,6 +162,26 @@ def install_claude_code(settings_path: Path | None = None) -> list[str]:
     return added
 
 
+def merge_claude_posttooluse(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Add the PostToolUse back-fill hook for AskUserQuestion / ExitPlanMode.
+    Idempotent.
+
+    Cleans up older `agent-notify hook` PostToolUse entries (e.g. with a
+    different matcher) before appending the canonical one — third-party
+    PostToolUse entries from other tools are left intact.
+    """
+    hooks = settings.setdefault("hooks", {})
+    added: list[str] = []
+    desired_entries = CLAUDE_POSTTOOLUSE_ENTRIES["PostToolUse"]
+    existing = hooks.get("PostToolUse", [])
+    if any(e == desired_entries[0] for e in existing):
+        return settings, added
+    cleaned_existing = [e for e in existing if not _entry_has_our_hook(e)]
+    hooks["PostToolUse"] = cleaned_existing + list(desired_entries)
+    added.append("PostToolUse")
+    return settings, added
+
+
 def merge_claude_permissionrequest(settings: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Add the PermissionRequest blocking hook. Idempotent.
 
@@ -228,8 +263,9 @@ def install_slack_bot(
     # install shouldn't require a prior `install claude-code`.
     settings, base_added = merge_claude_hooks(settings)
     settings, pre_added = merge_claude_permissionrequest(settings)
+    settings, post_added = merge_claude_posttooluse(settings)
     paths.write_secure(settings_path, json.dumps(settings, indent=2) + "\n")
-    claude_added = base_added + pre_added
+    claude_added = base_added + pre_added + post_added
 
     summary: dict[str, Any] = {
         "claude_hooks_added": claude_added,

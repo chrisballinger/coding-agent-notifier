@@ -205,10 +205,19 @@ def test_build_resolved_message_deny():
     assert "@alice" in text
 
 
-def test_build_resolved_message_timeout():
-    body = build_resolved_message(_event(), "timeout", "system")
+def test_build_resolved_message_timed_out():
+    """Timeout is no longer a denial — Claude Code falls through to its
+    native TUI prompt when our Slack wait elapses, so the resolved
+    message reads as "awaiting" rather than "denied"."""
+    body = build_resolved_message(_event(), "timed_out", "another surface")
     text = json.dumps(body)
-    assert "Timed out" in text
+    assert "Awaiting answer" in text
+    # Header should attribute the pending state to the non-Slack surface,
+    # not to a (non-existent) actor.
+    assert "another surface" in text
+    # Don't regress — must not claim the request was denied.
+    assert "Denied" not in text
+    assert "denied" not in text
 
 
 # --- AskUserQuestion option-button rendering ---
