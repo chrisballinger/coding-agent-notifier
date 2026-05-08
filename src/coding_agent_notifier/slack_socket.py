@@ -175,7 +175,10 @@ def handle_block_actions(
                 update_fn(slack_config.bot_token, rec_channel, rec_ts, body)
             except Exception:
                 logger.exception("toggle chat.update failed for msg=%s", msg_id)
-        logger.info(
+        # Logged at debug because the user_id is sensitive (per-user activity
+        # trail). --debug enables it for diagnostics; default WARNING level
+        # in production keeps daemon.log free of click attributions.
+        logger.debug(
             "workspace=%s payload=block_actions toggle=%s msg_id=%s user=%s",
             workspace, toggle_kind, msg_id, user_id,
         )
@@ -789,7 +792,10 @@ def _start_workspace_listener(
             logger.exception("handler raised while processing Slack interaction")
             return
         if result.handled:
-            logger.info(
+            # Debug-only: includes user_id (Slack user IDs are PII when
+            # paired with workspace/channel context). Default WARNING
+            # suppresses it; --debug surfaces it for diagnostics.
+            logger.debug(
                 "workspace=%s payload=%s approval=%s decision=%s user=%s rejected=%s",
                 workspace_name,
                 payload_type,

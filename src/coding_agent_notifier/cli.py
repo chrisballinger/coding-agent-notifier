@@ -318,20 +318,43 @@ def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
     tool_use_id_raw = payload.get("tool_use_id")
     tool_use_id = tool_use_id_raw if isinstance(tool_use_id_raw, str) else None
     tool_response = payload.get("tool_response")
+    _log_event(
+        f"PostToolUse fired tool={tool_name} sess={session_id} "
+        f"tool_use_id={tool_use_id} response_type={type(tool_response).__name__}"
+    )
 
     rec = None
+    lookup = "none"
     if tool_use_id:
         rec = pending_approvals.find_by_tool_use_id(tool_use_id)
+        if rec is not None:
+            lookup = "tool_use_id"
     if rec is None and session_id:
         rec = pending_approvals.find_active_for_session(session_id, tool_name)
+        if rec is not None:
+            lookup = "session_fallback"
     if rec is None:
         # No pending approval for this tool call — either we never sent it
         # to Slack, or it was already finalized via a Slack click. Either
         # way nothing to back-fill.
+        _log_event(
+            f"PostToolUse no pending approval found tool_use_id={tool_use_id} "
+            f"sess={session_id} tool={tool_name}"
+        )
         return 0
+    # Sensitive: includes Slack channel ID + message_ts. Verbose-only.
+    _log_event_verbose(
+        f"PostToolUse matched approval_id={rec.get('approval_id')} via={lookup} "
+        f"decision={rec.get('decision')} channel={rec.get('channel')} ts={rec.get('message_ts')}"
+    )
+    _log_event(
+        f"PostToolUse matched approval_id={rec.get('approval_id')} via={lookup} "
+        f"decision={rec.get('decision')}"
+    )
 
     if rec.get("decision") in ("allow", "deny"):
         # Slack already won; the message has been updated. Nothing to do.
+        _log_event("PostToolUse skipping — already resolved by Slack click")
         return 0
 
     config = load_config(args.config)
@@ -339,9 +362,16 @@ def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
     cwd = Path(cwd_raw) if isinstance(cwd_raw, str) and cwd_raw else Path(".")
     resolved = sinks_for(cwd, config)
     if resolved is None:
+        # Sensitive: cwd is a filesystem path. Verbose-only.
+        _log_event_verbose(f"PostToolUse no route matches cwd={cwd}")
+        _log_event("PostToolUse no route matches")
         return 0
     slack_cfg, _ = resolved
     if not (slack_cfg.enabled and slack_cfg.bot_token):
+        _log_event(
+            f"PostToolUse skipping — slack disabled or no bot_token "
+            f"(enabled={slack_cfg.enabled} has_token={bool(slack_cfg.bot_token)})"
+        )
         return 0
 
     approval_id = rec.get("approval_id")
@@ -372,6 +402,13 @@ def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
         decision, selected_options, freeform_answers = _extract_exit_plan_mode_answer(
             tool_response,
         )
+    # Sensitive: freeform answer keys leak which questions had typed text.
+    # Verbose-only; the basic line strips them.
+    _log_event_verbose(
+        f"PostToolUse extracted decision={decision} "
+        f"selected_options={selected_options} freeform_keys={sorted(freeform_answers.keys())}"
+    )
+    _log_event(f"PostToolUse extracted decision={decision}")
 
     # Persist the resolution. `resolve` accepts upgrades from "timed_out" →
     # "allow"/"deny" but is otherwise idempotent, so a Slack click that
@@ -387,6 +424,9 @@ def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
     channel = rec.get("channel")
     message_ts = rec.get("message_ts")
     if not (channel and message_ts):
+        _log_event(
+            f"PostToolUse no message_ref to update (channel={channel} ts={message_ts})"
+        )
         return 0
     try:
         body = slack_sink.build_resolved_message(
@@ -396,7 +436,13 @@ def cmd_posttooluse(payload: dict, args: argparse.Namespace) -> int:
             freeform_answers=freeform_answers if freeform_answers else None,
         )
         slack_sink.update_message(slack_cfg.bot_token, channel, message_ts, body)
-    except Exception:  # noqa: BLE001 - hooks must never block the agent
+        # Sensitive: Slack channel ID. Verbose-only.
+        _log_event_verbose(
+            f"PostToolUse chat.update OK approval_id={approval_id} channel={channel}"
+        )
+        _log_event(f"PostToolUse chat.update OK approval_id={approval_id}")
+    except Exception as e:  # noqa: BLE001 - hooks must never block the agent
+        _log_event(f"PostToolUse chat.update FAILED approval_id={approval_id}: {e!r}")
         traceback.print_exc(file=sys.stderr)
         return 0
 
@@ -677,7 +723,11 @@ def cmd_permissionrequest(
             poster=poster,
         )
         pending_approvals.set_message_ref(approval_id, channel, message_ts)
-        _log_event(f"PermissionRequest posted slack channel={channel} ts={message_ts}")
+        # Sensitive: Slack channel ID + message timestamp. Verbose-only.
+        _log_event_verbose(
+            f"PermissionRequest posted slack channel={channel} ts={message_ts}"
+        )
+        _log_event("PermissionRequest posted slack")
     except Exception as e:  # noqa: BLE001
         _log_event(f"PermissionRequest slack post failed: {e}")
         pending_approvals.cleanup(approval_id)
@@ -737,12 +787,20 @@ def cmd_permissionrequest(
     freeform_answers = record.get("freeform_answers") or {}
     selected_suggestion_idx = record.get("selected_suggestion_index")
     deny_reason = record.get("deny_reason")
-    _log_event(
+    # Sensitive: freeform_answers_keys reveals which questions had typed
+    # text; deny_reason '<set>' marker reveals that the user typed a reason.
+    # Both are verbose-only. The basic line keeps the decision verb +
+    # numeric option indices, which are useful for "did the resolve fire?"
+    # without leaking content signals.
+    _log_event_verbose(
         f"PermissionRequest resolved approval_id={approval_id} decision={decision} "
         f"selected_option_index={selected_idx} selected_options={selected_options} "
         f"freeform_answers_keys={sorted(freeform_answers.keys()) if isinstance(freeform_answers, dict) else None} "
         f"selected_suggestion_index={selected_suggestion_idx} "
         f"deny_reason={'<set>' if deny_reason else None}"
+    )
+    _log_event(
+        f"PermissionRequest resolved approval_id={approval_id} decision={decision}"
     )
     pending_approvals.cleanup(approval_id)
 
@@ -846,6 +904,18 @@ def _ask_user_question_updated_input(record: dict, selected_idx: int) -> dict | 
     """Build an updatedInput payload for the legacy single-question
     AskUserQuestion path. Returns None if the record's tool_input isn't
     a recognizable AUQ shape.
+
+    The shape `{"answers": {<question text>: <option label>}}` matches
+    Claude Code's published PermissionRequest decision spec. Empirically,
+    Claude Code's TUI still crashes when rendering this answer (H.map
+    error) — verified by capturing the literal stdout via
+    `[logging] level = "verbose"` and confirming bytes-out matches docs.
+    Wrapping the label in a list (`[label]`) didn't help either. The
+    crash appears to be an upstream Claude Code render bug; the answer
+    *is* applied (the hook unblocks, Slack collapses, the next agent turn
+    proceeds with the user's choice) — only the TUI render of the answer
+    fails. Documented and tracked separately; revisit if upstream fixes
+    or if the spec changes.
     """
     tool_input = record.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -886,6 +956,11 @@ def _ask_user_question_updated_input_multi(
     `freeform_answers` (str_q_idx → typed text) wins over `selected_options`
     per question — when the user submits a custom answer modal for Q1, the
     typed string lands in `answers[Q1]` instead of an option label.
+
+    Shape matches Claude Code's published spec: `{"answers": {<question>:
+    <label>}}` with a bare string per question. See the docstring on
+    `_ask_user_question_updated_input` for the H.map render-side issue we
+    can't fix from this side.
     """
     tool_input = record.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -954,7 +1029,13 @@ def _emit_decision(
             "decision": decision_obj,
         }
     }
-    out.write(json.dumps(payload))
+    text = json.dumps(payload)
+    # Verbose-only diagnostic: capture the literal JSON we hand to Claude
+    # Code so a user investigating render bugs can compare bytes-out vs
+    # documented spec. Sensitive — includes question text and option labels
+    # for AskUserQuestion; never on by default.
+    _log_event_verbose(f"emit decision={decision} json={text}")
+    out.write(text)
     out.write("\n")
     try:
         out.flush()
@@ -1090,13 +1171,98 @@ def _defer_log_path() -> Path:
     return paths.defer_log()
 
 
+# Cached log level so the hot path (_log_event) doesn't re-load the config
+# on every call. Reset to None for tests that override `AGENT_NOTIFY_HOME`
+# mid-run; production hooks/daemon are short-lived enough that "load once,
+# cache forever" is fine.
+_cached_log_level: str | None = None
+
+
+def _current_log_level() -> str:
+    """Return the active `logging.level` enum value, defaulting to 'off'.
+
+    Loads the config once on first call and caches the result. Any failure
+    during config load (missing file, malformed) is treated as 'off' —
+    same security-conservative default as if the user had no [logging]
+    section at all.
+    """
+    global _cached_log_level
+    if _cached_log_level is not None:
+        return _cached_log_level
+    try:
+        cfg = load_config(None)
+        _cached_log_level = cfg.logging.level
+    except Exception:  # noqa: BLE001 - logging must never block the agent
+        _cached_log_level = "off"
+    return _cached_log_level
+
+
+def _reset_log_level_cache() -> None:
+    """Force the next `_current_log_level()` call to re-read config.
+
+    Tests use this when they monkeypatch the config / env between cases.
+    Production code never calls this — the cache is process-lifetime.
+    """
+    global _cached_log_level
+    _cached_log_level = None
+
+
+_DEFER_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+
+def _maybe_rotate_defer_log(path: Path) -> None:
+    """Rotate defer.log → defer.log.1 (replacing any existing) when it
+    exceeds the cap. Single backup, no compression — keeps a verbose
+    debug session bounded so it can't fill the disk. Best-effort: any
+    OS error is swallowed (the next write still goes through, just to
+    a now-larger file)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size < _DEFER_LOG_MAX_BYTES:
+        return
+    backup = path.with_suffix(path.suffix + ".1")
+    try:
+        # os.replace is atomic on POSIX; overwrites any existing backup.
+        os.replace(path, backup)
+    except OSError:
+        pass
+
+
 def _log_event(msg: str) -> None:
-    """Append a timestamped line to defer.log with 0600 perms. Swallows all
+    """Append a timestamped line to defer.log under `logging.level >= basic`.
+
+    Default level is `off`, so this is a no-op until the user explicitly
+    opts in via `[logging] level = "basic"` (or "verbose"). Swallows all
     errors — a hook logging failure must never block the agent. Used to
     audit the defer pipeline (pending write, subprocess spawn, claim,
     dispatch)."""
+    if _current_log_level() == "off":
+        return
     try:
         path = _defer_log_path()
+        _maybe_rotate_defer_log(path)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with paths.open_append_secure(path) as f:
+            f.write(f"[{ts}] pid={os.getpid()} {msg}\n")
+    except OSError:
+        pass
+
+
+def _log_event_verbose(msg: str) -> None:
+    """Like `_log_event` but only fires at `logging.level = "verbose"`.
+
+    Reserved for messages that include sensitive metadata (Slack channel
+    IDs, message timestamps, cwd, freeform answer keys) or large payloads
+    (the `_emit_decision` JSON capture). Users opt in deliberately for
+    short-lived diagnostic sessions; never on by default.
+    """
+    if _current_log_level() != "verbose":
+        return
+    try:
+        path = _defer_log_path()
+        _maybe_rotate_defer_log(path)
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         with paths.open_append_secure(path) as f:
             f.write(f"[{ts}] pid={os.getpid()} {msg}\n")

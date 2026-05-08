@@ -101,11 +101,20 @@ def test_cmd_config_init_produces_0600(tmp_path, monkeypatch, loose_umask):
 
 
 def test_log_event_produces_0600(tmp_path, monkeypatch, loose_umask):
+    """When the user opts into [logging] level=basic, defer.log must still
+    be created with 0600 perms — opting into logs is not opting out of
+    the secure-write posture."""
     monkeypatch.setenv("AGENT_NOTIFY_HOME", str(tmp_path))
-    from coding_agent_notifier.cli import _log_event
-    _log_event("test line")
+    # Default level is "off", so _log_event would no-op; write a minimal
+    # config that enables it.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('gating = "always"\n\n[logging]\nlevel = "basic"\n')
+    from coding_agent_notifier import cli
+    cli._reset_log_level_cache()
+    cli._log_event("test line")
     assert _mode(paths.defer_log()) == FILE_MODE
     assert _mode(paths.logs_dir()) == DIR_MODE
+    cli._reset_log_level_cache()
 
 
 def test_dedup_creates_0600_state(tmp_path, monkeypatch, loose_umask):

@@ -27,6 +27,18 @@ VALID_EVENT_KINDS: tuple[EventKind, ...] = (
 Verbosity = Literal["terse", "normal", "minimal"]
 VALID_VERBOSITIES: tuple[Verbosity, ...] = ("terse", "normal", "minimal")
 
+# On-disk debug logging level for `~/.agent-notify/logs/defer.log`.
+#   off (default): no writes — defer.log is never created
+#   basic:         event-name + ID lines (session_id, approval_id, decision verb,
+#                  tool_name, counts). Useful for "did the hook fire?" debugging.
+#   verbose:       basic + Slack channel/message_ts / cwd / freeform answer keys
+#                  + `_emit_decision` JSON capture + future debug-only fields.
+# Default is `off` because the lower levels still leak metadata (channel IDs,
+# message timestamps) that would be embarrassing in a shared bug report. Users
+# turn this on intentionally, only as long as they need it.
+LogLevel = Literal["off", "basic", "verbose"]
+VALID_LOG_LEVELS: tuple[LogLevel, ...] = ("off", "basic", "verbose")
+
 # Per-workspace policy for freeform text inputs in interactive flows. "deny"
 # suppresses the "Custom answer" (AskUserQuestion) and "Deny with reason"
 # (PermissionRequest) modals so approvers can only choose fixed options. The
@@ -103,6 +115,21 @@ class DisplayConfig:
 
 
 @dataclass(frozen=True)
+class LoggingConfig:
+    """Controls on-disk diagnostic logging to `~/.agent-notify/logs/defer.log`.
+
+    Default `off` means we never write the file at all — security-by-default,
+    since even metadata-only logs (Slack channel IDs, message timestamps, cwd,
+    session IDs) are sensitive enough that a user pasting defer.log into a
+    bug report shouldn't surface them. Opt in with `level = "basic"` for
+    workflow debugging; `verbose` for full diagnostic capture (including
+    every hook subprocess's emit JSON, useful for upstream-bug-report repros
+    but expensive to leave on).
+    """
+    level: LogLevel = "off"
+
+
+@dataclass(frozen=True)
 class SummaryConfig:
     enabled: bool = True
     # Soft cap on the transcript snippet that becomes `event.message` for
@@ -160,6 +187,7 @@ class Config:
     routes: tuple[Route, ...] = ()
     display: DisplayConfig = field(default_factory=DisplayConfig)
     summary: SummaryConfig = field(default_factory=SummaryConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def event(self, kind: EventKind) -> EventConfig:
         return self.events.get(kind, EventConfig())
@@ -577,6 +605,17 @@ def parse_config(raw: dict[str, Any]) -> Config:
         tail_chars=tail_chars,
     )
 
+    logging_raw = raw.get("logging", {}) or {}
+    if not isinstance(logging_raw, dict):
+        raise ConfigError("logging must be a table")
+    log_level = logging_raw.get("level", "off")
+    if log_level not in VALID_LOG_LEVELS:
+        raise ConfigError(
+            f"invalid logging.level: {log_level!r} "
+            f"(expected one of {list(VALID_LOG_LEVELS)})"
+        )
+    logging_cfg = LoggingConfig(level=log_level)  # type: ignore[arg-type]
+
     return Config(
         idle_threshold_seconds=idle,
         gating=gating,  # type: ignore[arg-type]
@@ -588,6 +627,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         routes=tuple(routes),
         display=display,
         summary=summary,
+        logging=logging_cfg,
     )
 
 
@@ -718,6 +758,20 @@ tail_chars = 2000              # display.message_preview_*chars so the Slack Sho
                                 # has room to elide and expand. Set both small (e.g. 250/250) to restore
                                 # aggressive pre-truncation; set both very large to defer all UX
                                 # truncation to the toggle.
+
+[logging]
+# On-disk diagnostic log written to ~/.agent-notify/logs/defer.log.
+#   off (default) — never written
+#   basic         — event names + IDs (session_id, approval_id, decision verb,
+#                   tool_name, counts). Useful for "did the hook fire?" debugging.
+#   verbose       — basic + sensitive metadata (Slack channel/message_ts, cwd,
+#                   freeform answer keys) + the literal JSON each PermissionRequest
+#                   hook emits to Claude Code. Intended for short-lived diagnostic
+#                   sessions; rotates at 5MB to defer.log.1 (single backup).
+# Default off because even metadata-only lines (channel IDs, message timestamps)
+# are sensitive enough that a user pasting defer.log into a bug report shouldn't
+# surface them. Opt in only as long as you need it.
+level = "off"
 
 # --- Slack workspaces ----------------------------------------------------
 #

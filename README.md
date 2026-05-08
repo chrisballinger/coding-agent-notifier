@@ -140,6 +140,10 @@ Highlights:
 
 - `[display]` — `verbosity` (`terse`/`normal`/`minimal`),
   coalesce window, message preview budget for the Show more toggle.
+- `[logging]` — `level` (`off` default / `basic` / `verbose`) for on-disk
+  `defer.log` diagnostics. Off by default; even metadata-only lines
+  (channel IDs, message timestamps) shouldn't appear in a shared bug
+  report without explicit opt-in. Rotates at 5MB when enabled.
 - `[summary]` — head/tail snippet of the agent's last message on
   `turn_complete` (purely local, no API keys).
 - `[slack.workspaces.<name>]` — multi-workspace, with optional
@@ -158,11 +162,12 @@ Highlights:
 | Daemon logs `ModuleNotFoundError: No module named 'slack_sdk'` | `uv tool install` ran without the `[slack-bot]` extras. | `uv tool install --reinstall 'coding-agent-notifier[slack-bot]'`, then bounce the daemon. |
 | `launchctl print` shows `last exit code = 78: EX_CONFIG` | Old plist used a bare `agent-notify` program name; launchd's PATH excluded `~/.local/bin`. | Re-run `agent-notify install slack-bot` (the install writes the absolute path now), then `bootout` + `bootstrap` to reload. |
 | `agent-notify slack test default` says "posted to U…" but **no DM appears** | Bot DMed itself (App Home Messages tab). Manifest wasn't declaring `messages_tab_enabled`. | Slack admin → your app → **App Home** → toggle **Messages Tab** on. Or recreate the app from `docs/slack-app-manifest.yaml`. |
-| Hook fires but **nothing reaches Slack** | Stale installed `agent-notify` binary in `~/.local/share/uv/tools/`. | `uv tool install --reinstall 'coding-agent-notifier[slack-bot]'`; confirm `which agent-notify` and `defer.log`'s `spawning=` agree. |
+| Hook fires but **nothing reaches Slack** | Stale installed `agent-notify` binary in `~/.local/share/uv/tools/`. | `uv tool install --reinstall 'coding-agent-notifier[slack-bot]'`; confirm `which agent-notify`. To trace per-hook, set `[logging] level = "basic"` and re-check defer.log. |
 | Doctor reports `legacy plist present` | Pre-rename install leftover. | `agent-notify install slack-bot` removes it. |
 
-`~/.agent-notify/logs/daemon.log` is the daemon's stdout/stderr;
-`defer.log` is every hook fire and dispatch decision. Both are `0600`.
+`~/.agent-notify/logs/daemon.log` is the daemon's stdout/stderr (always
+written, rotated at 10MB × 3). `defer.log` only exists when `[logging]
+level` is `basic` or `verbose`; both files are `0600`.
 
 ## Commands
 
