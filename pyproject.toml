@@ -12,9 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Chris Ballinger" }]
 keywords = [
     "claude-code",
-    "codex",
     "slack",
-    "discord",
     "notifications",
     "macos",
     "agents",

@@ -656,6 +656,7 @@ def _build_option_buttons_for_question(
     *,
     answered_index: int | None = None,
     answered_freeform: bool = False,
+    allow_freeform_text: bool = True,
 ) -> dict:
     """One actions block for a single question: option buttons indexed by
     `question_index`, plus a trailing "✏️ Custom answer" trigger that opens
@@ -691,17 +692,22 @@ def _build_option_buttons_for_question(
             button["style"] = "primary"
             primary_assigned = True
         elements.append(button)
-    # Reserve one slot for the custom-answer button when within Slack's
-    # 25-element actions cap.
-    if len(elements) > 24:
-        elements = elements[:24]
-    custom_text = "✓ ✏️ Custom answer" if answered_freeform else "✏️ Custom answer"
-    elements.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": custom_text, "emoji": True},
-        "action_id": f"{CUSTOM_ANSWER_ACTION_ID_PREFIX}{question_index}",
-        "value": approval_id,
-    })
+    if allow_freeform_text:
+        # Reserve one slot for the custom-answer button when within Slack's
+        # 25-element actions cap.
+        if len(elements) > 24:
+            elements = elements[:24]
+        custom_text = "✓ ✏️ Custom answer" if answered_freeform else "✏️ Custom answer"
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": custom_text, "emoji": True},
+            "action_id": f"{CUSTOM_ANSWER_ACTION_ID_PREFIX}{question_index}",
+            "value": approval_id,
+        })
+    elif len(elements) > 25:
+        # No custom-answer button to reserve a slot for — still cap at Slack's
+        # 25-element actions limit.
+        elements = elements[:25]
     return {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}::q{question_index}",
@@ -709,20 +715,22 @@ def _build_option_buttons_for_question(
     }
 
 
-def _build_deny_block(approval_id: str) -> dict:
+def _build_deny_block(approval_id: str, *, allow_freeform_text: bool = True) -> dict:
+    elements: list[dict] = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Deny", "emoji": False},
+            "style": "danger",
+            "action_id": DENY_ACTION_ID,
+            "value": approval_id,
+        },
+    ]
+    if allow_freeform_text:
+        elements.append(_build_deny_with_reason_button(approval_id))
     return {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}::deny",
-        "elements": [
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Deny", "emoji": False},
-                "style": "danger",
-                "action_id": DENY_ACTION_ID,
-                "value": approval_id,
-            },
-            _build_deny_with_reason_button(approval_id),
-        ],
+        "elements": elements,
     }
 
 
@@ -863,6 +871,7 @@ def _build_multi_question_blocks(
     *,
     selected_options: dict[str, int] | None = None,
     freeform_answers: dict[str, str] | None = None,
+    allow_freeform_text: bool = True,
 ) -> list[dict]:
     """Block Kit blocks for an N-question AskUserQuestion: a section header
     per question (with ✓ once answered) followed by its option buttons +
@@ -904,8 +913,9 @@ def _build_multi_question_blocks(
             approval_id, q_idx, labels,
             answered_index=answered_opt,
             answered_freeform=freeform_text is not None,
+            allow_freeform_text=allow_freeform_text,
         ))
-    blocks.append(_build_deny_block(approval_id))
+    blocks.append(_build_deny_block(approval_id, allow_freeform_text=allow_freeform_text))
     return blocks
 
 
@@ -975,33 +985,40 @@ def _build_suggestion_buttons(approval_id: str, suggestions: list[dict]) -> dict
     }
 
 
-def _build_approve_deny_block(approval_id: str, confirm_text: str) -> dict:
+def _build_approve_deny_block(
+    approval_id: str,
+    confirm_text: str,
+    *,
+    allow_freeform_text: bool = True,
+) -> dict:
+    elements: list[dict] = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Approve", "emoji": False},
+            "style": "primary",
+            "action_id": APPROVE_ACTION_ID,
+            "value": approval_id,
+            "confirm": {
+                "title": {"type": "plain_text", "text": "Approve tool call?"},
+                "text": {"type": "mrkdwn", "text": confirm_text},
+                "confirm": {"type": "plain_text", "text": "Approve"},
+                "deny": {"type": "plain_text", "text": "Cancel"},
+            },
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Deny", "emoji": False},
+            "style": "danger",
+            "action_id": DENY_ACTION_ID,
+            "value": approval_id,
+        },
+    ]
+    if allow_freeform_text:
+        elements.append(_build_deny_with_reason_button(approval_id))
     return {
         "type": "actions",
         "block_id": f"agent_notify::{approval_id}",
-        "elements": [
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Approve", "emoji": False},
-                "style": "primary",
-                "action_id": APPROVE_ACTION_ID,
-                "value": approval_id,
-                "confirm": {
-                    "title": {"type": "plain_text", "text": "Approve tool call?"},
-                    "text": {"type": "mrkdwn", "text": confirm_text},
-                    "confirm": {"type": "plain_text", "text": "Approve"},
-                    "deny": {"type": "plain_text", "text": "Cancel"},
-                },
-            },
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Deny", "emoji": False},
-                "style": "danger",
-                "action_id": DENY_ACTION_ID,
-                "value": approval_id,
-            },
-            _build_deny_with_reason_button(approval_id),
-        ],
+        "elements": elements,
     }
 
 
@@ -1014,6 +1031,7 @@ def build_approval_message(
     message_max_chars: int = 0,
     selected_options: dict[str, int] | None = None,
     freeform_answers: dict[str, str] | None = None,
+    allow_freeform_text: bool = True,
 ) -> dict:
     """Like `build_slack_message` but with an actions block for the user.
 
@@ -1045,6 +1063,7 @@ def build_approval_message(
             approval_id, questions,
             selected_options=selected_options,
             freeform_answers=freeform_answers,
+            allow_freeform_text=allow_freeform_text,
         )
     else:
         # The confirm dialog is part of the Slack payload — in minimal mode
@@ -1058,7 +1077,10 @@ def build_approval_message(
                 f"Allow `{tool_label}` to run in "
                 f"`{event.cwd.name or str(event.cwd)}`?"
             )
-        appended_blocks = [_build_approve_deny_block(approval_id, confirm_text)]
+        appended_blocks = [_build_approve_deny_block(
+            approval_id, confirm_text,
+            allow_freeform_text=allow_freeform_text,
+        )]
         # Append per-suggestion buttons after Approve/Deny. Tapping one
         # equals "approve AND apply this rule edit" — the user gets the
         # extra-allowlist outcome in a single tap. Suppressed in minimal
@@ -1105,12 +1127,14 @@ def post_approval_message(
     """
     if not slack_config.bot_token:
         raise SinkError("approval messages require bot_token (webhook cannot carry interactivity)")
+    allow_freeform_text = slack_config.freeform_text == "allow"
     full_body = build_approval_message(
         event,
         approval_id,
         max_chars=max_chars,
         verbosity=verbosity,
         message_max_chars=message_max_chars,
+        allow_freeform_text=allow_freeform_text,
     )
 
     # Build (preview, full) pair when the body has a long section block AND

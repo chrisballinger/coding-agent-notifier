@@ -325,6 +325,85 @@ def test_non_ask_user_question_still_renders_approve_deny():
     assert labels == ["Approve", "Deny", "💬 Deny with reason"]
 
 
+def test_build_approval_message_omits_deny_with_reason_when_freeform_disabled():
+    """Bash-style approve/deny path: when allow_freeform_text=False, only
+    Approve + one-tap Deny render. The Deny-with-reason trigger is gone."""
+    from coding_agent_notifier.sinks.slack import DENY_REASON_ACTION_ID
+    body = build_approval_message(
+        _event(), "appr-no-freeform", allow_freeform_text=False,
+    )
+    actions = _find_block(body, "actions")
+    labels = [el["text"]["text"] for el in actions["elements"]]
+    assert labels == ["Approve", "Deny"]
+    action_ids = [el["action_id"] for el in actions["elements"]]
+    assert DENY_REASON_ACTION_ID not in action_ids
+
+
+def test_post_approval_message_threads_freeform_text_from_slack_config():
+    """End-to-end: post_approval_message reads slack_config.freeform_text
+    and passes it to build_approval_message — when "deny", the posted
+    payload has no freeform-modal triggers."""
+    from coding_agent_notifier.sinks.slack import DENY_REASON_ACTION_ID
+    cfg = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-test",
+        channel="C0XX",
+        interactive=True,
+        freeform_text="deny",
+    )
+    poster = _FakePoster()
+    post_approval_message(_event(), cfg, "appr-no-ff", poster=poster)
+    posted = poster.calls[0]["payload"]
+    # Walk the posted blocks and assert no element carries the
+    # Deny-with-reason action_id.
+    all_action_ids: list[str] = []
+    for att in posted.get("attachments", []) or []:
+        for blk in att.get("blocks", []) or []:
+            if blk.get("type") == "actions":
+                all_action_ids.extend(
+                    el.get("action_id", "") for el in blk.get("elements", [])
+                )
+    for blk in posted.get("blocks", []) or []:
+        if blk.get("type") == "actions":
+            all_action_ids.extend(
+                el.get("action_id", "") for el in blk.get("elements", [])
+            )
+    assert DENY_REASON_ACTION_ID not in all_action_ids
+
+
+def test_build_approval_message_omits_custom_answer_when_freeform_disabled():
+    """AskUserQuestion path: when allow_freeform_text=False, the per-
+    question actions block has only the option buttons (no Custom-answer),
+    and the trailing Deny block has only one-tap Deny."""
+    from coding_agent_notifier.sinks.slack import (
+        CUSTOM_ANSWER_ACTION_ID_PREFIX,
+        DENY_REASON_ACTION_ID,
+    )
+    body = build_approval_message(
+        _ask_user_question_event(), "appr-aq-no-freeform",
+        allow_freeform_text=False,
+    )
+    actions_blocks = _find_blocks(body, "actions")
+    assert len(actions_blocks) == 2
+    q1, deny_block = actions_blocks
+    # No Custom-answer button on the question's actions block.
+    q1_action_ids = [el["action_id"] for el in q1["elements"]]
+    assert not any(
+        a.startswith(CUSTOM_ANSWER_ACTION_ID_PREFIX) for a in q1_action_ids
+    )
+    # Option buttons are still there.
+    assert q1_action_ids == [
+        "agent_notify_option_0_0",
+        "agent_notify_option_0_1",
+        "agent_notify_option_0_2",
+    ]
+    # Deny block is one-tap-only — no Deny-with-reason trigger.
+    deny_labels = [el["text"]["text"] for el in deny_block["elements"]]
+    assert deny_labels == ["Deny"]
+    deny_action_ids = [el["action_id"] for el in deny_block["elements"]]
+    assert DENY_REASON_ACTION_ID not in deny_action_ids
+
+
 def test_multi_question_renders_one_actions_block_per_question():
     """Multi-question AskUserQuestion: each question gets its own actions
     block (option buttons indexed by q,o), plus a single trailing Deny

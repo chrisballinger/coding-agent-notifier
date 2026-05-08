@@ -27,6 +27,15 @@ VALID_EVENT_KINDS: tuple[EventKind, ...] = (
 Verbosity = Literal["terse", "normal", "minimal"]
 VALID_VERBOSITIES: tuple[Verbosity, ...] = ("terse", "normal", "minimal")
 
+# Per-workspace policy for freeform text inputs in interactive flows. "deny"
+# suppresses the "Custom answer" (AskUserQuestion) and "Deny with reason"
+# (PermissionRequest) modals so approvers can only choose fixed options. The
+# daemon also rejects view_submissions for those callbacks defensively, in
+# case a stale modal was opened before the policy flipped. Future modes
+# (e.g. "audit", "redacted") slot in here without a config migration.
+FreeformTextMode = Literal["allow", "deny"]
+VALID_FREEFORM_TEXT_MODES: tuple[FreeformTextMode, ...] = ("allow", "deny")
+
 
 class ConfigError(ValueError):
     """Raised when the config file is missing fields, misshapen, or invalid."""
@@ -57,6 +66,13 @@ class SlackConfig:
     approver_user_ids: tuple[str, ...] = ()
     approver_user_groups: tuple[str, ...] = ()
     approval_timeout_seconds: float = 300.0
+    # Whether interactive flows may include freeform text inputs. Default
+    # "allow" preserves the Custom-answer (AskUserQuestion) and Deny-with-
+    # reason (PermissionRequest) modals. Set to "deny" to lock the workspace
+    # to fixed-option clicks only — both trigger buttons are suppressed and
+    # any view_submission for those modals is dropped by the daemon (with an
+    # ephemeral hint posted back to the channel).
+    freeform_text: FreeformTextMode = "allow"
 
 
 @dataclass(frozen=True)
@@ -110,6 +126,7 @@ _SLACK_FIELD_KEYS = frozenset({
     "approver_user_ids",
     "approver_user_groups",
     "approval_timeout_seconds",
+    "freeform_text",
 })
 # Keys accepted in a [[routes]].slack block. `workspace` is extra: it names
 # which `[slack.workspaces.<name>]` to use as the base, and is NOT a
@@ -317,6 +334,12 @@ def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> S
     time, not at first dispatch."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{context} must be a table")
+    freeform_text = raw.get("freeform_text", "allow")
+    if freeform_text not in VALID_FREEFORM_TEXT_MODES:
+        raise ConfigError(
+            f"{context}.freeform_text = {freeform_text!r} is invalid "
+            f"(expected one of {list(VALID_FREEFORM_TEXT_MODES)})"
+        )
     cfg = SlackConfig(
         enabled=bool(raw.get("enabled", False)),
         webhook_url=_resolve_secret(raw, "webhook_url", context=context),
@@ -334,6 +357,7 @@ def _parse_slack_workspace(name: str, raw: dict[str, Any], *, context: str) -> S
             field=f"{context}.approver_user_groups",
         ),
         approval_timeout_seconds=float(raw.get("approval_timeout_seconds", 300.0)),
+        freeform_text=freeform_text,  # type: ignore[arg-type]
     )
     if cfg.enabled and not (cfg.webhook_url or cfg.bot_token):
         raise ConfigError(f"{context} is enabled but has no webhook_url or bot_token")
@@ -498,6 +522,13 @@ def parse_config(raw: dict[str, Any]) -> Config:
                 slack_override_clean[tuple_field] = _parse_string_tuple(
                     slack_override_clean[tuple_field],
                     field=f"routes[{i}].slack.{tuple_field}",
+                )
+        if "freeform_text" in slack_override_clean:
+            value = slack_override_clean["freeform_text"]
+            if value not in VALID_FREEFORM_TEXT_MODES:
+                raise ConfigError(
+                    f"routes[{i}].slack.freeform_text = {value!r} is invalid "
+                    f"(expected one of {list(VALID_FREEFORM_TEXT_MODES)})"
                 )
         routes.append(Route(cwd=cwd, slack=slack_override_clean, discord=dict(discord_override)))
 
@@ -709,6 +740,12 @@ tail_chars = 2000              # display.message_preview_*chars so the Slack Sho
 # actionable_approvals = true                   # block PermissionRequest, inject decision
 # approver_user_ids = ["U0YOURID"]              # wizard fills this in automatically
 # approver_user_groups = ["S01OPSTEAM"]         # optional: allow a Slack usergroup
+# freeform_text = "allow"                       # "allow" (default) | "deny" — set to "deny" to
+#                                                 # suppress the Custom-answer (AskUserQuestion)
+#                                                 # and Deny-with-reason modals so approvers can
+#                                                 # only click fixed options. The daemon also
+#                                                 # rejects view_submissions for those modals
+#                                                 # defensively when "deny".
 # approval_timeout_seconds = 300                # hook fails closed (deny) after timeout.
 #                                                 # Set to 0 to wait forever — the approval
 #                                                 # stays pending until resolved from Slack on

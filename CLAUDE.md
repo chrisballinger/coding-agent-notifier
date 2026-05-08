@@ -51,6 +51,31 @@ echo '{"hook_event_name":"Stop","cwd":"/tmp","session_id":"demo"}' \
   | uv run agent-notify hook --source claude-code
 ```
 
+## Smoke testing changes against the live daemon
+`uv run pytest` validates code correctness, but the binary on PATH and the
+running daemon are still the *previous* build until you reinstall + restart.
+For any change that touches code reachable by the hook subprocess or the
+Socket Mode daemon (sinks, config parsing, sources, `slack_socket.py`,
+`cli.py`), finish the loop with:
+
+```bash
+uv tool install --reinstall '.[slack-bot]'                              # reinstall the user-tool binary (non-editable — required)
+launchctl kickstart -k "gui/$(id -u)/app.coding-agent-notifier.daemon"  # SIGTERM + relaunch the daemon
+launchctl list | grep coding-agent-notifier                             # verify a fresh PID is present
+```
+
+Notes:
+- The reinstall is **not editable** — `uv tool install` is a one-shot copy
+  into `~/.local/share/uv/tools/`. Without `--reinstall`, uv treats the
+  existing install as up-to-date and skips your changes silently.
+- `kickstart -k` sends SIGTERM and relaunches under launchd. The exit
+  status column in `launchctl list` will read `-15` after the restart —
+  that's the prior process's signal, not a failure of the new one.
+- Pure test-only or docs-only changes don't need this step.
+- If the daemon isn't a launchd service on this machine (e.g. running
+  in a foreground terminal via `agent-notify slack run`), restart it
+  the same way you launched it.
+
 ## When adding a new sink
 1. New file in `sinks/`, dataclass wrapping its config, `send(event)` method.
 2. Corresponding config block in `config.py` with a `ConfigError` when enabled-but-unconfigured.

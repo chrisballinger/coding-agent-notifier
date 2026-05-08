@@ -574,6 +574,85 @@ def test_actionable_approvals_in_named_workspace_rejects_shared_channel_without_
         })
 
 
+def test_freeform_text_defaults_to_allow():
+    # Backwards-compat: existing configs that don't set the key keep the
+    # current UX (Custom-answer + Deny-with-reason modals available).
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb",
+    ))
+    assert cfg.slack.freeform_text == "allow"
+
+
+def test_freeform_text_explicit_deny_parses():
+    # Security-conscious workspaces opt into the locked-down policy.
+    cfg = cfgmod.parse_config(_default_ws(
+        enabled=True,
+        bot_token="xoxb",
+        freeform_text="deny",
+    ))
+    assert cfg.slack.freeform_text == "deny"
+
+
+def test_freeform_text_invalid_value_rejected():
+    # Typos / unknown modes must fail at parse time so the user sees a
+    # clear list of valid values rather than silently getting "allow".
+    with pytest.raises(cfgmod.ConfigError, match="freeform_text"):
+        cfgmod.parse_config(_default_ws(
+            enabled=True,
+            bot_token="xoxb",
+            freeform_text="off",
+        ))
+
+
+def test_freeform_text_route_override_parses(tmp_path):
+    # A route can flip the policy for a specific cwd while leaving the
+    # base workspace permissive — useful for repos that share a workspace
+    # but have stricter security posture.
+    (tmp_path / "secure").mkdir()
+    cfg = cfgmod.parse_config({
+        "slack": {
+            "workspaces": {
+                "default": {
+                    "enabled": True,
+                    "bot_token": "xoxb",
+                    # freeform_text omitted → defaults to "allow"
+                },
+            },
+        },
+        "routes": [
+            {
+                "cwd": f"{tmp_path}/secure",
+                "slack": {"freeform_text": "deny"},
+            },
+        ],
+    })
+    resolved = cfgmod.sinks_for(tmp_path / "secure", cfg)
+    assert resolved is not None
+    slack_cfg, _ = resolved
+    assert slack_cfg.freeform_text == "deny"
+    # The base workspace stays "allow".
+    assert cfg.slack.freeform_text == "allow"
+
+
+def test_freeform_text_route_override_invalid_value_rejected(tmp_path):
+    (tmp_path / "secure").mkdir()
+    with pytest.raises(cfgmod.ConfigError, match="freeform_text"):
+        cfgmod.parse_config({
+            "slack": {
+                "workspaces": {
+                    "default": {"enabled": True, "bot_token": "xoxb"},
+                },
+            },
+            "routes": [
+                {
+                    "cwd": f"{tmp_path}/secure",
+                    "slack": {"freeform_text": "redacted"},  # not yet a valid mode
+                },
+            ],
+        })
+
+
 def test_merge_secrets_preserves_base_scalars_over_secret_tables():
     # Defensive: if the user accidentally has a scalar in config where secrets
     # has a table (weird shape mismatch), we keep the base and skip the secret

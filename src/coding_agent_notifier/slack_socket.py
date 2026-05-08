@@ -49,6 +49,35 @@ logger = logging.getLogger(__name__)
 # channels or weird Slack routing.
 _DM_CHANNEL_PREFIX = "D"
 
+# Shown when an approver clicks a stale Custom-answer / Deny-with-reason
+# button (or a stale modal somehow submits) on a workspace whose
+# freeform_text policy is set to "deny".
+_FREEFORM_DISABLED_HINT = (
+    ":lock: Freeform text entry is disabled for this workspace. "
+    "Use the approve / deny / option buttons on the original message."
+)
+
+
+def _post_freeform_disabled_hint(
+    *,
+    channel: str | None,
+    user: str | None,
+    ephemeral_fn: Callable[..., None] | None,
+) -> None:
+    """Best-effort ephemeral hint when a freeform-disabled action arrives.
+
+    Hooks-must-never-block applies: any failure (missing channel, missing
+    user, ephemeral_fn raising) is logged and swallowed — the approval
+    record stays untouched so the user can still click a fixed-option
+    button.
+    """
+    if ephemeral_fn is None or not channel or not user:
+        return
+    try:
+        ephemeral_fn(channel=channel, user=user, text=_FREEFORM_DISABLED_HINT)
+    except Exception:
+        logger.exception("failed to post freeform-disabled hint to %s", user)
+
 
 @dataclass
 class ButtonClickResult:
@@ -156,6 +185,16 @@ def handle_block_actions(
     # happens later when `view_submission` arrives. The `trigger_id` is
     # short-lived (3s per Slack docs), so views_open must run synchronously.
     if modal_kind is not None:
+        # Defense-in-depth: when freeform_text="deny", the buttons aren't
+        # rendered, but a stale message in scrollback could still surface
+        # one. Refuse to open the modal and explain why.
+        if slack_config.freeform_text != "allow":
+            _post_freeform_disabled_hint(
+                channel=channel_id, user=user_id, ephemeral_fn=ephemeral_fn,
+            )
+            return ButtonClickResult(
+                True, None, "freeform_disabled", approval_id, user_id,
+            )
         trigger_id = payload.get("trigger_id") or ""
         if not trigger_id or views_open_fn is None:
             # No way to open a modal — log and fall through; user can use
@@ -253,6 +292,7 @@ def handle_block_actions(
                     event, approval_id,
                     selected_options=rec.get("selected_options") or {},
                     freeform_answers=rec.get("freeform_answers") or {},
+                    allow_freeform_text=slack_config.freeform_text == "allow",
                 )
             update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
         except Exception:
@@ -308,6 +348,7 @@ def handle_view_submission(
     resolve_fn: Callable[..., dict | None] = pending_approvals.resolve,
     record_partial_fn: Callable[..., dict | None] = pending_approvals.record_partial_answer,
     update_fn: Callable[..., None] = update_message,
+    ephemeral_fn: Callable[..., None] | None = None,
     base_dir: Path | None = None,
 ) -> ButtonClickResult:
     """Act on a Slack `view_submission` payload — the user submitted a
@@ -343,6 +384,20 @@ def handle_view_submission(
     approval_id = metadata.get("approval_id") or ""
     if not isinstance(approval_id, str) or not approval_id:
         return ButtonClickResult(True, None, "bad_metadata", None, user_id)
+
+    # Defense-in-depth: a stale modal could submit after freeform_text was
+    # flipped to "deny" — refuse the submission and post an ephemeral hint
+    # to the originating channel. The pending approval keeps waiting for a
+    # button click.
+    if slack_config.freeform_text != "allow" and callback_id in (
+        MODAL_CALLBACK_CUSTOM_ANSWER, MODAL_CALLBACK_DENY_REASON,
+    ):
+        existing = pending_approvals.read(approval_id, base_dir=base_dir)
+        channel = (existing or {}).get("channel") if isinstance(existing, dict) else None
+        _post_freeform_disabled_hint(
+            channel=channel, user=user_id, ephemeral_fn=ephemeral_fn,
+        )
+        return ButtonClickResult(True, None, "freeform_disabled", approval_id, user_id)
 
     if callback_id == MODAL_CALLBACK_DENY_REASON:
         rec = resolve_fn(
@@ -390,6 +445,7 @@ def handle_view_submission(
                     event, approval_id,
                     selected_options=rec.get("selected_options") or {},
                     freeform_answers=rec.get("freeform_answers") or {},
+                    allow_freeform_text=slack_config.freeform_text == "allow",
                 )
             update_fn(slack_config.bot_token, msg_channel, msg_ts, body)
         except Exception:
@@ -693,6 +749,7 @@ def _start_workspace_listener(
                     slack_config,
                     workspace=workspace_name,
                     update_fn=_update,
+                    ephemeral_fn=_ephemeral,
                 )
             else:
                 result = handle_block_actions(
